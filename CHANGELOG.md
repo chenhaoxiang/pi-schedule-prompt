@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.2
+- Add a single sequential automation roadmap with pinned routines/reactor reference mapping.
+- Package the bounded /supervise recipe using existing Intercom/Subagents tools, without a second goal database or runner.
+- Verify online two-peer progress/evidence/stop and offline behavior through real SDK tools and an isolated real Intercom broker with faux inference.
+- Add fixed payload/provenance packing and verified versioned installation helpers; do not edit global settings or reload business sessions.
+
 ### Maintained fork 0.4.1-fork.1
 - Move maintenance to main and preserve pure community upstream-main.
 - Target Pi 1.3 with pinned SDK/toolchain and provider-free CI on Node 22/26.
