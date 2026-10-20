@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventBinding } from "../src/events.js";
 import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
+import { runSubagentOnce } from "../src/subagent.js";
 import { createCronTool } from "../src/tool.js";
+
+vi.mock("../src/subagent.js", () => ({ runSubagentOnce: vi.fn() }));
+
 import type { CronJob } from "../src/types.js";
 
 const owned: string[] = [];
@@ -21,7 +25,7 @@ function setup(overrides: Partial<CronJob> = {}) {
   const scheduler = new CronScheduler(storage, pi as any, ctx as any); scheduler.start();
   return { storage, pi, ctx, scheduler, idle: () => { idle = true; scheduler.onAgentSettled(); } };
 }
-beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-20T12:00:00Z")); });
+beforeEach(() => { vi.mocked(runSubagentOnce).mockReset(); vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-20T12:00:00Z")); });
 afterEach(() => { vi.useRealTimers(); for (const cwd of owned.splice(0)) fs.rmSync(cwd, { recursive: true, force: true }); });
 
 describe("unified event admission", () => {
@@ -34,6 +38,20 @@ describe("unified event admission", () => {
     const triggered = await tool.execute("call", { action: "trigger", jobId: created.details!.jobId, eventName: "local:test", eventId: "once" }, undefined, undefined, h.ctx as any);
     expect(triggered.content[0]).toEqual({ type: "text", text: "Event queued" });
     h.idle(); expect(h.pi.sendMessage).toHaveBeenCalledTimes(1); h.scheduler.stop();
+  });
+
+  it("retains the next coalesced event while the same model job is still active", async () => {
+    let finish!: (value: { ok: true; text: string }) => void;
+    const run = vi.mocked(runSubagentOnce);
+    run.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue({ ok: true, text: "done" });
+    const h = setup({ model: "fixture" }); h.idle();
+    h.scheduler.receiveEvent("event", "local:build", "one");
+    h.scheduler.receiveEvent("event", "local:build", "two");
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(h.storage.getJob("event")?.pendingEvent).toBeDefined();
+    finish({ ok: true, text: "done" }); await vi.advanceTimersByTimeAsync(1200);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(h.storage.getJob("event")?.attemptCount).toBe(2); h.scheduler.stop();
   });
 
   it("coalesces pending events, persists dedup and dispatches only the configured prompt", () => {

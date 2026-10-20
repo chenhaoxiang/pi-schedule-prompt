@@ -45,7 +45,7 @@ export class CronScheduler {
         if (job.enabled && job.catchUp === "latest" && job.pendingEvent.revision === (job.revision ?? 0)) this.pending.add(job.id);
         else this.storage.updateJob(job.id, { pendingEvent: undefined, lastStatus: "skipped" });
       }
-      if (job.type !== "event" && (job.lastStatus === "running" || job.lastStatus === "queued")) {
+      if (job.lastStatus === "running" || (job.lastStatus === "queued" && (job.type !== "event" || !job.pendingEvent))) {
         this.storage.updateJob(job.id, { lastStatus: "unknown" });
       }
       if (job.enabled) this.scheduleJob(job);
@@ -270,7 +270,8 @@ export class CronScheduler {
       this.armDrain();
       return;
     }
-    const id = this.pending.values().next().value as string;
+    const id = [...this.pending].find(candidate => !this.activeJobs.has(candidate));
+    if (!id) { this.armDrain(); return; }
     this.pending.delete(id);
     let admitted = false;
     try {
