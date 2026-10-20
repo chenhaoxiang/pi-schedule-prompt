@@ -31,11 +31,11 @@ export function startEventApi(options: EventApiOptions,
       const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
       if (!timingSafeEqual(createHash("sha256").update(token).digest(), secret)) return reply(401, { error: "unauthorized" });
       if (request.headers["content-type"] !== "application/json") return reply(415, { error: "json-required" });
-      if (Number(request.headers["content-length"] ?? 0) > 4096) return reply(413, { error: "too-large" });
+      if (Number(request.headers["content-length"] ?? 0) > 4096) { request.resume(); return reply(413, { error: "too-large" }); }
       let text = "";
-      for await (const chunk of request) {
+      for await (const chunk of request.iterator({ destroyOnReturn: false })) {
         text += chunk;
-        if (Buffer.byteLength(text) > 4096) return reply(413, { error: "too-large" });
+        if (Buffer.byteLength(text) > 4096) { request.resume(); return reply(413, { error: "too-large" }); }
       }
       let data: unknown;
       try { data = JSON.parse(text); } catch { return reply(400, { error: "invalid-json" }); }

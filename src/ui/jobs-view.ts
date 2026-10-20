@@ -146,6 +146,7 @@ export class JobsView implements Component {
       // already running in this cwd won't see the change until they restart;
       // their in-memory schedulers are stale until session_start.
       if (this.isSelectionForeign()) return;
+      if (sel.type === "event") { this.operationError = "Event jobs stay session-bound."; return; }
       const session = sel.session ? undefined : this.mySessionId;
       this.storage.updateJob(sel.id, { session });
       this.scheduler.updateJob(sel.id, { ...sel, session });

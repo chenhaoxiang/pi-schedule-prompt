@@ -73,7 +73,10 @@ export class CronScheduler {
 
   emitEvent(name: string, eventId: string = randomUUID()): void {
     for (const job of this.storage.getAllJobs()) {
-      if (job.type === "event" && CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId()) && eventNames(job.schedule).includes(name)) this.receiveEvent(job.id, name, eventId);
+      if (job.type === "event" && CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId()) && eventNames(job.schedule).includes(name)) {
+        try { this.receiveEvent(job.id, name, eventId); }
+        catch { this.emitChange({ type: "error", jobId: job.id, error: "Lifecycle event not admitted; selected store unavailable" }); }
+      }
     }
   }
 

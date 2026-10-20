@@ -7,11 +7,15 @@ import { EVENT_REQUEST } from "../src/events.js";
 import schedule from "../src/index.js";
 import { CronStorage } from "../src/storage.js";
 
-async function fixture(eventName: string) {
+async function fixture(eventName: string, ui?: { notify: ReturnType<typeof vi.fn>; setWidget: ReturnType<typeof vi.fn> }) {
   const base = path.resolve("tmp/event-sdk"); fs.mkdirSync(base, { recursive: true });
   const cwd = fs.mkdtempSync(path.join(base, "case-"));
   const agentDir = path.join(cwd, "agent"); fs.mkdirSync(agentDir);
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+  if (ui) {
+    vi.stubEnv("SCHEDULE_SYNTHETIC_MISSING_TOKEN", undefined);
+    fs.writeFileSync(path.join(agentDir, "schedule-prompts-settings.json"), JSON.stringify({ eventApi: { enabled: true, port: 0, tokenEnv: "SCHEDULE_SYNTHETIC_MISSING_TOKEN" } }));
+  }
   const manager = SessionManager.inMemory(cwd);
   const storage = new CronStorage(cwd);
   storage.addJob({ id: "event", name: "event", type: "event", schedule: eventName, prompt: "Reply EVENT_OK", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: manager.getSessionId(), maxRunsPerDay: 5 });
@@ -25,7 +29,7 @@ async function fixture(eventName: string) {
   await loader.reload();
   const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off", tools: [], sessionManager: manager, settingsManager: settings, resourceLoader: loader });
   const errors: string[] = [];
-  await session.bindExtensions({ mode: "rpc", onError: error => { errors.push(error.message); } });
+  await session.bindExtensions({ mode: "rpc", ...(ui ? { uiContext: ui as any } : {}), onError: error => { errors.push(error.message); } });
   const cleanup = async () => { try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); } finally { session.dispose(); vi.unstubAllEnvs(); fs.rmSync(cwd, { recursive: true, force: true }); } };
   return { session, faux, storage, bus, cleanup, errors };
 }
@@ -38,6 +42,32 @@ describe("real SDK event lifecycle", () => {
       await new Promise(resolve => setTimeout(resolve, 150));
       expect(h.faux.state.callCount).toBe(1);
       expect(h.storage.getJob("event")?.runCount).toBe(1);
+      expect(h.errors).toEqual([]);
+    } finally { await h.cleanup(); }
+  });
+
+  it("admits a later startup of the same session as a distinct event", async () => {
+    const h = await fixture("lifecycle:session-start");
+    try {
+      await vi.waitFor(() => expect(h.session.getLastAssistantText()).toBe("EVENT_OK"));
+      await h.session.waitForIdle();
+      h.faux.appendResponses([fauxAssistantMessage("RELOAD_OK")]);
+      await h.session.extensionRunner.emit({ type: "session_start", reason: "reload" });
+      await vi.waitFor(() => expect(h.session.getLastAssistantText()).toBe("RELOAD_OK"));
+      expect(h.faux.state.callCount).toBe(2);
+      expect(h.storage.getJob("event")?.runCount).toBe(2);
+      expect(h.errors).toEqual([]);
+    } finally { await h.cleanup(); }
+  });
+
+  it("warns visibly on an enabled API startup failure without blocking other event scheduling", async () => {
+    const ui = { notify: vi.fn(), setWidget: vi.fn() };
+    const h = await fixture("local:done", ui);
+    try {
+      expect(ui.notify).toHaveBeenCalledWith("Local event API could not start; other scheduling remains available", "warning");
+      expect(h.faux.state.callCount).toBe(0);
+      h.bus.emit(EVENT_REQUEST, { version: 1, requestId: "r1", jobId: "event", eventName: "local:done", eventId: "one" });
+      await vi.waitFor(() => expect(h.session.getLastAssistantText()).toBe("EVENT_OK"));
       expect(h.errors).toEqual([]);
     } finally { await h.cleanup(); }
   });

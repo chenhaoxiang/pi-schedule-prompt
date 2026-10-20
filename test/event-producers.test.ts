@@ -42,6 +42,20 @@ describe("optional authenticated loopback events", () => {
     expect((await h.request(data)).status).toBe(423);
     expect((await h.request(data)).status).toBe(429);
   });
+  it("returns a clean 413 for chunked oversized input without content-length", async () => {
+    const h = await api();
+    const result = await new Promise<{ status?: number; body: string }>((resolve, reject) => {
+      const request = httpRequest(h.url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + token, "transfer-encoding": "chunked" } }, response => {
+        let body = ""; response.on("data", chunk => { body += chunk; });
+        response.on("end", () => resolve({ status: response.statusCode, body }));
+      });
+      request.on("error", reject);
+      request.write("x".repeat(3000)); request.end("y".repeat(3000));
+    });
+    expect(result.status).toBe(413); expect(JSON.parse(result.body)).toEqual({ error: "too-large" });
+    expect(h.trigger).not.toHaveBeenCalled();
+  });
+
   it("contains admission failure without exposing secrets", async () => {
     const h = await api(vi.fn(() => { throw new Error("synthetic private failure"); }));
     const response = await h.request(data);

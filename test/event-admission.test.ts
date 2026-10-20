@@ -6,6 +6,7 @@ import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
 import { runSubagentOnce } from "../src/subagent.js";
 import { createCronTool } from "../src/tool.js";
+import { JobsView } from "../src/ui/jobs-view.js";
 
 vi.mock("../src/subagent.js", () => ({ runSubagentOnce: vi.fn() }));
 
@@ -132,6 +133,25 @@ describe("unified event admission", () => {
     expect(h.storage.getJob("event")?.pendingEvent).toBeUndefined();
     expect(h.storage.observeGithub(job.id, job.revision!, "b".repeat(64), "owner", eventBinding(job)).status).toBe("queued");
     expect(h.storage.getJob("event")?.pendingEvent).toBeDefined(); h.scheduler.stop();
+  });
+
+  it("keeps later lifecycle jobs isolated from a transient first admission error", () => {
+    const h = setup({ schedule: "lifecycle:session-start" });
+    h.storage.addJob({ ...h.storage.getJob("event")!, id: "later", name: "later" });
+    const queue = vi.spyOn(h.storage, "queueEvent");
+    queue.mockImplementationOnce(() => { throw new Error("transient fixture store failure"); });
+    h.scheduler.emitEvent("lifecycle:session-start", "start-1");
+    expect(queue).toHaveBeenCalledTimes(2);
+    expect(h.storage.getJob("later")?.pendingEvent).toBeDefined(); h.scheduler.stop();
+  });
+
+  it("explains why event scope cannot be unbound in the jobs UI", () => {
+    const h = setup();
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    const view = new JobsView(h.storage, h.scheduler, "owner", async () => {}, theme, () => {}, () => {});
+    view.handleInput("s");
+    expect(view.render(120).join("\n")).toContain("Event jobs stay session-bound");
+    expect(h.storage.getJob("event")?.session).toBe("owner"); h.scheduler.stop();
   });
 
   it("does not spend attempts on duplicate/locked admission and writes version2", () => {
