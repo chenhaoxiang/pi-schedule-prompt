@@ -43,7 +43,7 @@ Important differences: routines GitHub polling is not a complete CI event adapte
 
 Native custom turns; busy tick coalescing; latest-definition admission; session binding; truthful queued/dispatched/unknown; paused persistence; private serialized validated storage; optional lifetime maxRuns/expiresAt; isolated SDK coverage. No offline catch-up, external event source or daemon yet.
 
-## 5. Stage B — online supervision and fixed installation (next)
+## 5. Stage B — online supervision and fixed installation (source implemented; rollout/pilot pending)
 
 ### Smallest implementation
 
@@ -57,7 +57,7 @@ Keep transport receipt, opening acknowledgement, execution and business verifica
 
 Create immutable source-derived install payload/provenance/checksums, verify unpacked bytes and peer SDK resolution, and install into a dedicated supervisor context first. Preserve old packages/settings; do not hot-reload or restart business sessions. A fixed package on disk is not a runtime acknowledgement.
 
-Acceptance sequence: provider-free tool/SDK tests; two isolated Pi sessions with faux inference exercising wake/ack/evidence/stop; then a bounded real-session pilot only when selected peers, goals and completion evidence are concrete. User's rollout authorization covers implementation and necessary installation; missing pilot targets pauses that dependent live step, not all work.
+Acceptance sequence: provider-free tool/SDK tests; two isolated peers plus one timed supervisor with faux inference exercising wake/ack/evidence/stop; then a bounded real-session pilot only when selected peers, goals and completion evidence are concrete. User's rollout authorization covers implementation and necessary installation; missing pilot targets pauses that dependent live step, not all work.
 
 Deliverable: a current-session timed supervisor genuinely advances two selected goals or reports their exact blockers, then stops at its declared boundary.
 

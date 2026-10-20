@@ -12,6 +12,16 @@ if (git('status', '--porcelain=v1')) throw new Error('Fixed payloads require a c
 const sha = git('rev-parse', 'HEAD');
 fs.mkdirSync(output, { recursive: true });
 execFileSync('npm', ['run', 'build'], { cwd: root, stdio: 'inherit' });
+const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+const runtimePackages = { '': { name: 'pi-schedule-fixed-runtime', version: '1.0.0', dependencies: pkg.dependencies } };
+for (const [name, version] of Object.entries(pkg.dependencies)) {
+  const entry = lock.packages['node_modules/' + name];
+  if (!entry || entry.version !== version || !entry.integrity || Object.keys(entry.dependencies || {}).length) throw new Error('Runtime lock closure requires review: ' + name);
+  const { dev, ...production } = entry;
+  runtimePackages['node_modules/' + name] = production;
+}
+fs.writeFileSync(path.join(root, 'dist/runtime-lock.json'), JSON.stringify({ name: 'pi-schedule-fixed-runtime', version: '1.0.0', lockfileVersion: 3, requires: true, packages: runtimePackages }, null, 2));
 const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--pack-destination', output, '--json'], { cwd: root, encoding: 'utf8' }))[0];
 const hash = data => createHash('sha256').update(data).digest('hex');
 const archive = path.join(output, packed.filename);

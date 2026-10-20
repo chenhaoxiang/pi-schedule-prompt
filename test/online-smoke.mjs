@@ -11,7 +11,9 @@ const sdk = await import(process.env.PI_SCHEDULE_HOST_ENTRY || '@earendil-works/
 const ai = await import('@earendil-works/pi-ai');
 const { default: intercom } = await import('pi-intercom/index.ts');
 const { IntercomClient } = await import('pi-intercom/broker/client.ts');
-const { default: schedule } = await import(process.env.PI_SCHEDULE_EXTENSION_ENTRY || '../src/index.ts');
+const fixedRoot = process.env.PI_SCHEDULE_PACKAGE_ROOT;
+const schedule = fixedRoot ? undefined : (await import(process.env.PI_SCHEDULE_EXTENSION_ENTRY || '../src/index.ts')).default;
+console.log(JSON.stringify({ fixtureBinding: { hostVersion: sdk.VERSION, hostEntry: process.env.PI_SCHEDULE_HOST_ENTRY || 'package-peer', packageRoot: fixedRoot || null, extensionEntry: process.env.PI_SCHEDULE_EXTENSION_ENTRY || 'source', manifestEntries: fixedRoot ? JSON.parse(fs.readFileSync(path.join(fixedRoot, 'package.json'), 'utf8')).pi.extensions : null } }));
 const { CronStorage } = await import('../src/storage.ts');
 const root = process.env.PI_SCHEDULE_FIXTURE_CASE;
 assert(root && process.env.PI_CODING_AGENT_DIR?.startsWith(root));
@@ -37,10 +39,19 @@ async function makeSession(name, cwd, responses, extensions, tools, manager) {
   const runtime = await sdk.ModelRuntime.create({ credentials: new ai.InMemoryCredentialStore(), modelsStore: new ai.InMemoryModelsStore(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
   runtime.registerNativeProvider(faux.provider);
   const settings = sdk.SettingsManager.inMemory({ packages: [], compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: { enabled: false } });
-  const loader = new sdk.DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: extensions });
+  const manifestLoad = fixedRoot && extensions.includes(undefined);
+  const loader = new sdk.DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: !manifestLoad, noThemes: true, noContextFiles: true, extensionFactories: extensions.filter(Boolean),
+    ...(manifestLoad ? { additionalExtensionPaths: [fixedRoot] } : {}) });
   await loader.reload();
+  if (manifestLoad) {
+    const manifest = JSON.parse(fs.readFileSync(path.join(fixedRoot, "package.json"), "utf8"));
+    assert(manifest.pi.extensions.every(entry => loader.getExtensions().extensions.some(extension => fs.realpathSync(extension.path) === fs.realpathSync(path.join(fixedRoot, entry)))));
+    assert(loader.getPrompts().prompts.some(prompt => prompt.name === "supervise"));
+    console.log(JSON.stringify({ manifestVerified: true, entries: manifest.pi.extensions, prompt: "supervise", hostVersion: sdk.VERSION }));
+  }
   const { session } = await sdk.createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: 'off', tools, settingsManager: settings, sessionManager: manager || sdk.SessionManager.inMemory(cwd), resourceLoader: loader });
   sessions.push(session);
+  session.subscribe(event => { if (event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error') console.error('Fixture model failure: ' + event.message.errorMessage); });
   await session.bindExtensions({ mode: 'rpc', onError: error => { faults.push(error.message); } });
   return { session, faux };
 }
@@ -48,7 +59,24 @@ const observer = new IntercomClient();
 try {
   await until(() => fs.existsSync(path.join(agentDir, 'intercom/broker.sock')));
   await observer.connect({ cwd: root, model: 'fixture', pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(), name: 'fixture-observer', status: 'idle' }, 'fixture-observer');
-  if (process.env.PI_SCHEDULE_SCENARIO === "offline") {
+  if (process.env.PI_SCHEDULE_SCENARIO === "cwd-mismatch") {
+    const peer = await makeSession("wrong-cwd", path.join(root, "peer-actual"), [], [intercom], ["intercom"]);
+    await until(async () => (await observer.listSessions()).some(entry => entry.id === peer.session.sessionId));
+    const parent = await makeSession("identity-supervisor", path.join(root, "supervisor"), [
+      ai.fauxAssistantMessage(ai.fauxToolCall("intercom", { action: "list" })),
+      context => {
+        const results = JSON.stringify(context.messages.filter(message => message.role === "toolResult"));
+        assert(results.includes(peer.session.sessionId.slice(0, 12)), results);
+        assert(results.includes(path.join(root, "peer-actual")));
+        assert(!results.includes(path.join(root, "peer-expected")));
+        return ai.fauxAssistantMessage("Repository mismatch; do not dispatch work.");
+      },
+    ], [intercom], ["intercom"]);
+    await parent.session.prompt("Authorized fixture: verify identity/cwd, no work on mismatch.");
+    assert.equal(parent.session.getLastAssistantText(), "Repository mismatch; do not dispatch work.");
+    assert.equal(peer.faux.state.callCount, 0);
+    console.log(JSON.stringify({ ok: true, scenario: "cwd-mismatch", realBroker: observer.isConnected(), nativePiSessions: sessions.length, cwdMismatchDetected: true, peerModelCalls: peer.faux.state.callCount, realProviderCalls: 0, businessSessionsTouched: 0 }));
+  } else if (process.env.PI_SCHEDULE_SCENARIO === "offline") {
     const cwd = path.join(root, "supervisor");
     fs.mkdirSync(cwd);
     const manager = sdk.SessionManager.inMemory(cwd);
@@ -67,7 +95,7 @@ try {
     assert.equal(storage.getJob("offline").enabled, false);
     assert.equal(sessions.length, 1);
     assert.deepEqual(faults, []);
-    console.log(JSON.stringify({ ok: true, scenario: "offline", realBroker: true, nativePiSessions: 1, offlineDetected: true, replacementCreated: false, realProviderCalls: 0, businessSessionsTouched: 0 }));
+    console.log(JSON.stringify({ ok: true, scenario: "offline", realBroker: observer.isConnected(), nativePiSessions: sessions.length, offlineDetected: true, replacementCreated: sessions.length > 1, realProviderCalls: 0, businessSessionsTouched: 0 }));
   } else {
   const parentCwd = path.join(root, 'supervisor');
   fs.mkdirSync(parentCwd);
@@ -86,10 +114,15 @@ try {
   const storage = new CronStorage(parentCwd);
   storage.addJob({ id: 'fixture-supervision', name: 'fixture-supervision', type: 'interval', schedule: '1s', intervalMs: 1000, prompt: 'Advance the two explicitly authorized fixture goals; verify result files and stop the known schedule when both pass.', enabled: true, createdAt: new Date().toISOString(), runCount: 0, maxRuns: 4, expiresAt: new Date(Date.now() + 20000).toISOString(), session: parentId });
   const supervisorResponses = [
-    ai.fauxAssistantMessage([
+    ai.fauxAssistantMessage(ai.fauxToolCall('intercom', { action: 'list' })),
+    context => {
+      const results = JSON.stringify(context.messages.filter(message => message.role === 'toolResult'));
+      assert(results.includes(a.session.sessionId.slice(0, 12)) && results.includes(b.session.sessionId.slice(0, 12)), results);
+      assert(results.includes(path.join(root, 'a')) && results.includes(path.join(root, 'b')));
+      return ai.fauxAssistantMessage([
       ai.fauxToolCall('intercom', { action: 'send', to: a.session.sessionId, message: 'Authorized fixture a: produce result.json with answer 4. No other changes.', wake: true }),
       ai.fauxToolCall('intercom', { action: 'send', to: b.session.sessionId, message: 'Authorized fixture b: produce result.json with answer 9. No other changes.', wake: true }),
-    ]),
+    ]); },
     async () => { await until(() => fs.existsSync(evidenceA) && fs.existsSync(evidenceB)); return ai.fauxAssistantMessage('Waiting for the next bounded verification check.'); },
     ai.fauxAssistantMessage([ai.fauxToolCall('read', { path: evidenceA }), ai.fauxToolCall('read', { path: evidenceB })]),
     ai.fauxAssistantMessage(ai.fauxToolCall('schedule_prompt', { action: 'disable', jobId: 'fixture-supervision' })),
@@ -97,27 +130,31 @@ try {
   ];
   const parent = await makeSession('supervisor', parentCwd, supervisorResponses, [intercom, schedule], ['intercom', 'schedule_prompt', 'read'], manager);
   await until(() => storage.getJob('fixture-supervision')?.enabled === false);
-  await until(() => parent.session.getLastAssistantText() === 'Both fixture results verified; future checks stopped.');
+  try { await until(() => parent.session.getLastAssistantText() === 'Both fixture results verified; future checks stopped.'); }
+  catch (error) { console.error(JSON.stringify({ fixtureFailure: parent.session.messages.slice(-8), faults })); throw error; }
   assert.deepEqual(JSON.parse(fs.readFileSync(evidenceA, 'utf8')), { goal: 'a', answer: 4 });
   assert.deepEqual(JSON.parse(fs.readFileSync(evidenceB, 'utf8')), { goal: 'b', answer: 9 });
   assert.equal(storage.getJob('fixture-supervision').runCount, 2);
   assert.equal(a.faux.state.callCount, 3);
   assert.equal(b.faux.state.callCount, 3);
-  assert.equal(parent.faux.state.callCount, 5);
+  assert.equal(parent.faux.state.callCount, 6);
   assert.deepEqual(faults, []);
   const count = parent.faux.state.callCount;
   await new Promise(resolve => setTimeout(resolve, 1100));
   assert.equal(parent.faux.state.callCount, count);
-  console.log(JSON.stringify({ ok: true, scenario: "online", realBroker: true, nativePiSessions: 3, peerGoalsVerified: 2, supervisorChecks: 2, stopped: true, realProviderCalls: 0, businessSessionsTouched: 0 }));
+  console.log(JSON.stringify({ ok: true, scenario: "online", realBroker: observer.isConnected(), nativePiSessions: sessions.length, peerGoalsVerified: [evidenceA, evidenceB].filter(file => fs.existsSync(file)).length, supervisorChecks: storage.getJob("fixture-supervision").runCount, stopped: storage.getJob("fixture-supervision").enabled === false, realProviderCalls: 0, businessSessionsTouched: 0 }));
   }
 } finally {
-  for (const session of sessions.reverse()) {
-    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
-    session.dispose();
+  try {
+    for (const session of sessions.reverse()) {
+      try { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); }
+      finally { session.dispose(); }
+    }
+  } finally {
+    await observer.disconnect().catch(() => {});
+    const exited = new Promise(resolve => broker.once('exit', resolve));
+    broker.kill('SIGTERM');
+    await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 500))]);
+    if (broker.exitCode === null && broker.signalCode === null) { broker.kill('SIGKILL'); await exited; }
   }
-  await observer.disconnect().catch(() => {});
-  const exited = new Promise(resolve => broker.once('exit', resolve));
-  broker.kill('SIGTERM');
-  await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 1500))]);
-  if (broker.exitCode === null && broker.signalCode === null) broker.kill('SIGKILL');
 }

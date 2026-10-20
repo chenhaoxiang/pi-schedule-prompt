@@ -55,8 +55,8 @@ if (fs.existsSync(destination)) {
   verify(destination);
   verifyRuntime(destination);
   const receipt = JSON.parse(fs.readFileSync(path.join(destination, '.install-receipt.json'), 'utf8'));
-  if (receipt.sourceSha !== expectedSha || receipt.archiveSha256 !== metadata.archiveSha256 || receipt.hostVersion !== hostPackage.version) throw new Error('Existing installation has a different source/host binding');
-  console.log(JSON.stringify({ installed: destination, verified: true, runtimeReady: true, reused: true, sourceSha: expectedSha, globalSettingsChanged: false }));
+  if (receipt.sourceSha !== expectedSha || receipt.archiveSha256 !== metadata.archiveSha256 || receipt.hostVersion !== hostPackage.version || receipt.hostPath !== hostRoot) throw new Error('Existing installation has a different source/host binding');
+  console.log(JSON.stringify({ installed: destination, verified: true, runtimeReady: true, reused: true, sourceSha: expectedSha, hostPath: hostRoot, hostVersion: hostPackage.version, globalSettingsChanged: false }));
 } else {
   const temporaryRoot = path.join(root, 'tmp');
   fs.mkdirSync(temporaryRoot, { recursive: true, mode: 0o700 });
@@ -71,7 +71,8 @@ if (fs.existsSync(destination)) {
     const runtime = path.join(unpacked, '.runtime');
     fs.mkdirSync(runtime, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(runtime, 'package.json'), JSON.stringify({ name: 'pi-schedule-fixed-runtime', version: '1.0.0', private: true, dependencies: pkg.dependencies }) + '\n');
-    execFileSync('npm', ['install', '--prefix', runtime, '--omit=dev', '--ignore-scripts', '--legacy-peer-deps', '--no-audit', '--no-fund'], { stdio: 'inherit' });
+    fs.copyFileSync(path.join(unpacked, 'dist/runtime-lock.json'), path.join(runtime, 'package-lock.json'));
+    execFileSync('npm', ['ci', '--prefix', runtime, '--omit=dev', '--ignore-scripts', '--legacy-peer-deps', '--no-audit', '--no-fund'], { stdio: 'inherit' });
     const modules = path.join(runtime, 'node_modules');
     fs.mkdirSync(path.join(modules, '@earendil-works'), { recursive: true });
     for (const name of ['pi-coding-agent', 'pi-ai', 'pi-tui']) {
@@ -80,10 +81,10 @@ if (fs.existsSync(destination)) {
       fs.symlinkSync(target, path.join(modules, '@earendil-works', name), 'dir');
     }
     fs.symlinkSync(path.join('.runtime', 'node_modules'), path.join(unpacked, 'node_modules'), 'dir');
-    fs.writeFileSync(path.join(unpacked, '.install-receipt.json'), JSON.stringify({ sourceSha: expectedSha, archiveSha256: metadata.archiveSha256, version: metadata.version, hostVersion: hostPackage.version }) + '\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(unpacked, '.install-receipt.json'), JSON.stringify({ sourceSha: expectedSha, archiveSha256: metadata.archiveSha256, version: metadata.version, hostVersion: hostPackage.version, hostPath: hostRoot }) + '\n', { mode: 0o600 });
     fs.renameSync(unpacked, destination);
     verify(destination);
     verifyRuntime(destination);
-    console.log(JSON.stringify({ installed: destination, verified: true, runtimeReady: true, reused: false, sourceSha: expectedSha, globalSettingsChanged: false }));
+    console.log(JSON.stringify({ installed: destination, verified: true, runtimeReady: true, reused: false, sourceSha: expectedSha, hostPath: hostRoot, hostVersion: hostPackage.version, globalSettingsChanged: false }));
   } finally { fs.rmSync(staging, { recursive: true, force: true }); }
 }

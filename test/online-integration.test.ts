@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 const require = createRequire(import.meta.url);
 
 describe("online supervisor composition", () => {
-  it.each(["online", "offline"])("verifies %s supervision using native Pi tools and an isolated real Intercom broker", async (scenario) => {
+  it.each(["online", "offline", "cwd-mismatch"])("verifies %s supervision using native Pi tools and an isolated real Intercom broker", async (scenario) => {
     const base = path.resolve(process.env.PI_SCHEDULE_FIXTURE_ROOT || path.join(tmpdir(), "tmp/sp"));
     fs.mkdirSync(base, { recursive: true });
     const root = fs.mkdtempSync(path.join(base, "case-"));
@@ -27,7 +27,8 @@ describe("online supervisor composition", () => {
       cwd: root,
       env: { PATH: process.env.PATH, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_SCHEDULE_FIXTURE_CASE: root, PI_SCHEDULE_SCENARIO: scenario, NODE_NO_WARNINGS: "1",
         ...(process.env.PI_SCHEDULE_HOST_ENTRY ? { PI_SCHEDULE_HOST_ENTRY: process.env.PI_SCHEDULE_HOST_ENTRY } : {}),
-        ...(process.env.PI_SCHEDULE_EXTENSION_ENTRY ? { PI_SCHEDULE_EXTENSION_ENTRY: process.env.PI_SCHEDULE_EXTENSION_ENTRY } : {}) },
+        ...(process.env.PI_SCHEDULE_EXTENSION_ENTRY ? { PI_SCHEDULE_EXTENSION_ENTRY: process.env.PI_SCHEDULE_EXTENSION_ENTRY } : {}),
+        ...(process.env.PI_SCHEDULE_PACKAGE_ROOT ? { PI_SCHEDULE_PACKAGE_ROOT: process.env.PI_SCHEDULE_PACKAGE_ROOT } : {}) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stdout.on("data", chunk => { stdout = (stdout + chunk).slice(-20000); });
@@ -44,9 +45,17 @@ describe("online supervisor composition", () => {
       const result = JSON.parse(line!);
       expect(result).toMatchObject({ scenario, realBroker: true, realProviderCalls: 0, businessSessionsTouched: 0 });
       if (scenario === "online") expect(result).toMatchObject({ nativePiSessions: 3, peerGoalsVerified: 2, supervisorChecks: 2, stopped: true });
-      else expect(result).toMatchObject({ nativePiSessions: 1, offlineDetected: true, replacementCreated: false });
+      else if (scenario === "offline") expect(result).toMatchObject({ nativePiSessions: 1, offlineDetected: true, replacementCreated: false });
+      else expect(result).toMatchObject({ nativePiSessions: 2, cwdMismatchDetected: true, peerModelCalls: 0 });
     } finally {
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+          await new Promise(resolve => child.once("exit", resolve));
+        }
+      }
       fs.rmSync(root, { recursive: true, force: true });
     }
   }, 40000);
