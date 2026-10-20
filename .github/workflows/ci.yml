@@ -12,8 +12,6 @@ permissions:
 jobs:
   provider-free-tests:
     runs-on: ubuntu-latest
-    env:
-      PI_SCHEDULE_FIXTURE_ROOT: ${{ runner.temp }}/tmp/pi-schedule-online
     strategy:
       fail-fast: false
       matrix:
@@ -26,4 +24,6 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run check
+        env:
+          PI_SCHEDULE_FIXTURE_ROOT: ${{ runner.temp }}/tmp/pi-schedule-online
       - run: mkdir -p tmp && npm pack --ignore-scripts --pack-destination tmp
