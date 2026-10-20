@@ -7,4 +7,5 @@
 - [x] Serialize and validate storage; cover foreign-session mutation and corruption.
 - [x] Add optional maxRuns/expiresAt and accurate UI/next-run reporting.
 - [x] Complete provider-free regressions, host compatibility, build and pack verification.
-- [ ] Deliver bilingual fork documentation, independent review and PR evidence.
+- [x] Deliver bilingual fork documentation and initial independent review; fix the confirmed UI fault and add focused regressions.
+- [ ] Bind incremental review and CI to the final PR head and complete ordinary merge/readback.

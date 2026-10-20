@@ -30,7 +30,7 @@ function harness(seed = job()) {
     isIdle: () => idle, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "owner" } };
   const scheduler = new CronScheduler(storage, pi as any, ctx as any);
-  return { storage, pi, ctx, scheduler, setIdle: (v: boolean) => { idle = v; } };
+  return { storage, pi, ctx, scheduler, setIdle: (v: boolean) => { idle = v; if (v) scheduler.onAgentSettled(); } };
 }
 
 beforeEach(() => { vi.useFakeTimers(); });
@@ -122,6 +122,22 @@ describe("native inline delivery", () => {
 });
 
 describe("storage and session management", () => {
+  it("retries pre-dispatch writer contention without pausing or spending an attempt", async () => {
+    const h = harness();
+    h.setIdle(true);
+    h.scheduler.start();
+    fs.writeFileSync(`${h.storage.getStorePath()}.lock`, "other writer");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(h.pi.sendMessage).not.toHaveBeenCalled();
+    expect(h.storage.getJob("one")?.enabled).toBe(true);
+    expect(h.storage.getJob("one")?.attemptCount).toBeUndefined();
+    fs.rmSync(`${h.storage.getStorePath()}.lock`);
+    h.scheduler.onAgentSettled();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(h.pi.sendMessage).toHaveBeenCalledTimes(1);
+    h.scheduler.stop();
+  });
+
   it("does not arm new timers while stopped (batch/print mode)", async () => {
     const h = harness();
     h.scheduler.stop();

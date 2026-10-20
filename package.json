@@ -15,7 +15,7 @@
   "bugs": {
     "url": "https://github.com/chenhaoxiang/pi-schedule-prompt/issues"
   },
-  "files": ["src", "dist", "docs", "AGENTS.md", "README.md", "LICENSE"],
+  "files": ["src", "dist", "docs", "AGENTS.md", "README.md", "CHANGELOG.md", "LICENSE"],
   "keywords": [
     "pi-package",
     "pi",

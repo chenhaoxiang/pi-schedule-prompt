@@ -24,4 +24,4 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run check
-      - run: npm pack --ignore-scripts --pack-destination tmp
+      - run: mkdir -p tmp && npm pack --ignore-scripts --pack-destination tmp

@@ -48,6 +48,8 @@ The agent uses `schedule_prompt`. Actions: `add`, `list`, `remove`, `enable`, `d
 | `notify` | Model-job only; wake parent on completion, default false |
 | `extensions`, `skills` | Model-job only: true or a name list; default none |
 
+Omitting limits on update preserves them; to remove an expiry, replace the job or move the timestamp forward.
+
 Schedule formats:
 
 | Type | Examples |
@@ -72,7 +74,7 @@ Inline jobs send one `scheduled_prompt` custom message, not a synthetic human me
 | `success` / `error` | Explicit model run returned a result/error; not independent business verification |
 | `unknown` | Interrupted work or ambiguous delivery; reconcile before resuming |
 
-Ambiguous sends are paused, not blindly retried. Disabling a schedule cannot retract an already delivered prompt or cancel an active tool. This is not an exactly-once guarantee.
+Pre-admission store contention retains one pending intent and retries without consuming an attempt. Ambiguous sends are paused, not blindly retried. Disabling a schedule cannot retract an already delivered prompt or cancel an active tool. This is not an exactly-once guarantee.
 
 ## Scope, persistence and safety
 
@@ -80,7 +82,7 @@ Jobs live in `<cwd>/.pi/schedule-prompts.json`. New jobs bind to the creating se
 
 Mutations use an exclusive local lock and unique atomic replacements. Task files use mode 0600; prompts must not contain secrets. Corrupt stores are not replaced with an empty file. Contention fails visibly instead of blocking Pi. A leftover lock after a crash requires confirming the writer is gone before removing that exact lock. This is a same-user/local-filesystem contract, not adversarial or NFS isolation.
 
-Settings merge global `~/.pi/agent/schedule-prompts-settings.json` defaults with project `.pi/schedule-prompts-settings.json`. The UI only writes project settings: `widgetVisible` and `defaultJobScope` (session/workdir).
+Settings merge global `~/.pi/agent/schedule-prompts-settings.json` defaults with project `.pi/schedule-prompts-settings.json`. The UI only writes project settings: `widgetVisible` and `defaultJobScope` (session/workdir). Runtime store faults display an unavailable state without escaping UI refresh callbacks or replacing corrupt bytes.
 
 Schedules fire only in a compatible live Pi session. Offline ticks are not replayed; past one-shots are disabled with an error. Print/JSON batch sessions do not arm timers. This is not a daemon, OS wake service, permission system or cross-session supervisor.
 

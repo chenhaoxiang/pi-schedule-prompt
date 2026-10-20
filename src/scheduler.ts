@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
-import type { CronStorage } from "./storage.js";
+import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { runSubagentOnce } from "./subagent.js";
 import type { CronChangeEvent, CronJob, CronJobType } from "./types.js";
 
@@ -48,6 +48,7 @@ export class CronScheduler {
 
   setScheduledTurn(value: boolean): void { this.scheduledTurn = value; }
   isScheduledTurn(): boolean { return this.scheduledTurn; }
+  onAgentSettled(): void { this.drain(); }
 
   stop(): void {
     this.stopped = true;
@@ -77,6 +78,7 @@ export class CronScheduler {
 
   updateJob(id: string, updated: CronJob): void {
     this.unscheduleJob(id);
+    if (this.activeJobs.has(id)) this.storage.updateJob(id, { lastStatus: "unknown" });
     if (!this.stopped && updated.enabled && CronScheduler.isLoadedFor(updated, this.ctx.sessionManager.getSessionId())) this.scheduleJob(updated);
     this.emitChange({ type: "update", job: updated });
   }
@@ -170,7 +172,12 @@ export class CronScheduler {
         this.emitChange({ type: "fire", job: { ...job, lastStatus: "queued" } });
       }
       this.drain();
-    } catch (error) { this.fail(snapshot.id, error); }
+    } catch (error) {
+      if (error instanceof ScheduleStoreBusyError) {
+        this.pending.add(snapshot.id);
+        this.armDrain();
+      } else this.fail(snapshot.id, error);
+    }
   }
 
   /** A timer exists only while pending; nothing is queued inside a busy Pi host. */
@@ -179,7 +186,7 @@ export class CronScheduler {
     this.drainTimer = setTimeout(() => {
       this.drainTimer = undefined;
       this.drain();
-    }, 100);
+    }, 1000);
     this.drainTimer.unref?.();
   }
 
@@ -191,6 +198,7 @@ export class CronScheduler {
     }
     const id = this.pending.values().next().value as string;
     this.pending.delete(id);
+    let admitted = false;
     try {
       const eligible = this.eligible(id);
       if (eligible?.model) {
@@ -200,6 +208,7 @@ export class CronScheduler {
       }
       const job = eligible && this.storage.admitJob(id, this.ctx.sessionManager.getSessionId());
       if (job) {
+        admitted = true;
         const attempts = job.attemptCount!;
         // Admission is persisted before a potentially effectful send.
         this.pi.sendMessage({
@@ -214,7 +223,10 @@ export class CronScheduler {
         if (this.storage.getJob(id)?.enabled === false) this.unscheduleJob(id);
         this.emitChange({ type: "fire", job: this.storage.getJob(id) });
       }
-    } catch (error) { this.fail(id, error); }
+    } catch (error) {
+      if (!admitted && error instanceof ScheduleStoreBusyError) this.pending.add(id);
+      else this.fail(id, error);
+    }
     this.armDrain();
   }
 

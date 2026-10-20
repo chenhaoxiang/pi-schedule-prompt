@@ -31,6 +31,10 @@ function validate(store: unknown): asserts store is CronStore {
   }
 }
 
+export class ScheduleStoreBusyError extends Error {
+  constructor() { super("Schedule store is busy (lock exists); retry after the owning writer finishes"); }
+}
+
 /** Cooperating same-user local writers; not a distributed execution lock. */
 export class CronStorage {
   private readonly storePath: string;
@@ -62,7 +66,7 @@ export class CronStorage {
       fd = fs.openSync(lockPath, "wx", 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new Error("Schedule store is busy (lock exists); retry after the owning writer finishes");
+        throw new ScheduleStoreBusyError();
       }
       throw error;
     }

@@ -35,7 +35,7 @@ export default async function (pi: ExtensionAPI) {
           jobId: string;
           jobName: string;
           prompt: string;
-          mode?: "subagent_start" | "subagent_done" | "subagent_error";
+          mode?: "inline" | "subagent_start" | "subagent_done" | "subagent_error";
           model?: string;
           output?: string;
           error?: string;
@@ -135,7 +135,10 @@ export default async function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event) => {
     scheduler?.setScheduledTurn(event.messageType === "custom" && event.message.customType === "scheduled_prompt");
   });
-  pi.on("agent_end", () => { scheduler?.setScheduledTurn(false); });
+  pi.on("agent_settled", () => {
+    scheduler?.setScheduledTurn(false);
+    scheduler?.onAgentSettled();
+  });
 
   // --- Register /schedule-prompt command ---
 

@@ -48,6 +48,7 @@ export class CronWidget {
   private refreshInterval?: NodeJS.Timeout;
   private ctx?: any;
   private unsubscribe: () => void;
+  private storageError = false;
 
   constructor(
     private storage: CronStorage,
@@ -63,15 +64,22 @@ export class CronWidget {
 
   /** Jobs this session loads — same predicate as the scheduler. */
   private loadedJobs() {
-    return this.storage
-      .getAllJobs()
-      .filter((j) => CronScheduler.isLoadedFor(j, this.sessionId));
+    try {
+      const jobs = this.storage.getAllJobs().filter((j) => CronScheduler.isLoadedFor(j, this.sessionId));
+      this.storageError = false;
+      return jobs;
+    } catch {
+      if (!this.storageError) console.error("[pi-schedule-prompt] Schedule store unreadable; no task state shown.");
+      this.storageError = true;
+      return [];
+    }
   }
 
   show(ctx: any): void {
     this.ctx = ctx;
 
-    if (!this.isVisible() || this.loadedJobs().length === 0) {
+    const jobs = this.loadedJobs();
+    if (!this.isVisible() || (jobs.length === 0 && !this.storageError)) {
       this.hide(ctx);
       return;
     }
@@ -89,6 +97,7 @@ export class CronWidget {
     // nothing else changes. Same path as cron:change-driven refresh.
     if (!this.refreshInterval) {
       this.refreshInterval = setInterval(() => this.refresh(), 30000);
+      this.refreshInterval.unref?.();
     }
   }
 
@@ -111,6 +120,7 @@ export class CronWidget {
    */
   private renderWidget(width: number, theme: any): string[] {
     const jobs = this.loadedJobs();
+    if (this.storageError) return [theme.fg("error", "Schedule store unreadable; no task state shown.")];
 
     // Deduplicate jobs by ID (safeguard against rendering issues)
     const uniqueJobs = Array.from(

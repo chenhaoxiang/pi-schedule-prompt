@@ -27,6 +27,8 @@ export class JobsView implements Component {
   private foreign: CronJob[] = [];
   private selectedIndex = 0;
   private confirm: ConfirmState | null = null;
+  private storageError = false;
+  private operationError?: string;
 
   constructor(
     private storage: CronStorage,
@@ -45,9 +47,18 @@ export class JobsView implements Component {
   }
 
   private refresh(): void {
-    const all = this.storage.getAllJobs();
-    this.mine = all.filter((j) => CronScheduler.isLoadedFor(j, this.mySessionId));
-    this.foreign = all.filter((j) => !CronScheduler.isLoadedFor(j, this.mySessionId));
+    try {
+      const all = this.storage.getAllJobs();
+      this.mine = all.filter((j) => CronScheduler.isLoadedFor(j, this.mySessionId));
+      this.foreign = all.filter((j) => !CronScheduler.isLoadedFor(j, this.mySessionId));
+      this.storageError = false;
+    } catch {
+      if (!this.storageError) console.error("[pi-schedule-prompt] Schedule store unreadable; management unavailable.");
+      this.storageError = true;
+      this.mine = [];
+      this.foreign = [];
+      this.confirm = null;
+    }
     const max = Math.max(0, this.mine.length + this.foreign.length - 1);
     if (this.selectedIndex > max) this.selectedIndex = max;
   }
@@ -63,11 +74,16 @@ export class JobsView implements Component {
   }
 
   handleInput(data: string): void {
-    if (this.confirm) {
-      this.handleConfirmInput(data);
-      return;
+    try {
+      this.operationError = undefined;
+      if (this.confirm) this.handleConfirmInput(data);
+      else this.handleNormalInput(data);
+    } catch {
+      this.operationError = "Schedule operation failed; no change confirmed. Check the local store.";
+      console.error("[pi-schedule-prompt] " + this.operationError);
+      this.confirm = null;
+      this.refresh();
     }
-    this.handleNormalInput(data);
   }
 
   private handleConfirmInput(data: string): void {
@@ -150,6 +166,8 @@ export class JobsView implements Component {
 
   render(width: number): string[] {
     const lines: string[] = [];
+    if (this.storageError) return [this.theme.fg("error", "Schedule store unreadable; management unavailable. Press q to close.")];
+    if (this.operationError) lines.push(this.theme.fg("error", this.operationError));
     const total = this.mine.length + this.foreign.length;
     const rule = this.theme.fg("dim", "─".repeat(Math.max(1, width)));
 
