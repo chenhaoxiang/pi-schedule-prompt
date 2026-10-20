@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.1
+- Move maintenance to main and preserve pure community upstream-main.
+- Target Pi 1.3 with pinned SDK/toolchain and provider-free CI on Node 22/26.
+- Dispatch inline jobs as native custom turns, coalesce busy ticks, preserve paused jobs and report dispatched/unknown truthfully.
+- Add lifetime maxRuns/expiresAt admission controls, serialized validated private storage and foreign-session management protection.
+- Retain explicit model jobs with current SDK provider setup, no same-job overlap, self-extension exclusion and session disposal.
+- Add reliable scheduling and real-SDK faux-provider regressions, bilingual fork guidance and scoped design.
+
 ## [0.4.1] - 2026-06-23
 
 ### Added

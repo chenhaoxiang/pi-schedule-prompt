@@ -79,6 +79,10 @@ export async function runAddFlow(
   );
   if (!scopeChoice) return;
   const session = scopeChoice === SCOPE_SESSION ? mySessionId : undefined;
+  if (scopeChoice === SCOPE_SESSION && !session) {
+    ctx.ui.notify("Session-bound jobs require a session id", "error");
+    return;
+  }
 
   const human = CronScheduler.describeSchedule(jobType, schedule);
   const scopeLabel = session ? "session-bound" : "shared (any pi here)";

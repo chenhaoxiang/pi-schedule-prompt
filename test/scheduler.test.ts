@@ -26,6 +26,13 @@ function makeStorage(seedJobs: CronJob[] = []) {
       Object.assign(job, partial);
       return true;
     },
+    admitJob: (id: string) => {
+      const job = jobs.get(id);
+      if (!job?.enabled) return undefined;
+      job.attemptCount = (job.attemptCount ?? job.runCount) + 1;
+      job.lastStatus = "unknown";
+      return { ...job };
+    },
     getJob: (id: string) => jobs.get(id),
     getAllJobs: () => Array.from(jobs.values()),
     getStorePath: () => ":memory:",
@@ -312,7 +319,7 @@ describe("CronScheduler — start() recovery", () => {
     try {
       scheduler.start();
 
-      expect(storage.getJob("stuck").lastStatus).toBeUndefined();
+      expect(storage.getJob("stuck").lastStatus).toBe("unknown");
       // Other lastStatus values are left alone — we only sweep the one that
       // signals an interrupted run.
       expect(storage.getJob("clean").lastStatus).toBe("success");
@@ -440,35 +447,32 @@ describe("CronScheduler — inline path is unaffected by mock", () => {
     await (scheduler as any).executeJob(job);
 
     expect(mockRunSubagentOnce).not.toHaveBeenCalled();
-    // Inline path: marker + sendUserMessage
+    // Pi 1.3 consumes the custom message directly; no duplicate user wake.
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(
-      "do the thing",
-      { deliverAs: "followUp" },
-    );
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage.mock.calls[0][0].content).toBe("do the thing");
   });
 
-  it("inline marker uses empty content and no delivery options (regression guard for double-injection)", async () => {
+  it("injects the prompt exactly once as a source-labelled native custom turn", async () => {
     const pi = makePi();
-    const job = exampleJob(); // no model
-    const scheduler = new CronScheduler(makeStorage([job]), pi, makeCtx());
+    const job = exampleJob();
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
 
     await (scheduler as any).executeJob(job);
 
-    // The marker must NOT carry the prompt in `content` — that would inject
-    // the prompt into the LLM context a second time alongside `sendUserMessage`,
-    // producing the "PROMPT\n\nPROMPT" / duplicate-turn symptom. No options
-    // means: idle → silent append + emit (marker shows before the user
-    // message); streaming → `agent.steer` with empty content (no LLM
-    // context change, no extra turn triggered).
-    const [markerMsg, markerOpts] = pi.sendMessage.mock.calls[0];
-    expect(markerMsg.content).toEqual([]);
-    expect(markerMsg.details).toEqual({
+    const [message, options] = pi.sendMessage.mock.calls[0];
+    expect(message.content).toBe(job.prompt);
+    expect(message.customType).toBe("scheduled_prompt");
+    expect(message.details).toEqual({
       jobId: job.id,
       jobName: job.name,
       prompt: job.prompt,
+      mode: "inline",
     });
-    expect(markerOpts).toBeUndefined();
+    expect(options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+    expect(storage.getJob(job.id).lastStatus).toBe("dispatched");
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 });
 

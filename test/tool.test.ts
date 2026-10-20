@@ -33,9 +33,8 @@ function makeScheduler() {
   } as any;
 }
 
-// Tool reads ctx.sessionManager.getEntries() (recursion guard) and
-// .getSessionId() (session binding on add). Empty entries bypass the guard;
-// a stable mock id lets tests assert what gets persisted.
+// Current-turn recursion is scheduler-owned; history is not a permission signal.
+// A stable session id lets tests assert what gets persisted.
 function makeCtx(sessionId = "test-session") {
   return {
     sessionManager: {
@@ -56,7 +55,7 @@ function buildTool(
     () => scheduler,
     getDefaultScope,
   );
-  return { tool, storage };
+  return { tool, storage, scheduler };
 }
 
 function exampleJob(overrides: Partial<CronJob> = {}): CronJob {
@@ -472,5 +471,38 @@ describe("schedule_prompt — extensions/skills", () => {
       expect(result.details?.error).toBeUndefined();
       expect(storage.getJob("j2").skills).toBe(false);
     });
+  });
+});
+
+
+describe("schedule_prompt — limits and source-based recursion", () => {
+  it.each([{ maxRuns: 0 }, { maxRuns: -1 }, { maxRuns: 1.5 }, { expiresAt: "not-a-date" }, { expiresAt: "2000-01-01T00:00:00Z" }])("rejects invalid limits: %j", async (limits) => {
+    const { tool } = buildTool();
+    const result = await tool.execute("call", { action: "add", type: "once", schedule: "+30s", prompt: "check", ...limits } as any, undefined, undefined, makeCtx());
+    expect(result.isError).toBe(true);
+  });
+
+  it("persists and updates both optional limits", async () => {
+    const { tool, storage } = buildTool();
+    const expiresAt = "2099-01-01T00:00:00Z";
+    const added = await tool.execute("call", { action: "add", type: "once", schedule: "+30s", prompt: "check", maxRuns: 2, expiresAt } as any, undefined, undefined, makeCtx());
+    const id = added.details!.jobId!;
+    expect(storage.getJob(id).maxRuns).toBe(2);
+    expect(storage.getJob(id).expiresAt).toBe(expiresAt);
+    const updated = await tool.execute("call", { action: "update", jobId: id, maxRuns: 4 } as any, undefined, undefined, makeCtx());
+    expect(updated.isError).not.toBe(true);
+    expect(storage.getJob(id).maxRuns).toBe(4);
+    expect(storage.getJob(id).expiresAt).toBe(expiresAt);
+  });
+
+  it("blocks only the actual scheduled turn, not historical scheduler entries", async () => {
+    const { tool, scheduler } = buildTool();
+    scheduler.isScheduledTurn = () => true;
+    await expect(tool.execute("call", { action: "add", type: "once", schedule: "+30s", prompt: "check" } as any, undefined, undefined, makeCtx())).rejects.toThrow(/within a scheduled prompt/);
+    scheduler.isScheduledTurn = () => false;
+    const ctx = makeCtx();
+    ctx.sessionManager.getEntries = () => [{ type: "custom", customType: "scheduled_prompt" }];
+    const result = await tool.execute("call", { action: "add", type: "once", schedule: "+30s", prompt: "check" } as any, undefined, undefined, ctx);
+    expect(result.isError).not.toBe(true);
   });
 });

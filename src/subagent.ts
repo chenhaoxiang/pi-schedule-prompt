@@ -6,6 +6,7 @@
  * No subprocess, no extension recursion (noExtensions: true), no persistence.
  */
 
+import { fileURLToPath } from "node:url";
 import type { Model } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
@@ -14,6 +15,7 @@ import {
   DefaultResourceLoader,
   type ExtensionContext,
   getAgentDir,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -36,9 +38,11 @@ export function resolveModel(
   modelStr: string,
 ): Model<any> | undefined {
   let fuzzyNeedle = modelStr;
+  let providerHint: string | undefined;
   const slash = modelStr.indexOf("/");
   if (slash !== -1) {
     const provider = modelStr.slice(0, slash);
+    providerHint = provider;
     const id = modelStr.slice(slash + 1);
     const found = registry.find(provider, id);
     if (found) return found;
@@ -49,7 +53,7 @@ export function resolveModel(
   }
 
   const needle = fuzzyNeedle.toLowerCase();
-  const candidates = registry.getAvailable();
+  const candidates = registry.getAvailable().filter(m => !providerHint || m.provider === providerHint);
   return (
     candidates.find((m) => m.id.toLowerCase() === needle) ??
     candidates.find((m) => m.id.toLowerCase().includes(needle)) ??
@@ -103,6 +107,7 @@ export async function runSubagentOnce(
       };
     }
 
+    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
     const agentDir = getAgentDir();
 
     // Helper: convert extensions/skills option to boolean and optionally filter.
@@ -115,6 +120,7 @@ export async function runSubagentOnce(
     const extList = getNameList(options.extensions);
     const skillList = getNameList(options.skills);
 
+    const packageRoot = fileURLToPath(new URL("../", import.meta.url));
     const loader = new DefaultResourceLoader({
       cwd: ctx.cwd,
       agentDir,
@@ -124,11 +130,12 @@ export async function runSubagentOnce(
       noSkills: !isEnabled(options.skills),
       noPromptTemplates: true,
       noThemes: true,
-      ...(extList && {
+      ...(isEnabled(options.extensions) && {
         extensionsOverride: (base) => ({
           ...base,
           extensions: base.extensions.filter((ext) =>
-            extList.some((name) => ext.path.toLowerCase().includes(name.toLowerCase())),
+            !ext.path.startsWith(packageRoot) &&
+            (!extList || extList.some((name) => ext.path.toLowerCase().includes(name.toLowerCase()))),
           ),
         }),
       }),
@@ -143,17 +150,24 @@ export async function runSubagentOnce(
     });
     await loader.reload();
 
+    const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
+    const native = ctx.modelRegistry.getRegisteredNativeProvider?.(model.provider);
+    const configured = ctx.modelRegistry.getRegisteredProviderConfig?.(model.provider);
+    if (native) modelRuntime.registerNativeProvider(native);
+    else if (configured) modelRuntime.registerProvider(model.provider, configured);
     const { session } = await createAgentSession({
       cwd: ctx.cwd,
       agentDir,
       sessionManager: SessionManager.inMemory(ctx.cwd),
       settingsManager: SettingsManager.create(ctx.cwd, agentDir),
-      modelRegistry: ctx.modelRegistry,
+      modelRuntime,
+      thinkingLevel: ctx.thinkingLevel,
       model,
       tools: isEnabled(options.extensions) ? undefined : DEFAULT_TOOL_NAMES,
       resourceLoader: loader,
     });
 
+    try {
     if (isEnabled(options.extensions)) {
       await session.bindExtensions({});
     }
@@ -188,8 +202,17 @@ export async function runSubagentOnce(
       }
     }
 
+    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
+    const last = session.messages.filter(message => message.role === "assistant").at(-1);
+    if (last?.stopReason === "error" || last?.stopReason === "aborted") {
+      return { ok: false, error: last.errorMessage || "Scheduled model run did not complete" };
+    }
     const text = buffered.trim() || getLastAssistantText(session);
     return { ok: true, text };
+    } finally {
+      try { await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
+      finally { session.dispose(); }
+    }
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
