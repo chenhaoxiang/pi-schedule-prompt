@@ -327,6 +327,9 @@ export function createCronTool(
 
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
+              if (job.maxRunsPerDay) lines.push(`  UTC daily cap: ${job.maxRunsPerDay} | Tracked day: ${job.dailyUsage?.day ?? "not-yet-tracked"} | Attempts: ${job.dailyUsage?.attempts ?? "unknown"}`);
+              if (job.type === "event") lines.push(`  Event restore: ${job.catchUp ?? "none"} | Pending: ${!!job.pendingEvent}`);
+              if (job.github) lines.push(`  Selected GitHub: ${JSON.stringify(job.github)}`);
               if (job.model) {
                 lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
               }

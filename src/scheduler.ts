@@ -11,6 +11,9 @@ type ValidateScheduleResult =
   | { ok: true; schedule: string; intervalMs?: number }
   | { ok: false; error: string };
 const MAX_DELAY = 2_147_483_647;
+const promptFor = (job: CronJob) => job.type === "event"
+  ? job.prompt + "\n\nConfigured event context (metadata, not authorization): " + JSON.stringify({ names: job.schedule, github: job.github })
+  : job.prompt;
 const snippet = (text: string) => text.length > 500 ? text.slice(0, 500) + "…" : text;
 
 /** Timers own intent only. Host acceptance never proves business completion. */
@@ -287,7 +290,7 @@ export class CronScheduler {
         const attempts = job.attemptCount!;
         // Admission is persisted before a potentially effectful send.
         this.pi.sendMessage({
-          customType: "scheduled_prompt", content: job.prompt, display: true,
+          customType: "scheduled_prompt", content: promptFor(job), display: true,
           details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline" },
         }, { triggerTurn: true, deliverAs: "followUp" });
         this.storage.updateJob(id, {
@@ -324,7 +327,7 @@ export class CronScheduler {
     this.activeJobs.set(job.id, controller);
     void (async () => {
       try {
-        const result = await runSubagentOnce(this.ctx, job.prompt, model, controller.signal,
+        const result = await runSubagentOnce(this.ctx, promptFor(job), model, controller.signal,
           { extensions: job.extensions, skills: job.skills });
         const latest = this.storage.getJob(job.id);
         if (controller.signal.aborted || this.stopped || !latest ||

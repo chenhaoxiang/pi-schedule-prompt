@@ -62,7 +62,9 @@ describe("unified event admission", () => {
     expect(h.pi.sendMessage).not.toHaveBeenCalled();
     h.idle();
     expect(h.pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(h.pi.sendMessage.mock.calls[0][0].content).toBe("configured authorized prompt");
+    expect(h.pi.sendMessage.mock.calls[0][0].content).toContain("configured authorized prompt");
+    expect(h.pi.sendMessage.mock.calls[0][0].content).toContain("Configured event context");
+    expect(h.pi.sendMessage.mock.calls[0][0].content).toContain("local:build");
     expect(h.storage.getJob("event")?.attemptCount).toBe(1);
     expect(h.storage.queueEvent("event", "local:build", "two", "owner").status).toBe("duplicate");
     expect(h.storage.getJob("event")?.pendingEvent).toBeUndefined();
