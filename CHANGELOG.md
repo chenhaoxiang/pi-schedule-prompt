@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.4
+- Add opt-in session-owned durable timers/events with schema3 intent/claim metadata, exact native execution receipts and conservative restart reconciliation.
+- Bound local durable concurrency/deadlines and pre-effect contention retries; pause ambiguous/aborted work, stop after three confirmed errors and retain notification delivery separately.
+- Package a fixed native Pi RPC service with config/binary/installation/session pins, authenticated loopback status/confirmed stop, duplicate/orphan protection and opt-in launchd output.
+- Preserve normal host guards/resources/credentials and legacy interactive jobs; no global setting change, generic effectful retry, business target enrollment or auto-approved UI consent.
+
 ### Maintained fork 0.4.1-fork.3
 - Add session-owned event jobs with existing tool/local bus/lifecycle ingress and non-recursive settled events.
 - Persist bounded dedup/pending intent and content binding, UTC daily admission caps and none/latest restoration; new writes use store version2.

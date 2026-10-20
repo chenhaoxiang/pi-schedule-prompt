@@ -1,6 +1,6 @@
 {
   "name": "pi-schedule-prompt",
-  "version": "0.4.1-fork.3",
+  "version": "0.4.1-fork.4",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22.19.0" },
@@ -15,7 +15,7 @@
   "bugs": {
     "url": "https://github.com/chenhaoxiang/pi-schedule-prompt/issues"
   },
-  "files": ["src", "dist", "docs", "prompts", "AGENTS.md", "README.md", "CHANGELOG.md", "LICENSE"],
+  "files": ["src", "dist", "docs", "prompts", "scripts/supervisor.mjs", "scripts/supervisor-rpc.mjs", "AGENTS.md", "README.md", "CHANGELOG.md", "LICENSE"],
   "keywords": [
     "pi-package",
     "pi",
@@ -41,7 +41,7 @@
     "build": "tsc",
     "test": "vitest run --maxWorkers=2",
     "check": "npm run lint && npm run typecheck && npm run check:scripts && npm test && npm run build",
-    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/install-fixed.mjs && node --check test/online-smoke.mjs",
+    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/install-fixed.mjs && node --check test/online-smoke.mjs && node --check scripts/supervisor.mjs && node --check scripts/supervisor-rpc.mjs && node --check test/supervisor-native.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",

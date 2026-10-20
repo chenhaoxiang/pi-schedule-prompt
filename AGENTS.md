@@ -11,6 +11,8 @@ This repository is chenhaoxiang/pi-schedule-prompt, maintained from tintinweb/pi
 
 ## Documentation map
 
+- docs/durable-supervisor.md: stage D opt-in durable intent/claim/receipt reconciliation, bounded native RPC service and stop/install evidence.
+
 - docs/event-admission.md: stage C unified local/lifecycle/GitHub/optional loopback admission, UTC daily bounds, bounded dedup and restart policy.
 
 - docs/online-supervision.md: bounded supervisor prompt, native tool composition, isolated real-component fixtures, fixed installation and selected-peer acceptance.

@@ -49,6 +49,7 @@ export function createCronTool(
         if (params.maxRuns !== undefined && (!Number.isSafeInteger(params.maxRuns) || params.maxRuns < 1)) {
           throw new Error("maxRuns must be a positive safe integer");
         }
+        if (params.deadlineMs !== undefined && (!Number.isSafeInteger(params.deadlineMs) || params.deadlineMs < 1000 || params.deadlineMs > 86400000)) throw new Error("deadlineMs must be 1000–86400000");
         if (params.maxRunsPerDay !== undefined && (!Number.isSafeInteger(params.maxRunsPerDay) || params.maxRunsPerDay < 1)) throw new Error("maxRunsPerDay must be a positive safe integer");
         if (params.catchUp !== undefined && !["none", "latest"].includes(params.catchUp)) throw new Error("Invalid catchUp policy");
         if (params.github !== undefined) validateGithub(params.github);
@@ -64,6 +65,7 @@ export function createCronTool(
             return { content: [{ type: "text", text: `Event ${result.status}${result.reason ? ": " + result.reason : ""}` }], details };
           }
           case "add": {
+            if (process.env.PI_SCHEDULE_SERVICE_SESSION && (params.durable !== true || getDefaultScope() !== "session" || !params.maxRuns || !params.expiresAt)) throw new Error("Dedicated service requires explicit finite durable session-bound jobs");
             if (!params.schedule || !params.prompt) {
               const missing = [];
               if (!params.schedule) missing.push("'schedule'");
@@ -115,6 +117,8 @@ export function createCronTool(
               maxRuns: params.maxRuns,
               maxRunsPerDay: params.maxRunsPerDay,
               catchUp: params.catchUp,
+              durable: params.durable,
+              deadlineMs: params.deadlineMs,
               github: params.github,
               expiresAt: params.expiresAt,
               model: params.model,
@@ -263,6 +267,9 @@ export function createCronTool(
             }
 
             const updates: Partial<CronJob> = {};
+            if (process.env.PI_SCHEDULE_SERVICE_SESSION && params.durable === false) throw new Error("Dedicated service cannot disable durable execution");
+            if (params.durable !== undefined) updates.durable = params.durable;
+            if (params.deadlineMs !== undefined) updates.deadlineMs = params.deadlineMs;
             if (params.maxRuns !== undefined) updates.maxRuns = params.maxRuns;
             if (params.maxRunsPerDay !== undefined) updates.maxRunsPerDay = params.maxRunsPerDay;
             if (params.catchUp !== undefined) updates.catchUp = params.catchUp;
@@ -327,6 +334,7 @@ export function createCronTool(
 
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
+              if (job.durable) lines.push(`  Durable claim: ${job.claim?.id ?? "none"} | Phase: ${job.claim?.phase ?? "none"} | Outcome: ${job.claim?.outcome ?? "not-proven"} | Deadline ms: ${job.deadlineMs ?? 600000} | Notice: ${job.notice?.state ?? "none"}`);
               if (job.maxRunsPerDay) lines.push(`  UTC daily cap: ${job.maxRunsPerDay} | Tracked day: ${job.dailyUsage?.day ?? "not-yet-tracked"} | Attempts: ${job.dailyUsage?.attempts ?? "unknown"}`);
               if (job.type === "event") lines.push(`  Event restore: ${job.catchUp ?? "none"} | Pending: ${!!job.pendingEvent}`);
               if (job.github) lines.push(`  Selected GitHub: ${JSON.stringify(job.github)}`);

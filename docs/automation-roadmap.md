@@ -63,7 +63,7 @@ Deliverable: a current-session timed supervisor genuinely advances two selected 
 
 Stage B source was delivered through PR #2, main d18f298, with148 tests and Node22/26 PR/post-merge CI. Release v0.4.1-fork.2 was freshly downloaded/checksummed, installed into a permanent version directory, and passed3/3 installed-manifest component cases. A dedicated pinned launcher exists with zero targets/schedules; global settings and business sessions were unchanged. Real business-goal acceptance still requires selected peers/goals.
 
-## 6. Stage C — event-driven admission and daily bounds (source candidate)
+## 6. Stage C — event-driven admission and daily bounds (delivered)
 
 Add optional event triggers to the existing job definitions rather than a second timer store. Begin with lifecycle and explicit local events; GitHub polling follows for actual PR/CI needs. A localhost authenticated API is optional and off by default, with bounded input and no arbitrary prompt/command from event payloads. Events select an existing task id; untrusted body text is data, not instructions or authority.
 
@@ -71,7 +71,11 @@ Common admission checks enabled state, task revision/owner, expiry, lifetime/dai
 
 Acceptance: duplicate events cause one admitted intent; events during busy work coalesce; paused/expired/capped tasks do not start inference; restart preserves the chosen missed/dedup semantics. Safe local fixtures first; external reads only for selected authorized repositories.
 
+Stage C delivered PR #3, merge55796b2 and release v0.4.1-fork.3:184 source tests, Node22/26 PR/post-merge CI and9 installed component cases. No real external source/API was activated.
+
 ## 7. Stage D — durable unattended operation and recovery
+
+The implementation envelope is opt-in durable session-bound jobs, the original schema3 store and exact native Pi receipt/owner handles, with one local durable slot. Existing interactive/broadcast modes remain compatible. The native RPC wrapper controls only its own child; selected port/config identity and live-child checks prevent duplicate takeover. Full behavior, bounds, missed-tick policy, pinned start/status/stop and opt-in launchd entry are in [the durable supervisor runbook](durable-supervisor.md).
 
 Persist scheduled/event intents before effectful dispatch and claim them under a local single-owner lifecycle. Reuse existing execution handles; store references and uncertainty, not a copy of every child's transcript or task database. A dedicated long-lived Pi supervisor is controlled through the existing native SDK/RPC; do not attach to or write stdin of arbitrary TUI processes.
 

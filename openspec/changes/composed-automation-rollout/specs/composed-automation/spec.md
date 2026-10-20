@@ -23,6 +23,19 @@ Durable operation SHALL reconcile exact existing execution handles before a new 
 - **THEN** recovery checks the existing execution owner
 - **AND** lack of a response is not treated as proof of no execution
 
+### Requirement: Bound the dedicated native host
+The dedicated service SHALL start only its own pinned native Pi RPC child, retain normal host guards/resources and credentials, require finite session-bound durable service jobs and accept only authenticated local metadata/status/stop controls. It SHALL deny unattended UI consent and SHALL NOT auto-restart a potentially live owned child.
+
+#### Scenario: Parent interruption with a live child
+- **WHEN** a prior exact-scope record still identifies a potentially live child
+- **THEN** a second launcher holds without killing, stealing or duplicating it
+- **AND** a missing RPC receipt does not turn into business completion
+
+#### Scenario: Controlled elapsed deadline
+- **WHEN** the exact claimed run reaches its elapsed deadline
+- **THEN** only its native/child handle is aborted, the uncertain job pauses and the local slot stays held until the handle settles
+- **AND** independent detached children/external effects are not claimed rolled back
+
 ### Requirement: Separate evidence levels
 The rollout SHALL distinguish source, synthetic fixture, installed fixture and live selected-peer results.
 

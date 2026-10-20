@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
+import { DurableExecution } from "./durable.js";
 import { dailyLimited, eventBinding, eventNames } from "./events.js";
 import { githubFingerprint } from "./github-events.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
@@ -25,22 +26,25 @@ export class CronScheduler {
   private nextRuns = new Map<string, Date>();
   private pending = new Set<string>();
   private drainTimer?: NodeJS.Timeout;
+  private contention = new Map<string, number>();
   private stopped = false;
   private activeSubagents = new Set<AbortController>();
   private activeJobs = new Map<string, AbortController>();
   private generations = new Map<string, number>();
   private scheduledTurn = false;
+  private durable: DurableExecution;
 
   constructor(
     private readonly storage: CronStorage,
     private readonly pi: ExtensionAPI,
     private readonly ctx: ExtensionContext,
-  ) {}
+  ) { this.durable = new DurableExecution(storage, pi, ctx); }
 
   start(): void {
     this.stop();
     this.stopped = false;
     const session = this.ctx.sessionManager.getSessionId();
+    this.durable.restore();
     for (const job of this.storage.getAllJobs()) {
       if (!CronScheduler.isLoadedFor(job, session)) continue;
       if (job.github && job.catchUp !== "latest") this.storage.updateJob(job.id, { sourceFingerprint: undefined });
@@ -48,7 +52,13 @@ export class CronScheduler {
         if (job.enabled && job.catchUp === "latest" && job.pendingEvent.revision === (job.revision ?? 0)) this.pending.add(job.id);
         else this.storage.updateJob(job.id, { pendingEvent: undefined, lastStatus: "skipped" });
       }
-      if (job.lastStatus === "running" || (job.lastStatus === "queued" && (job.type !== "event" || !job.pendingEvent))) {
+      if (job.durable && job.type !== "event" && job.enabled) {
+        if (job.catchUp === "latest" && (job.pendingIntent || (job.nextRun && Date.parse(job.nextRun) <= Date.now()) || (job.type === "once" && Date.parse(job.schedule) <= Date.now()))) {
+          if (!job.pendingIntent) this.storage.queueTime(job.id, session);
+          this.pending.add(job.id);
+        }
+      }
+      if (!job.durable && (job.lastStatus === "running" || (job.lastStatus === "queued" && (job.type !== "event" || !job.pendingEvent)))) {
         this.storage.updateJob(job.id, { lastStatus: "unknown" });
       }
       if (job.enabled) this.scheduleJob(job);
@@ -82,10 +92,14 @@ export class CronScheduler {
 
   setScheduledTurn(value: boolean): void { this.scheduledTurn = value; }
   isScheduledTurn(): boolean { return this.scheduledTurn; }
-  onAgentSettled(): void { this.drain(); }
+  isRunning(): boolean { return !this.stopped; }
+  onAgentSettled(aborted = false): void { this.durable.settled(aborted); this.drain(); }
+  onScheduledStart(claimId: unknown): void { this.durable.started(claimId); }
+  onMessageEnd(message: { role: string; stopReason?: string }): void { this.durable.messageEnd(message); }
 
   stop(): void {
     this.stopped = true;
+    this.durable.stop();
     for (const cron of this.jobs.values()) cron.stop();
     for (const timer of this.intervals.values()) clearTimeout(timer);
     for (const timer of this.githubTimers.values()) clearTimeout(timer);
@@ -135,15 +149,38 @@ export class CronScheduler {
         if (!job.intervalMs || !Number.isSafeInteger(job.intervalMs) || job.intervalMs > MAX_DELAY) {
           throw new Error("Interval must be positive and at most 2147483647 milliseconds");
         }
-        this.nextRuns.set(job.id, new Date(Date.now() + job.intervalMs));
-        const timer = setInterval(() => {
-          this.nextRuns.set(job.id, new Date(Date.now() + job.intervalMs!));
-          void this.executeJob(job);
-        }, job.intervalMs);
-        timer.unref?.();
-        this.intervals.set(job.id, timer);
+        if (job.durable) {
+          const anchor = job.nextRun && Date.parse(job.nextRun) > Date.now() ? Date.parse(job.nextRun) : Date.now() + job.intervalMs;
+          const generation = this.generations.get(job.id) ?? 0;
+          const arm = (target: number) => {
+            if (this.stopped || generation !== (this.generations.get(job.id) ?? 0) || !this.storage.getJob(job.id)?.enabled) return;
+            this.nextRuns.set(job.id, new Date(target));
+            this.storage.updateJob(job.id, { nextRun: new Date(target).toISOString() });
+            const timer = setTimeout(() => {
+              if (this.stopped) return;
+              const next = Date.now() + job.intervalMs!;
+              this.nextRuns.set(job.id, new Date(next));
+              void this.executeJob(job);
+              try { arm(next); } catch (error) { this.fail(job.id, error); }
+            }, Math.max(1, target - Date.now()));
+            timer.unref?.(); this.intervals.set(job.id, timer);
+          };
+          arm(anchor);
+        } else {
+          this.nextRuns.set(job.id, new Date(Date.now() + job.intervalMs));
+          const timer = setInterval(() => {
+            this.nextRuns.set(job.id, new Date(Date.now() + job.intervalMs!));
+            void this.executeJob(job);
+          }, job.intervalMs);
+          timer.unref?.();
+          this.intervals.set(job.id, timer);
+        }
       } else if (job.type === "once") {
         const target = Date.parse(job.schedule);
+        if (job.durable && Number.isFinite(target) && target <= Date.now()) {
+          if (!this.pending.has(job.id)) this.storage.updateJob(job.id, { enabled: false, lastStatus: "skipped" });
+          return;
+        }
         if (!Number.isFinite(target) || target <= Date.now()) throw new Error("One-shot time is invalid or in the past");
         this.nextRuns.set(job.id, new Date(target));
         const arm = () => {
@@ -160,6 +197,7 @@ export class CronScheduler {
         arm();
       } else {
         this.jobs.set(job.id, new Cron(job.schedule, () => { void this.executeJob(job); }));
+        if (job.durable) this.storage.updateJob(job.id, { nextRun: this.getNextRun(job.id)?.toISOString() });
       }
     } catch (error) {
       this.fail(job.id, error);
@@ -220,6 +258,7 @@ export class CronScheduler {
     if (this.stopped) return;
     const job = this.storage.getJob(id);
     if (!job?.enabled || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) return;
+    if (process.env.PI_SCHEDULE_SERVICE_SESSION && (!job.durable || !job.session || !job.maxRuns || !job.expiresAt)) { this.fail(id, new Error("Dedicated service requires finite durable session jobs")); return; }
     if ((job.expiresAt && Date.parse(job.expiresAt) <= Date.now()) ||
       (job.maxRuns !== undefined && (job.attemptCount ?? job.runCount) >= job.maxRuns)) {
       this.storage.updateJob(id, { enabled: false });
@@ -242,7 +281,9 @@ export class CronScheduler {
         this.updateJob(job.id, job);
         return;
       }
-      if (job.model) {
+      if (job.durable) {
+        if (!this.storage.queueTime(job.id, this.ctx.sessionManager.getSessionId(), this.getNextRun(job.id)?.toISOString())) return;
+      } else if (job.model) {
         if (!this.activeJobs.has(job.id)) this.executeJobInSubagent(job);
         return;
       }
@@ -254,8 +295,7 @@ export class CronScheduler {
       this.drain();
     } catch (error) {
       if (error instanceof ScheduleStoreBusyError) {
-        this.pending.add(snapshot.id);
-        this.armDrain();
+        this.deferContention(snapshot.id);
       } else this.fail(snapshot.id, error);
     }
   }
@@ -276,27 +316,32 @@ export class CronScheduler {
       this.armDrain();
       return;
     }
+    if (this.durable.busy()) { this.armDrain(); return; }
     const id = [...this.pending].find(candidate => !this.activeJobs.has(candidate));
     if (!id) { this.armDrain(); return; }
     this.pending.delete(id);
     let admitted = false;
     try {
       const eligible = this.eligible(id);
+      if (eligible?.durable && eligible.type !== "event" && !eligible.pendingIntent) this.storage.queueTime(id, this.ctx.sessionManager.getSessionId(), this.getNextRun(id)?.toISOString());
       if (eligible?.model) {
         this.executeJobInSubagent(eligible);
         this.armDrain();
         return;
       }
-      const job = eligible && this.storage.admitJob(id, this.ctx.sessionManager.getSessionId());
+      if (eligible?.durable && this.activeJobs.size) { this.pending.add(id); this.armDrain(); return; }
+      const job = eligible && (eligible.durable ? this.durable.begin(id) : this.storage.admitJob(id, this.ctx.sessionManager.getSessionId()));
+      if (!job && eligible?.durable && this.storage.getAllJobs().some(other => other.claim && other.claim.sessionId === eligible.session && other.claim.phase !== "settled")) this.pending.add(id);
       if (job) {
         admitted = true;
+        this.contention.delete(id);
         const attempts = job.attemptCount!;
         // Admission is persisted before a potentially effectful send.
         this.pi.sendMessage({
           customType: "scheduled_prompt", content: promptFor(job), display: true,
-          details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline" },
+          details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline", ...(job.claim ? { claimId: job.claim.id } : {}) },
         }, { triggerTurn: true, deliverAs: "followUp" });
-        this.storage.updateJob(id, {
+        if (!job.durable) this.storage.updateJob(id, {
           lastRun: new Date().toISOString(), lastStatus: "dispatched", runCount: job.runCount + 1,
           ...(job.type === "once" || (job.maxRuns !== undefined && attempts >= job.maxRuns) ? { enabled: false } : {}),
           nextRun: this.getNextRun(id)?.toISOString(),
@@ -305,19 +350,19 @@ export class CronScheduler {
         this.emitChange({ type: "fire", job: this.storage.getJob(id) });
       }
     } catch (error) {
-      if (!admitted && error instanceof ScheduleStoreBusyError) this.pending.add(id);
-      else this.fail(id, error);
+      if (!admitted && error instanceof ScheduleStoreBusyError) this.deferContention(id);
+      else { this.durable.finish("unknown"); this.fail(id, error); }
     }
     this.armDrain();
   }
 
   private executeJobInSubagent(snapshot: CronJob): void {
     if (this.activeJobs.has(snapshot.id) || this.stopped) return;
-    const job = this.storage.admitJob(snapshot.id, this.ctx.sessionManager.getSessionId());
+    const job = snapshot.durable ? this.durable.begin(snapshot.id) : this.storage.admitJob(snapshot.id, this.ctx.sessionManager.getSessionId());
     if (!job) return;
     const model = job.model!;
     const attempts = job.attemptCount!;
-    this.storage.updateJob(job.id, { lastStatus: "running", attemptCount: attempts,
+    if (!job.durable) this.storage.updateJob(job.id, { lastStatus: "running", attemptCount: attempts,
       ...(job.type === "once" || (job.maxRuns !== undefined && attempts >= job.maxRuns) ? { enabled: false } : {}) });
     if (this.storage.getJob(job.id)?.enabled === false) this.unscheduleJob(job.id);
     const generation = this.generations.get(job.id) ?? 0;
@@ -328,6 +373,7 @@ export class CronScheduler {
     const controller = new AbortController();
     this.activeSubagents.add(controller);
     this.activeJobs.set(job.id, controller);
+    if (job.claim) { this.durable.setAbort(job.claim.id, () => controller.abort()); this.durable.started(job.claim.id); }
     void (async () => {
       try {
         const result = await runSubagentOnce(this.ctx, promptFor(job), model, controller.signal,
@@ -338,7 +384,8 @@ export class CronScheduler {
         const text = result.ok
           ? snippet(result.text.trim()) || "(subagent produced no text output)"
           : snippet(result.error.trim()) || "(subagent failed with empty error)";
-        this.storage.updateJob(job.id, {
+        if (job.durable) this.durable.finish(result.ok ? "success" : "error");
+        else this.storage.updateJob(job.id, {
           lastRun: new Date().toISOString(), lastStatus: result.ok ? "success" : "error",
           runCount: latest.runCount + (result.ok ? 1 : 0), nextRun: this.getNextRun(job.id)?.toISOString(),
         });
@@ -353,12 +400,21 @@ export class CronScheduler {
         } catch (error) {
           console.error("Failed to post " + (result.ok ? "subagent_done" : "subagent_error") + " marker for job " + job.id + ":", error);
         }
-      } catch (error) { this.fail(job.id, error); }
+      } catch (error) { if (job.durable) this.durable.finish("unknown"); this.fail(job.id, error); }
       finally {
         this.activeSubagents.delete(controller);
         if (this.activeJobs.get(job.id) === controller) this.activeJobs.delete(job.id);
+        if (job.claim) this.durable.release(job.claim.id);
+        this.drain();
       }
     })();
+  }
+
+  private deferContention(id: string): void {
+    const failures = (this.contention.get(id) ?? 0) + 1;
+    this.contention.set(id, failures);
+    if (this.storage.getJob(id)?.durable && failures > 3) { this.fail(id, new Error("Pre-dispatch store remained busy after three retries; held without execution")); return; }
+    this.pending.add(id); this.armDrain();
   }
 
   private fail(id: string, error: unknown): void {

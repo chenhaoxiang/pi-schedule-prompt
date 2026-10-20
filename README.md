@@ -84,7 +84,7 @@ Mutations use an exclusive local lock and unique atomic replacements. Task files
 
 Settings merge global `~/.pi/agent/schedule-prompts-settings.json` defaults with project `.pi/schedule-prompts-settings.json`. The UI only writes project settings: `widgetVisible` and `defaultJobScope` (session/workdir). Runtime store faults display an unavailable state without escaping UI refresh callbacks or replacing corrupt bytes.
 
-Schedules fire only in a compatible live Pi session. Offline ticks are not replayed; past one-shots are disabled with an error. Print/JSON batch sessions do not arm timers. This is not a daemon, OS wake service, permission system or cross-session supervisor.
+Schedules fire only in a compatible live Pi session. Legacy offline ticks are not replayed; past legacy one-shots are disabled with an error. Print/JSON batch sessions do not arm timers. The optional dedicated service below maintains its own native Pi; it is not a permission system, arbitrary-terminal controller or OS sleep wake guarantee.
 
 ## Explicit model jobs
 
@@ -102,7 +102,13 @@ Stage C adds session-bound `type: "event"` jobs. `schedule` is 1–4 comma-separ
 
 Optional `github` selects `{repo, kind: "pull-request", number}` or `{repo, kind: "workflow", branch?}` with at least60 seconds between metadata-only GET polls. It is off unless the task explicitly configures it. Optional project `eventApi: {enabled:true,port,tokenEnv}` binds only127.0.0.1 and requires a separately supplied bearer token; POST `/events` accepts only `{jobId,eventName,eventId}`, and HTTP names must start with `api:`. No listener starts by default.
 
-See [event admission](docs/event-admission.md) for version2 storage, dedup bounds, source restrictions, expiry/pause and evidence limits. These are not hard financial budgets or live external-source acceptance.
+See [event admission](docs/event-admission.md) for dedup bounds, source restrictions, expiry/pause and evidence limits. This version writes schema3 and reads1/2/3; older writers refuse schema3, so do not mix runtimes on one state file. These are not hard financial budgets or live external-source acceptance.
+
+## Optional durable native supervisor
+
+Set `durable:true` only on session-bound jobs. `deadlineMs` is1,000–86,400,000ms (default600,000); `catchUp:none|latest` controls missed occurrences. Durable jobs retain one coalesced intent and unique claim, matching native session receipts and notification state. Missing post-dispatch proof becomes unknown/paused, never blind replay. Three confirmed errors stop a schedule. Durable model jobs do not allow notify:true (an extra parent inference would be unclaimed).
+
+The fixed package includes `scripts/supervisor.mjs run|status|stop|plist /private/config.json`. It owns one pinned Pi1.3 RPC child, retains normal host guards/resources/credentials, requires finite maxRuns/expiresAt on enabled service jobs, denies unattended UI consent, and exposes authenticated loopback metadata/confirmed stop. `plist` only prints an opt-in user LaunchAgent; it does not bootstrap a service. No real task, external source or global setting is created. See [durable operation](docs/durable-supervisor.md) for exact pins/recovery/HOLD and validation boundaries.
 
 ## Development and verification
 
