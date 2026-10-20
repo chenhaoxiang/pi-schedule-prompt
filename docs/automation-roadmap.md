@@ -43,7 +43,7 @@ Important differences: routines GitHub polling is not a complete CI event adapte
 
 Native custom turns; busy tick coalescing; latest-definition admission; session binding; truthful queued/dispatched/unknown; paused persistence; private serialized validated storage; optional lifetime maxRuns/expiresAt; isolated SDK coverage. No offline catch-up, external event source or daemon yet.
 
-## 5. Stage B — online supervision and fixed installation (delivered; real business pilot pending)
+## 5. Stage B — online supervision and fixed installation (delivered; one-peer stop pilot verified)
 
 ### Smallest implementation
 
@@ -61,7 +61,7 @@ Acceptance sequence: provider-free tool/SDK tests; two isolated peers plus one t
 
 Deliverable: a current-session timed supervisor genuinely advances two selected goals or reports their exact blockers, then stops at its declared boundary.
 
-Stage B source was delivered through PR #2, main d18f298, with148 tests and Node22/26 PR/post-merge CI. Release v0.4.1-fork.2 was freshly downloaded/checksummed, installed into a permanent version directory, and passed3/3 installed-manifest component cases. A dedicated pinned launcher exists with zero targets/schedules; global settings and business sessions were unchanged. Real business-goal acceptance still requires selected peers/goals.
+Stage B source was delivered through PR #2, main d18f298, with148 tests and Node22/26 PR/post-merge CI. Release v0.4.1-fork.2 was freshly downloaded/checksummed, installed into a permanent version directory, and passed3/3 installed-manifest component cases. A dedicated pinned launcher exists with zero targets/schedules; global settings and business sessions were unchanged. The operator later selected only the game-development peer. Its real custom-turn/status/early-stop pilot passed after the existing goal was found complete/awaiting-user; [pilot evidence](live-supervision-pilot.md) does not claim unfinished-goal advancement or two live business goals.
 
 ## 6. Stage C — event-driven admission and daily bounds (delivered)
 
@@ -73,7 +73,7 @@ Acceptance: duplicate events cause one admitted intent; events during busy work 
 
 Stage C delivered PR #3, merge55796b2 and release v0.4.1-fork.3:184 source tests, Node22/26 PR/post-merge CI and9 installed component cases. No real external source/API was activated.
 
-## 7. Stage D — durable unattended operation and recovery
+## 7. Stage D — durable unattended operation and recovery (delivered)
 
 The implementation envelope is opt-in durable session-bound jobs, the original schema3 store and exact native Pi receipt/owner handles, with one local durable slot. Existing interactive/broadcast modes remain compatible. The native RPC wrapper controls only its own child; selected port/config identity and live-child checks prevent duplicate takeover. Full behavior, bounds, missed-tick policy, pinned start/status/stop and opt-in launchd entry are in [the durable supervisor runbook](durable-supervisor.md).
 
@@ -84,6 +84,8 @@ Provide a minimal user-level service entry (launchd on macOS) with explicit star
 After restart, reconcile exact run/message handles first. Reattach/resume only when the owning execution API proves eligibility. Unknown or potentially effectful failures pause for diagnosis; only provably pre-effect/idempotent failures use bounded backoff. Consecutive real failures can disable a schedule; budget refusal is not a business failure. Delivery outbox states stay visible; no false 'notified' on timeout.
 
 Acceptance: controlled crash-before-dispatch, crash-after-dispatch, lost receipt, active child through parent restart, duplicate launcher, offline target, graceful stop and broken notification. No exactly-once claim for external side effects. Service/faux fixtures precede real small-scope rollout. Live machine reboot/OS sleep, 24/7 reliability and hard billing caps require their own evidence, not a unit-test inference.
+
+Stage D delivered [PR #4](https://github.com/chenhaoxiang/pi-schedule-prompt/pull/4), merge3594bbe and release v0.4.1-fork.4. Local checks218/18 files, Node22/26 PR/post-merge CI,16 installed component cases and actual native CLI faux acceptance passed. Normal-host zero-job readiness/confirmed stop also passed with real global-settings hash unchanged. The subsequent operator-selected one-peer live pilot produced one settled/success attempt, self-disabled and confirmed host stop; no always-on service was activated. Exact source/review/CI/install terminal readback: [PR4 delivery](https://github.com/chenhaoxiang/pi-schedule-prompt/pull/4#issuecomment-6289365199).
 
 ## 8. Delivery discipline and stopping
 

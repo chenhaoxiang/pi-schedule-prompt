@@ -11,6 +11,8 @@ This repository is chenhaoxiang/pi-schedule-prompt, maintained from tintinweb/pi
 
 ## Documentation map
 
+- docs/live-supervision-pilot.md: first real selected-game-peer wake/evidence/early-stop receipt; no new business implementation or always-on claim.
+
 - docs/durable-supervisor.md: stage D opt-in durable intent/claim/receipt reconciliation, bounded native RPC service and stop/install evidence.
 
 - docs/event-admission.md: stage C unified local/lifecycle/GitHub/optional loopback admission, UTC daily bounds, bounded dedup and restart policy.
