@@ -18,8 +18,8 @@ export function eventKey(job: CronJob, name: string, id: string): string {
   return createHash("sha256").update(`${job.id}:${name}:${id}`).digest("hex");
 }
 export function eventBinding(job: CronJob): string {
-  const { type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp } = job;
-  return createHash("sha256").update(JSON.stringify({ type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp })).digest("hex");
+  const { type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp, durable, deadlineMs } = job;
+  return createHash("sha256").update(JSON.stringify({ type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp, durable, deadlineMs })).digest("hex");
 }
 export function dailyLimited(job: CronJob, now = Date.now()): boolean {
   return job.maxRunsPerDay !== undefined && job.dailyUsage?.day === new Date(now).toISOString().slice(0, 10)

@@ -12,6 +12,16 @@ export interface GithubTrigger { repo: string; kind: "pull-request" | "workflow"
 export interface PendingEvent { revision: number; binding: string; keys: string[]; acceptedAt: string; }
 export type EventResult = { status: "queued" | "duplicate" | "ignored"; reason?: string };
 
+export type ExecutionOutcome = "success" | "error" | "aborted" | "unknown";
+export interface DurableIntent { revision: number; binding: string; acceptedAt: string; }
+export interface ExecutionClaim {
+  id: string; sessionId: string; ownerPid: number; ownerId: string;
+  binding: string; phase: "claimed" | "dispatched" | "started" | "settled";
+  claimedAt: string; deadlineAt: string; outcome?: ExecutionOutcome;
+}
+export interface ExecutionReceipt { jobId: string; claimId: string; sessionId: string; outcome: ExecutionOutcome; }
+export interface ExecutionNotice { claimId: string; outcome: ExecutionOutcome; state: "pending" | "accepted" | "failed"; attempts: number; }
+
 /**
  * Status of the last job execution
  */
@@ -60,6 +70,13 @@ export interface CronJob {
   catchUp?: "none" | "latest";
   github?: GithubTrigger;
   sourceFingerprint?: string;
+  /** Opt-in local durable execution, only for session-bound jobs. */
+  durable?: boolean;
+  deadlineMs?: number;
+  pendingIntent?: DurableIntent;
+  claim?: ExecutionClaim;
+  consecutiveErrors?: number;
+  notice?: ExecutionNotice;
   /** Optional description */
   description?: string;
   /** If set, run the prompt in a separate in-process agent session using this model instead of injecting into the current chat. */
@@ -134,7 +151,9 @@ export const CronToolParams = Type.Object({
   eventName: Type.Optional(Type.String({ description: "Required for trigger. Must match the existing event job schedule." })),
   eventId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for trigger; stable producer id, never prompt text." })),
   maxRunsPerDay: Type.Optional(Type.Integer({ minimum: 1, description: "UTC daily admitted-attempt limit." })),
-  catchUp: Type.Optional(StringEnum(["none", "latest"], { description: "Event restart policy; default none." })),
+  catchUp: Type.Optional(StringEnum(["none", "latest"], { description: "Missed event/durable timer policy; default none." })),
+  durable: Type.Optional(Type.Boolean({ description: "Opt-in durable claims; requires session binding. Unknown execution pauses, never blindly retries." })),
+  deadlineMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86400000, description: "Durable run elapsed deadline; default 600000. Abort is not rollback." })),
   github: Type.Optional(Type.Object({ repo: Type.String(), kind: StringEnum(["pull-request", "workflow"]), number: Type.Optional(Type.Integer({ minimum: 1 })), branch: Type.Optional(Type.String()), pollSeconds: Type.Optional(Type.Integer({ minimum: 60, maximum: 3600 })) })),
   maxRuns: Type.Optional(Type.Integer({ minimum: 1, description: "Lifetime dispatch/attempt limit, not a token or invoice cap." })),
   expiresAt: Type.Optional(Type.String({ description: "Absolute ISO expiry. New fires stop at this time." })),

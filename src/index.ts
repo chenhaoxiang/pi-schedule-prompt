@@ -100,6 +100,10 @@ export default async function (pi: ExtensionAPI) {
     scheduler = new CronScheduler(storage, pi, ctx);
     widget = new CronWidget(storage, scheduler, pi, isWidgetVisible, ctx.sessionManager.getSessionId());
 
+    const serviceSession = process.env.PI_SCHEDULE_SERVICE_SESSION;
+    if (serviceSession && (serviceSession !== ctx.sessionManager.getSessionId() || storage.getAllJobs().some(job => job.enabled && (!job.session || (job.session === serviceSession && (!job.durable || !job.maxRuns || !job.expiresAt)))))) {
+      throw new Error("Dedicated service requires finite exact session-bound durable schedules");
+    }
     // Batch invocations register management tools without running background timers.
     if (ctx.mode === "print" || ctx.mode === "json") { scheduler.stop(); return; }
     scheduler.start();
@@ -164,14 +168,16 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event) => {
     scheduler?.setScheduledTurn(event.messageType === "custom" && event.message.customType === "scheduled_prompt");
+    scheduler?.onScheduledStart(event.messageType === "custom" && event.message.customType === "scheduled_prompt" ? (event.message.details as { claimId?: string } | undefined)?.claimId : undefined);
   });
-  pi.on("agent_settled", () => {
+  pi.on("message_end", event => { scheduler?.onMessageEnd(event.message); });
+  pi.on("agent_settled", event => {
     if (scheduler && !scheduler.isScheduledTurn()) {
       try { scheduler.emitEvent("lifecycle:agent-settled", randomUUID()); }
       catch { console.error("Lifecycle event admission unavailable"); }
     }
     scheduler?.setScheduledTurn(false);
-    scheduler?.onAgentSettled();
+    scheduler?.onAgentSettled(event.aborted);
   });
 
   const stopEventBus = pi.events.on(EVENT_REQUEST, payload => {
@@ -188,6 +194,17 @@ export default async function (pi: ExtensionAPI) {
     catch { console.error("Local event observer failed"); }
   });
   pi.on("session_shutdown", () => { stopEventBus(); });
+
+  pi.registerCommand("schedule-host-status", {
+    description: "Metadata-only readiness handshake for the dedicated native host",
+    handler: async (args, ctx) => {
+      if (!/^[a-f0-9]{32}$/.test(args)) return;
+      pi.sendMessage({ customType: "schedule_host_status", display: false, content: "Scheduling host readiness", details: {
+        requestId: args, ready: !!scheduler?.isRunning(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(),
+        jobs: storage?.getAllJobs().filter(job => CronScheduler.isLoadedFor(job, ctx.sessionManager.getSessionId())).length ?? 0,
+      } });
+    },
+  });
 
   // --- Register /schedule-prompt command ---
 

@@ -154,12 +154,12 @@ describe("unified event admission", () => {
     expect(h.storage.getJob("event")?.session).toBe("owner"); h.scheduler.stop();
   });
 
-  it("does not spend attempts on duplicate/locked admission and writes version2", () => {
+  it("does not spend attempts on duplicate/locked admission and writes version3", () => {
     const h = setup();
     fs.writeFileSync(h.storage.getStorePath() + ".lock", "other");
     expect(() => h.scheduler.receiveEvent("event", "local:build", "one")).toThrow(/busy/);
     fs.rmSync(h.storage.getStorePath() + ".lock");
     expect(h.storage.getJob("event")?.attemptCount).toBeUndefined();
-    expect(h.storage.load().version).toBe(2); h.scheduler.stop();
+    expect(h.storage.load().version).toBe(3); h.scheduler.stop();
   });
 });

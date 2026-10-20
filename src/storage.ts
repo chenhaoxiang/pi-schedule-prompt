@@ -2,14 +2,14 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName } from "./events.js";
-import type { CronJob, CronStore, EventResult } from "./types.js";
+import type { CronJob, CronStore, EventResult, ExecutionOutcome, ExecutionReceipt } from "./types.js";
 
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped"]);
 
 function validate(store: unknown): asserts store is CronStore {
   if (!store || typeof store !== "object") throw new Error("Invalid schedule store");
   const data = store as CronStore;
-  if (![1, 2].includes(data.version) || !Array.isArray(data.jobs)) throw new Error("Unsupported schedule store");
+  if (![1, 2, 3].includes(data.version) || !Array.isArray(data.jobs)) throw new Error("Unsupported schedule store");
   const ids = new Set<string>();
   const names = new Set<string>();
   for (const job of data.jobs) {
@@ -43,6 +43,16 @@ function validate(store: unknown): asserts store is CronStore {
     }
     if (job.pendingEvent && (!Number.isSafeInteger(job.pendingEvent.revision) || !/^[a-f0-9]{64}$/.test(job.pendingEvent.binding) || !Number.isFinite(Date.parse(job.pendingEvent.acceptedAt)))) throw new Error("Invalid pending event");
     if (job.sourceFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(job.sourceFingerprint)) throw new Error("Invalid source fingerprint");
+    if ((job.durable !== undefined && typeof job.durable !== "boolean") || (job.durable && (!job.session || job.notify === true)) ||
+      (job.deadlineMs !== undefined && (!Number.isSafeInteger(job.deadlineMs) || job.deadlineMs < 1000 || job.deadlineMs > 86400000)) ||
+      (job.consecutiveErrors !== undefined && (!Number.isSafeInteger(job.consecutiveErrors) || job.consecutiveErrors < 0))) throw new Error("Invalid durable job bounds/session");
+    if (job.pendingIntent && (!Number.isSafeInteger(job.pendingIntent.revision) || !/^[a-f0-9]{64}$/.test(job.pendingIntent.binding) || !Number.isFinite(Date.parse(job.pendingIntent.acceptedAt)))) throw new Error("Invalid durable intent");
+    const claim = job.claim;
+    if (claim && (!job.durable || !validEventId(claim.id) || !validEventId(claim.ownerId) || claim.sessionId !== job.session || !Number.isSafeInteger(claim.ownerPid) || claim.ownerPid < 1 ||
+      !/^[a-f0-9]{64}$/.test(claim.binding) || !["claimed", "dispatched", "started", "settled"].includes(claim.phase) ||
+      ![claim.claimedAt, claim.deadlineAt].every(date => Number.isFinite(Date.parse(date))) ||
+      (claim.outcome !== undefined && !["success", "error", "aborted", "unknown"].includes(claim.outcome)))) throw new Error("Invalid durable claim");
+    if (job.notice && (!validEventId(job.notice.claimId) || !["success", "error", "aborted", "unknown"].includes(job.notice.outcome) || !["pending", "accepted", "failed"].includes(job.notice.state) || !Number.isSafeInteger(job.notice.attempts) || job.notice.attempts < 0 || job.notice.attempts > 3)) throw new Error("Invalid notification state");
     if (ids.has(job.id) || names.has(job.name)) throw new Error("Duplicate scheduled job id or name");
     ids.add(job.id);
     names.add(job.name);
@@ -93,7 +103,7 @@ export class CronStorage {
       fs.writeFileSync(fd, JSON.stringify({ pid: process.pid }));
       const store = this.load();
       const result = change(store);
-      store.version = 2;
+      store.version = 3;
       validate(store);
       const output = fs.openSync(temporary, "wx", 0o600);
       try {
@@ -103,6 +113,8 @@ export class CronStorage {
         fs.closeSync(output);
       }
       fs.renameSync(temporary, this.storePath);
+      const directory = fs.openSync(this.piDir, "r");
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
       return result;
     } finally {
       fs.rmSync(temporary, { force: true });
@@ -115,7 +127,7 @@ export class CronStorage {
   admitJob(id: string, sessionId: string | undefined): CronJob | undefined {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job?.enabled || (job.session && job.session !== sessionId)) return;
+      if (!job?.enabled || job.durable || (job.session && job.session !== sessionId)) return;
       if ((job.expiresAt && Date.parse(job.expiresAt) <= Date.now()) ||
         (job.maxRuns !== undefined && (job.attemptCount ?? job.runCount) >= job.maxRuns)) {
         job.enabled = false;
@@ -129,6 +141,110 @@ export class CronStorage {
       job.attemptCount = (job.attemptCount ?? job.runCount) + 1;
       job.lastStatus = "unknown";
       return { ...job };
+    });
+  }
+
+  queueTime(id: string, sessionId: string | undefined, nextRun?: string): boolean {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job?.durable || !job.enabled || job.session !== sessionId) return false;
+      job.pendingIntent = { revision: job.revision ?? 0, binding: eventBinding(job), acceptedAt: new Date().toISOString() };
+      if (!job.claim || job.claim.phase === "settled") job.lastStatus = "queued";
+      job.nextRun = nextRun;
+      return true;
+    });
+  }
+
+  claimJob(id: string, sessionId: string, ownerId: string): CronJob | undefined {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job?.durable || !job.enabled || job.session !== sessionId ||
+        (job.claim && (job.claim.phase !== "settled" || ["unknown", "aborted"].includes(job.claim.outcome ?? "unknown")))) return;
+      if (store.jobs.some(other => other.id !== id && other.durable && other.claim?.sessionId === sessionId && other.claim.phase !== "settled")) return;
+      const pending = job.type === "event" ? job.pendingEvent : job.pendingIntent;
+      if (!pending || pending.revision !== (job.revision ?? 0) || pending.binding !== eventBinding(job)) { job.pendingIntent = undefined; job.pendingEvent = undefined; return; }
+      if ((job.expiresAt && Date.parse(job.expiresAt) <= Date.now()) || (job.maxRuns !== undefined && (job.attemptCount ?? job.runCount) >= job.maxRuns)) { job.enabled = false; return; }
+      if (dailyLimited(job)) { job.lastStatus = "skipped"; return; }
+      const day = new Date().toISOString().slice(0, 10);
+      job.dailyUsage = { day, attempts: (job.dailyUsage?.day === day ? job.dailyUsage.attempts : 0) + 1 };
+      job.attemptCount = (job.attemptCount ?? job.runCount) + 1;
+      job.pendingIntent = undefined;
+      job.pendingEvent = undefined;
+      job.claim = { id: randomUUID(), ownerId, ownerPid: process.pid, sessionId, binding: eventBinding(job), phase: "claimed", claimedAt: new Date().toISOString(), deadlineAt: new Date(Date.now() + (job.deadlineMs ?? 600000)).toISOString() };
+      job.lastStatus = "unknown";
+      return structuredClone(job);
+    });
+  }
+
+  markClaim(id: string, claimId: string, phase: "dispatched" | "started"): boolean {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job?.claim || job.claim.id !== claimId || job.claim.phase === "settled") return false;
+      if (job.claim.phase === phase) return true;
+      if (phase === "dispatched" && (!job.enabled || job.claim.binding !== eventBinding(job))) return false;
+      if ((phase === "dispatched" && job.claim.phase !== "claimed") || (phase === "started" && job.claim.phase !== "dispatched")) return false;
+      job.claim.phase = phase;
+      job.lastStatus = phase === "started" ? "running" : "dispatched";
+      job.lastRun = new Date().toISOString();
+      if (phase === "dispatched") {
+        if (!job.model) job.runCount += 1;
+        if (job.type === "once" || (job.maxRuns !== undefined && (job.attemptCount ?? 0) >= job.maxRuns)) job.enabled = false;
+      }
+      return true;
+    });
+  }
+
+  private settleInto(job: CronJob, outcome: ExecutionOutcome): void {
+    if (!job.claim || job.claim.phase === "settled") return;
+    job.claim.phase = "settled";
+    job.claim.outcome = outcome;
+    job.lastStatus = outcome === "aborted" ? "unknown" : outcome;
+    if (job.model && outcome === "success") job.runCount += 1;
+    job.consecutiveErrors = outcome === "error" ? (job.consecutiveErrors ?? 0) + 1 : outcome === "success" ? 0 : job.consecutiveErrors;
+    if (["unknown", "aborted"].includes(outcome) || (job.consecutiveErrors ?? 0) >= 3) job.enabled = false;
+    job.notice = { claimId: job.claim.id, outcome, state: "pending", attempts: 0 };
+  }
+
+  settleClaim(receipt: ExecutionReceipt): boolean {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === receipt.jobId);
+      if (!job?.claim || job.claim.id !== receipt.claimId || job.claim.sessionId !== receipt.sessionId) return false;
+      this.settleInto(job, receipt.outcome);
+      return true;
+    });
+  }
+
+  recordNotice(id: string, claimId: string, accepted: boolean): void {
+    this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job?.notice || job.notice.claimId !== claimId || job.notice.state === "accepted") return;
+      job.notice.attempts = Math.min(3, job.notice.attempts + 1);
+      job.notice.state = accepted ? "accepted" : "failed";
+      // Notice failure is not execution failure and does not disable future admissions.
+    });
+  }
+
+  /** Reconcile only exact session receipts; never infer completion from a dead process. */
+  reconcileJob(id: string, sessionId: string, ownerId: string, receipts: ExecutionReceipt[], ownerAlive: (pid: number) => boolean): void {
+    this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job?.durable || job.session !== sessionId || !job.claim || job.claim.phase === "settled") return;
+      const claim = job.claim;
+      const receipt = receipts.find(item => item.jobId === id && item.claimId === claim.id && item.sessionId === sessionId);
+      if (receipt) { this.settleInto(job, receipt.outcome); return; }
+      if (claim.ownerId === ownerId || ownerAlive(claim.ownerPid)) return;
+      if (claim.phase === "claimed") {
+        // No effectful dispatch was entered. Release exactly this unspent attempt.
+        job.attemptCount = Math.max(0, (job.attemptCount ?? 1) - 1);
+        if (job.dailyUsage?.day === claim.claimedAt.slice(0, 10)) job.dailyUsage.attempts = Math.max(0, job.dailyUsage.attempts - 1);
+        job.claim = undefined;
+        if (job.catchUp === "latest" && claim.binding === eventBinding(job)) {
+          const intent = { revision: job.revision ?? 0, binding: claim.binding, acceptedAt: claim.claimedAt };
+          if (job.type === "event") job.pendingEvent = { ...intent, keys: [] };
+          else job.pendingIntent = intent;
+          job.lastStatus = "queued";
+        } else job.lastStatus = "skipped";
+      } else this.settleInto(job, "unknown");
     });
   }
 
@@ -191,10 +307,10 @@ export class CronStorage {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job) return false;
-      const configKeys = ["name", "schedule", "prompt", "enabled", "model", "notify", "extensions", "skills", "session", "maxRuns", "expiresAt", "maxRunsPerDay", "catchUp", "github"];
+      const configKeys = ["name", "schedule", "prompt", "enabled", "model", "notify", "extensions", "skills", "session", "maxRuns", "expiresAt", "maxRunsPerDay", "catchUp", "github", "durable", "deadlineMs"];
       const changed = configKeys.some(key => key in partial && JSON.stringify(job[key as keyof CronJob]) !== JSON.stringify(partial[key as keyof CronJob]));
       Object.assign(job, partial);
-      if (changed) { job.revision = (job.revision ?? 0) + 1; job.pendingEvent = undefined; job.sourceFingerprint = undefined; }
+      if (changed) { job.revision = (job.revision ?? 0) + 1; job.pendingEvent = undefined; job.pendingIntent = undefined; job.sourceFingerprint = undefined; job.nextRun = undefined; }
       return true;
     });
   }
