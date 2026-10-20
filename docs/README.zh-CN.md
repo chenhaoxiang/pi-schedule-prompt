@@ -65,6 +65,10 @@ created: 2026-10-20
 
 同一周期任务只能由一个调度器负责。显式 model 模式仍可启动有工具能力的新会话，不是沙箱；默认工具包括 bash/read/edit/write/grep/find/ls，默认不加载扩展/技能，显式启用时需审阅对应能力。
 
+## 总控与后续路线
+
+`/supervise` 提供有限范围的监督提示模板，复用现有 Intercom/Subagents 工具；必须明确目标会话、仓库、已有目标/证据来源及次数/到期限制，不会自动接管全部会话。运行与真实试点边界见 [在线总控](online-supervision.md)，事件与常驻阶段见 [统一路线](automation-roadmap.md)。
+
 ## 开发与验证
 
 执行 `npm ci --ignore-scripts --no-audit --no-fund`，再执行 `npm run check`。检查包含 lint、类型、有限并发无提供商回归和构建。真实 SDK 夹具使用内存 faux provider、隔离资源，不读取真实凭据或调用付费模型。

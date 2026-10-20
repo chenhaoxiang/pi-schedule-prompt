@@ -92,6 +92,10 @@ The upstream `model` option remains available: it creates a fresh in-process ses
 
 For our composed setup, prefer inline waking of the owning session, Intercom for existing peers and pi-subagents for independent workflows/worktrees. Do not register the same recurring job in both schedulers. A persisted schedule does not extend authorization.
 
+## Composed supervision rollout
+
+`/supervise` is a packaged bounded supervision recipe using the existing Intercom/Subagents tools. It requires exact selected peers, existing goal/evidence references and finite check/expiry limits; it does not automatically control other sessions. See [online operation](docs/online-supervision.md) and the [single overall roadmap](docs/automation-roadmap.md) for online, event and durable stages.
+
 ## Development and verification
 
 ```sh

@@ -12,6 +12,8 @@ permissions:
 jobs:
   provider-free-tests:
     runs-on: ubuntu-latest
+    env:
+      PI_SCHEDULE_FIXTURE_ROOT: ${{ runner.temp }}/tmp/pi-schedule-online
     strategy:
       fail-fast: false
       matrix:
