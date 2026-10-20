@@ -13,7 +13,7 @@ function fixture(extra: Partial<CronJob> = {}) {
   const cwd = fs.mkdtempSync(path.join(base, "case-")); owned.push(cwd);
   const storage = new CronStorage(cwd); storage.addJob(seed(extra));
   const receipts: ExecutionReceipt[] = [];
-  const pi = { sendMessage: vi.fn(), appendEntry: vi.fn((_type, data) => receipts.push(data)), events: { emit: vi.fn() } };
+  const pi = { sendMessage: vi.fn(), appendEntry: vi.fn((type, data) => { if (type === "schedule_execution") receipts.push(data); }), events: { emit: vi.fn() } };
   const ctx = { cwd, hasUI: true, ui: { notify: vi.fn() }, abort: vi.fn(), isIdle: () => true, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "owner", getEntries: () => [] } };
   return { cwd, storage, pi, ctx, receipts, durable: new DurableExecution(storage, pi as any, ctx as any) };
@@ -100,6 +100,24 @@ describe("native execution envelope", () => {
     await vi.advanceTimersByTimeAsync(1100); expect(h.ctx.abort).not.toHaveBeenCalled();
     expect(h.storage.getJob("one")?.enabled).toBe(false);
   });
+  it("keeps a model deadline hold through unrelated parent settlement until the exact child releases", async () => {
+    const h = fixture({ model: "synthetic/model", deadlineMs: 1000 }); h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!; h.durable.started(job.claim!.id);
+    const abort = vi.fn(); h.durable.setAbort(job.claim!.id, abort);
+    await vi.advanceTimersByTimeAsync(1100); expect(abort).toHaveBeenCalledOnce();
+    h.durable.started(undefined); h.durable.settled(false); expect(h.durable.busy()).toBe(true);
+    h.durable.release("foreign"); expect(h.durable.busy()).toBe(true);
+    h.durable.release(job.claim!.id); expect(h.durable.busy()).toBe(false);
+  });
+  it("retains the exact stopped run slot until its owned native turn settles", () => {
+    const h = fixture(); h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!; h.durable.started(job.claim!.id);
+    h.durable.stop(); expect(h.durable.busy()).toBe(true);
+    h.durable.settled(true); expect(h.durable.busy()).toBe(false);
+  });
+  it("classifies observed output truncation as a confirmed error, not unknown effects", () => {
+    const h = fixture(); h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!; h.durable.started(job.claim!.id);
+    h.durable.messageEnd({ role: "assistant", stopReason: "length" }); h.durable.settled(false);
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: true, consecutiveErrors: 1, lastStatus: "error", claim: { outcome: "error" } });
+  });
   it("allows only one durable execution per scheduler, not one per job", () => {
     const h = fixture(); h.storage.addJob(seed({ id: "two", name: "two" }));
     h.storage.queueTime("one", "owner"); h.storage.queueTime("two", "owner");
@@ -121,6 +139,25 @@ describe("native execution envelope", () => {
     h.pi.events.emit.mockReset(); h.durable.flushNotices();
     expect(h.storage.getJob("one")).toMatchObject({ notice: { state: "accepted", attempts: 2 }, attemptCount: 1, lastStatus: "error" });
     expect(h.pi.sendMessage).not.toHaveBeenCalled();
+  });
+  it("keeps local event acceptance when an optional UI notice fails", () => {
+    const h = fixture(); h.ctx.ui.notify.mockImplementation(() => { throw new Error("UI unavailable"); });
+    h.storage.queueTime("one", "owner"); h.durable.begin("one"); h.durable.finish("error");
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: true, notice: { state: "accepted" } });
+  });
+  it("does not disable or block future work solely because three notice deliveries failed", () => {
+    const h = fixture(); h.pi.events.emit.mockImplementation(() => { throw new Error("observer unavailable"); });
+    h.storage.queueTime("one", "owner"); h.durable.begin("one"); h.durable.finish("success"); h.durable.flushNotices(); h.durable.flushNotices();
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: true, lastStatus: "success", notice: { state: "failed", attempts: 3 } });
+    h.storage.queueTime("one", "owner"); expect(h.durable.begin("one")).toBeDefined(); h.durable.stop();
+  });
+  it("uses event dedup/daily limits through the same durable claim and settlement", () => {
+    const h = fixture({ type: "event", schedule: "local:build", maxRunsPerDay: 1 });
+    expect(h.storage.queueEvent("one", "local:build", "id1", "owner").status).toBe("queued");
+    const job = h.durable.begin("one")!; h.durable.started(job.claim!.id); h.durable.messageEnd({ role: "assistant", stopReason: "stop" }); h.durable.settled(false);
+    expect(h.storage.queueEvent("one", "local:build", "id1", "owner").status).toBe("duplicate");
+    expect(h.storage.queueEvent("one", "local:build", "id2", "owner")).toMatchObject({ status: "ignored", reason: "daily-limit" });
+    expect(h.storage.getJob("one")).toMatchObject({ attemptCount: 1, claim: { phase: "settled", outcome: "success" } });
   });
   it("serializes claims across jobs and cooperating storage/scheduler instances", () => {
     const h = fixture(); h.storage.addJob(seed({ id: "two", name: "two" }));

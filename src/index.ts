@@ -168,7 +168,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event) => {
     scheduler?.setScheduledTurn(event.messageType === "custom" && event.message.customType === "scheduled_prompt");
-    if (event.messageType === "custom" && event.message.customType === "scheduled_prompt") scheduler?.onScheduledStart((event.message.details as { claimId?: string } | undefined)?.claimId);
+    scheduler?.onScheduledStart(event.messageType === "custom" && event.message.customType === "scheduled_prompt" ? (event.message.details as { claimId?: string } | undefined)?.claimId : undefined);
   });
   pi.on("message_end", event => { scheduler?.onMessageEnd(event.message); });
   pi.on("agent_settled", event => {

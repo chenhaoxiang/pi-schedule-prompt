@@ -41,7 +41,7 @@
     "build": "tsc",
     "test": "vitest run --maxWorkers=2",
     "check": "npm run lint && npm run typecheck && npm run check:scripts && npm test && npm run build",
-    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/install-fixed.mjs && node --check test/online-smoke.mjs && node --check scripts/supervisor.mjs && node --check scripts/supervisor-rpc.mjs && node --check test/supervisor-native.mjs",
+    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/install-fixed.mjs && node --check test/online-smoke.mjs && node --check scripts/supervisor.mjs && node --check scripts/supervisor-rpc.mjs && node --check test/supervisor-native.mjs && node --check test/installed-native-cli.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",

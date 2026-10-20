@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -11,12 +11,17 @@ const owned: string[] = []; const children: ChildProcess[] = [];
 const hostScript = path.resolve("scripts/supervisor.mjs");
 const digest = (buffer: Buffer) => createHash("sha256").update(buffer).digest("hex");
 async function port() {
-  const server = net.createServer();
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  const selected = (server.address() as net.AddressInfo).port;
-  await new Promise<void>(resolve => server.close(() => resolve()));
-  if (selected < 49152) return port();
-  return selected;
+  // Some Linux runners allocate port0 only below49152; never recursively filter their ephemeral range.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const selected = randomInt(49152, 65536);
+    const server = net.createServer();
+    const bound = await new Promise<boolean>((resolve, reject) => {
+      server.once("error", error => { if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") resolve(false); else reject(error); });
+      server.listen(selected, "127.0.0.1", () => resolve(true));
+    });
+    if (bound) { await new Promise<void>(resolve => server.close(() => resolve())); return selected; }
+  }
+  throw new Error("No free fixture control port after20 bounded attempts");
 }
 async function fixture() {
   fs.mkdirSync(root, { recursive: true }); const cwd = fs.mkdtempSync(path.join(root, "case-")); owned.push(cwd);

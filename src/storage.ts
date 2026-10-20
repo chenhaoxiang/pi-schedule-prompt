@@ -159,8 +159,7 @@ export class CronStorage {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job?.durable || !job.enabled || job.session !== sessionId ||
-        (job.claim && (job.claim.phase !== "settled" || ["unknown", "aborted"].includes(job.claim.outcome ?? "unknown"))) ||
-        (job.notice && job.notice.state !== "accepted")) return;
+        (job.claim && (job.claim.phase !== "settled" || ["unknown", "aborted"].includes(job.claim.outcome ?? "unknown")))) return;
       if (store.jobs.some(other => other.id !== id && other.durable && other.claim?.sessionId === sessionId && other.claim.phase !== "settled")) return;
       const pending = job.type === "event" ? job.pendingEvent : job.pendingIntent;
       if (!pending || pending.revision !== (job.revision ?? 0) || pending.binding !== eventBinding(job)) { job.pendingIntent = undefined; job.pendingEvent = undefined; return; }
@@ -221,7 +220,7 @@ export class CronStorage {
       if (!job?.notice || job.notice.claimId !== claimId || job.notice.state === "accepted") return;
       job.notice.attempts = Math.min(3, job.notice.attempts + 1);
       job.notice.state = accepted ? "accepted" : "failed";
-      if (!accepted && job.notice.attempts >= 3) job.enabled = false;
+      // Notice failure is not execution failure and does not disable future admissions.
     });
   }
 

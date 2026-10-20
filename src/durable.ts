@@ -15,7 +15,8 @@ export class DurableExecution {
   readonly ownerId = randomUUID();
   private active?: { job: CronJob; started: boolean; stopReason?: string; deadline: NodeJS.Timeout; abort?: () => void };
   private sessionId: string;
-  private heldClaim?: string;
+  private heldClaim?: { id: string; started: boolean; model: boolean };
+  private turnClaimId?: string;
   constructor(private storage: CronStorage, private pi: ExtensionAPI, private ctx: ExtensionContext) {
     this.sessionId = ctx.sessionManager.getSessionId() ?? "";
   }
@@ -37,7 +38,7 @@ export class DurableExecution {
   }
 
   busy(): boolean { return !!this.active || !!this.heldClaim; }
-  release(claimId: string): void { if (this.heldClaim === claimId) this.heldClaim = undefined; }
+  release(claimId: string): void { if (this.heldClaim?.id === claimId) this.heldClaim = undefined; }
   begin(id: string): CronJob | undefined {
     if (this.busy()) return;
     this.flushNotices();
@@ -47,7 +48,7 @@ export class DurableExecution {
       const current = this.active;
       if (!current || current.job.claim?.id !== job.claim?.id) return;
       // Never abort an unrelated host turn if our custom message never started.
-      this.heldClaim = job.claim?.id;
+      this.heldClaim = { id: job.claim!.id, started: current.started, model: !!job.model };
       current.abort?.();
       if (!job.model && current.started) this.ctx.abort();
       this.finish("unknown");
@@ -65,6 +66,12 @@ export class DurableExecution {
   }
 
   started(claimId: unknown): void {
+    this.turnClaimId = typeof claimId === "string" ? claimId : undefined;
+    if (this.heldClaim && this.heldClaim.id === claimId && !this.heldClaim.model) {
+      this.heldClaim.started = true;
+      this.ctx.abort(); // An already accepted but late-starting timed-out custom turn is not a new attempt.
+      return;
+    }
     const current = this.active;
     if (!current || current.job.claim?.id !== claimId) return;
     current.started = true;
@@ -77,9 +84,13 @@ export class DurableExecution {
   }
 
   settled(aborted: boolean): void {
-    if (!this.active) { this.heldClaim = undefined; return; }
-    if (!this.active.started || this.active.job.model) return;
-    this.finish(aborted ? "aborted" : this.active.stopReason === "error" ? "error"
+    if (!this.active) {
+      if (this.heldClaim?.started && !this.heldClaim.model && this.turnClaimId === this.heldClaim.id) this.heldClaim = undefined;
+      this.turnClaimId = undefined;
+      return;
+    }
+    if (!this.active.started || this.active.job.model || this.turnClaimId !== this.active.job.claim?.id) return;
+    this.finish(aborted || this.active.stopReason === "aborted" ? "aborted" : ["error", "length"].includes(this.active.stopReason ?? "") ? "error"
       : this.active.stopReason === "stop" ? "success" : "unknown");
   }
 
@@ -99,6 +110,7 @@ export class DurableExecution {
 
   stop(): void {
     if (!this.active) return;
+    this.heldClaim = { id: this.active.job.claim!.id, started: this.active.started, model: !!this.active.job.model };
     this.active.abort?.();
     if (this.active.started && !this.active.job.model) this.ctx.abort();
     this.finish("unknown");
@@ -111,14 +123,16 @@ export class DurableExecution {
       let accepted = false;
       try {
         this.pi.events.emit("schedule:execution", { version: 1, jobId: job.id, ...notice });
-        if (notice.outcome !== "success") {
-          if (!this.ctx.hasUI) throw new Error("No local notice sink");
-          this.ctx.ui.notify(`Scheduled execution ${notice.outcome}: ${job.id}; inspect exact claim`, "warning");
-        }
         accepted = true;
+        if (notice.outcome !== "success" && this.ctx.hasUI) {
+          try { this.ctx.ui.notify(`Scheduled execution ${notice.outcome}: ${job.id}; inspect exact claim`, "warning"); }
+          catch { console.error("[pi-schedule-prompt] Supplementary UI notice unavailable; local event acceptance is unchanged"); }
+        }
       } catch { console.error("[pi-schedule-prompt] Execution notice delivery failed; execution will not be replayed"); }
-      try { this.storage.recordNotice(job.id, notice.claimId, accepted); }
-      catch { console.error("[pi-schedule-prompt] Notification receipt not persisted"); }
+      try {
+        this.storage.recordNotice(job.id, notice.claimId, accepted);
+        this.pi.appendEntry("schedule_notice", { jobId: job.id, claimId: notice.claimId, state: accepted ? "accepted" : "failed", attempts: notice.attempts + 1 });
+      } catch { console.error("[pi-schedule-prompt] Notification receipt not persisted"); }
     }
   }
 }
