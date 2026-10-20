@@ -146,6 +146,7 @@ export class JobsView implements Component {
       // already running in this cwd won't see the change until they restart;
       // their in-memory schedulers are stale until session_start.
       if (this.isSelectionForeign()) return;
+      if (sel.type === "event") { this.operationError = "Event jobs stay session-bound."; return; }
       const session = sel.session ? undefined : this.mySessionId;
       this.storage.updateJob(sel.id, { session });
       this.scheduler.updateJob(sel.id, { ...sel, session });
@@ -253,7 +254,7 @@ export class JobsView implements Component {
       icon = this.theme.fg("warning", "⟳");
     } else if (job.lastStatus === "error") {
       icon = this.theme.fg("error", "!");
-    } else if (job.lastStatus === "queued" || job.lastStatus === "unknown") {
+    } else if (job.lastStatus === "queued" || job.lastStatus === "unknown" || job.lastStatus === "skipped") {
       icon = this.theme.fg("warning", "?");
     } else if (job.lastStatus === "dispatched") {
       icon = this.theme.fg("dim", "→");

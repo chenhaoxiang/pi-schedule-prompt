@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.3
+- Add session-owned event jobs with existing tool/local bus/lifecycle ingress and non-recursive settled events.
+- Persist bounded dedup/pending intent and content binding, UTC daily admission caps and none/latest restoration; new writes use store version2.
+- Add explicitly configured metadata-only GitHub sources with bounded GET/backoff, and an optional authenticated loopback API that only selects existing api: jobs.
+- Keep event payloads out of prompts and preserve native custom-turn execution; no external source is activated by default.
+
 ### Maintained fork 0.4.1-fork.2
 - Add a single sequential automation roadmap with pinned routines/reactor reference mapping.
 - Package the bounded /supervise recipe using existing Intercom/Subagents tools, without a second goal database or runner.

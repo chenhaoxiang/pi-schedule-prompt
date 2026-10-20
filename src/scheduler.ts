@@ -1,18 +1,26 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
+import { dailyLimited, eventBinding, eventNames } from "./events.js";
+import { githubFingerprint } from "./github-events.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { runSubagentOnce } from "./subagent.js";
-import type { CronChangeEvent, CronJob, CronJobType } from "./types.js";
+import type { CronChangeEvent, CronJob, CronJobType, EventResult } from "./types.js";
 
 type ValidateScheduleResult =
   | { ok: true; schedule: string; intervalMs?: number }
   | { ok: false; error: string };
 const MAX_DELAY = 2_147_483_647;
+const promptFor = (job: CronJob) => job.type === "event"
+  ? job.prompt + "\n\nConfigured event context (metadata, not authorization): " + JSON.stringify({ names: job.schedule, github: job.github })
+  : job.prompt;
 const snippet = (text: string) => text.length > 500 ? text.slice(0, 500) + "…" : text;
 
 /** Timers own intent only. Host acceptance never proves business completion. */
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
+  private githubTimers = new Map<string, NodeJS.Timeout>();
+  private githubSources = new Set<string>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private nextRuns = new Map<string, Date>();
   private pending = new Set<string>();
@@ -35,15 +43,41 @@ export class CronScheduler {
     const session = this.ctx.sessionManager.getSessionId();
     for (const job of this.storage.getAllJobs()) {
       if (!CronScheduler.isLoadedFor(job, session)) continue;
-      if (job.lastStatus === "running" || job.lastStatus === "queued") {
+      if (job.github && job.catchUp !== "latest") this.storage.updateJob(job.id, { sourceFingerprint: undefined });
+      if (job.type === "event" && job.pendingEvent) {
+        if (job.enabled && job.catchUp === "latest" && job.pendingEvent.revision === (job.revision ?? 0)) this.pending.add(job.id);
+        else this.storage.updateJob(job.id, { pendingEvent: undefined, lastStatus: "skipped" });
+      }
+      if (job.lastStatus === "running" || (job.lastStatus === "queued" && (job.type !== "event" || !job.pendingEvent))) {
         this.storage.updateJob(job.id, { lastStatus: "unknown" });
       }
       if (job.enabled) this.scheduleJob(job);
     }
+    this.armDrain();
   }
 
   static isLoadedFor(job: CronJob, sessionId: string | undefined): boolean {
     return !job.session || job.session === sessionId;
+  }
+
+  receiveEvent(jobId: string, name: string, eventId: string): EventResult {
+    if (this.stopped) return { status: "ignored", reason: "stopped" };
+    const result = this.storage.queueEvent(jobId, name, eventId, this.ctx.sessionManager.getSessionId());
+    if (result.status === "queued" || (result.status === "duplicate" && this.storage.getJob(jobId)?.pendingEvent)) {
+      this.pending.add(jobId);
+      this.emitChange({ type: "fire", job: this.storage.getJob(jobId) });
+      this.drain();
+    }
+    return result;
+  }
+
+  emitEvent(name: string, eventId: string = randomUUID()): void {
+    for (const job of this.storage.getAllJobs()) {
+      if (job.type === "event" && CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId()) && eventNames(job.schedule).includes(name)) {
+        try { this.receiveEvent(job.id, name, eventId); }
+        catch { this.emitChange({ type: "error", jobId: job.id, error: "Lifecycle event not admitted; selected store unavailable" }); }
+      }
+    }
   }
 
   setScheduledTurn(value: boolean): void { this.scheduledTurn = value; }
@@ -54,6 +88,9 @@ export class CronScheduler {
     this.stopped = true;
     for (const cron of this.jobs.values()) cron.stop();
     for (const timer of this.intervals.values()) clearTimeout(timer);
+    for (const timer of this.githubTimers.values()) clearTimeout(timer);
+    this.githubTimers.clear();
+    this.githubSources.clear();
     this.jobs.clear();
     this.intervals.clear();
     this.nextRuns.clear();
@@ -89,6 +126,11 @@ export class CronScheduler {
 
   private scheduleJob(job: CronJob): void {
     try {
+      if (job.type === "event") {
+        eventNames(job.schedule);
+        if (job.github) this.scheduleGithub(job.id);
+        return;
+      }
       if (job.type === "interval") {
         if (!job.intervalMs || !Number.isSafeInteger(job.intervalMs) || job.intervalMs > MAX_DELAY) {
           throw new Error("Interval must be positive and at most 2147483647 milliseconds");
@@ -125,9 +167,43 @@ export class CronScheduler {
     }
   }
 
+  private scheduleGithub(id: string, failures = 0): void {
+    const definition = this.storage.getJob(id);
+    if (this.stopped || !definition?.enabled || !definition.github) return;
+    if (!this.githubSources.has(id) && this.githubSources.size >= 10) throw new Error("At most 10 selected GitHub sources are allowed per session");
+    this.githubSources.add(id);
+    const generation = this.generations.get(id) ?? 0;
+    const timer = setTimeout(() => {
+      this.githubTimers.delete(id);
+      void (async () => {
+        let failed = failures;
+        try {
+          const current = this.storage.getJob(id);
+          if (this.stopped || !current?.enabled || !current.github || generation !== (this.generations.get(id) ?? 0)) return;
+          if ((current.expiresAt && Date.parse(current.expiresAt) <= Date.now()) || (current.maxRuns !== undefined && (current.attemptCount ?? current.runCount) >= current.maxRuns)) { this.eligible(id); return; }
+          const fingerprint = await githubFingerprint(current.github);
+          if (this.stopped || generation !== (this.generations.get(id) ?? 0)) return;
+          const result = this.storage.observeGithub(id, current.revision ?? 0, fingerprint, this.ctx.sessionManager.getSessionId(), eventBinding(current));
+          if (result.status === "queued") { this.pending.add(id); this.drain(); }
+          failed = 0;
+        } catch {
+          failed = Math.min(failures + 1, 4);
+          this.emitChange({ type: "error", jobId: id, error: "Selected GitHub event source unavailable; backing off" });
+        }
+        if (!this.stopped && generation === (this.generations.get(id) ?? 0)) this.scheduleGithub(id, failed);
+      })().catch(error => this.fail(id, error));
+    }, Math.min(3600000, (definition.github.pollSeconds ?? 60) * 1000 * (2 ** failures)));
+    timer.unref?.();
+    this.githubTimers.set(id, timer);
+  }
+
   private unscheduleJob(id: string): void {
     this.jobs.get(id)?.stop();
     this.jobs.delete(id);
+    const github = this.githubTimers.get(id);
+    if (github) clearTimeout(github);
+    this.githubTimers.delete(id);
+    this.githubSources.delete(id);
     const timer = this.intervals.get(id);
     if (timer) clearTimeout(timer);
     this.intervals.delete(id);
@@ -149,6 +225,10 @@ export class CronScheduler {
       this.storage.updateJob(id, { enabled: false });
       this.unscheduleJob(id);
       this.emitChange({ type: "update", job: { ...job, enabled: false } });
+      return;
+    }
+    if (dailyLimited(job)) {
+      this.storage.updateJob(id, { lastStatus: "skipped", pendingEvent: undefined });
       return;
     }
     return job;
@@ -196,7 +276,8 @@ export class CronScheduler {
       this.armDrain();
       return;
     }
-    const id = this.pending.values().next().value as string;
+    const id = [...this.pending].find(candidate => !this.activeJobs.has(candidate));
+    if (!id) { this.armDrain(); return; }
     this.pending.delete(id);
     let admitted = false;
     try {
@@ -212,7 +293,7 @@ export class CronScheduler {
         const attempts = job.attemptCount!;
         // Admission is persisted before a potentially effectful send.
         this.pi.sendMessage({
-          customType: "scheduled_prompt", content: job.prompt, display: true,
+          customType: "scheduled_prompt", content: promptFor(job), display: true,
           details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline" },
         }, { triggerTurn: true, deliverAs: "followUp" });
         this.storage.updateJob(id, {
@@ -249,7 +330,7 @@ export class CronScheduler {
     this.activeJobs.set(job.id, controller);
     void (async () => {
       try {
-        const result = await runSubagentOnce(this.ctx, job.prompt, model, controller.signal,
+        const result = await runSubagentOnce(this.ctx, promptFor(job), model, controller.signal,
           { extensions: job.extensions, skills: job.skills });
         const latest = this.storage.getJob(job.id);
         if (controller.signal.aborted || this.stopped || !latest ||
@@ -374,6 +455,10 @@ export class CronScheduler {
    * - `interval`: accepts duration strings (`5m`, `1h`, `30s`)
    */
   static validateSchedule(type: CronJobType, schedule: string): ValidateScheduleResult {
+    if (type === "event") {
+      try { return { ok: true, schedule: eventNames(schedule).join(",") }; }
+      catch (error) { return { ok: false, error: error instanceof Error ? error.message : "Invalid event schedule" }; }
+    }
     if (type === "interval") {
       const intervalMs = CronScheduler.parseInterval(schedule);
       if (!intervalMs) {

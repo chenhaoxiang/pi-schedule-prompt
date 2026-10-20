@@ -11,6 +11,8 @@ export type JobScope = "session" | "workdir";
 export interface ScheduleSettings {
   /** Default true. Project file overrides global. */
   widgetVisible?: boolean;
+  /** Off unless explicitly configured; token value is never stored here. */
+  eventApi?: { enabled: boolean; port: number; tokenEnv: string };
   /**
    * Default scope for newly-created jobs. `"session"` (default) writes
    * `session: <currentSessionId>` so only the creating pi fires the job;
@@ -26,6 +28,13 @@ function sanitize(raw: unknown): ScheduleSettings {
   const r = raw as Record<string, unknown>;
   const out: ScheduleSettings = {};
   if (typeof r.widgetVisible === "boolean") out.widgetVisible = r.widgetVisible;
+  const api = r.eventApi as Record<string, unknown> | undefined;
+  if (api && typeof api.enabled === "boolean" && Number.isInteger(api.port) && (api.port as number) >= 0 && (api.port as number) <= 65535 && typeof api.tokenEnv === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(api.tokenEnv)) {
+    out.eventApi = { enabled: api.enabled, port: api.port as number, tokenEnv: api.tokenEnv };
+  } else if (r.eventApi !== undefined) {
+    out.eventApi = { enabled: false, port: 0, tokenEnv: "SCHEDULE_EVENT_TOKEN" };
+    console.warn("[pi-schedule-prompt] Invalid event API configuration; API disabled");
+  }
   if (r.defaultJobScope === "session" || r.defaultJobScope === "workdir") {
     out.defaultJobScope = r.defaultJobScope;
   }
@@ -39,7 +48,7 @@ function read(path: string): ScheduleSettings {
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(`[pi-schedule-prompt] Ignoring malformed settings at ${path}: ${reason}`);
-    return {};
+    return { eventApi: { enabled: false, port: 0, tokenEnv: "SCHEDULE_EVENT_TOKEN" } };
   }
 }
 

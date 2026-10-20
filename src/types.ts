@@ -6,12 +6,16 @@ const StringEnum = <T extends string>(values: T[], options?: { description?: str
 /**
  * Type of cron job
  */
-export type CronJobType = "cron" | "once" | "interval";
+export type CronJobType = "cron" | "once" | "interval" | "event";
+
+export interface GithubTrigger { repo: string; kind: "pull-request" | "workflow"; number?: number; branch?: string; pollSeconds?: number; }
+export interface PendingEvent { revision: number; binding: string; keys: string[]; acceptedAt: string; }
+export type EventResult = { status: "queued" | "duplicate" | "ignored"; reason?: string };
 
 /**
  * Status of the last job execution
  */
-export type CronJobStatus = "success" | "error" | "running" | "queued" | "dispatched" | "unknown";
+export type CronJobStatus = "success" | "error" | "running" | "queued" | "dispatched" | "unknown" | "skipped";
 
 /**
  * A scheduled cron job
@@ -47,6 +51,15 @@ export interface CronJob {
   maxRuns?: number;
   /** Optional absolute expiry; no new work is admitted at/after this time. */
   expiresAt?: string;
+  /** UTC-calendar daily attempt cap; not an invoice cap. */
+  maxRunsPerDay?: number;
+  dailyUsage?: { day: string; attempts: number };
+  revision?: number;
+  pendingEvent?: PendingEvent;
+  recentEventKeys?: string[];
+  catchUp?: "none" | "latest";
+  github?: GithubTrigger;
+  sourceFingerprint?: string;
   /** Optional description */
   description?: string;
   /** If set, run the prompt in a separate in-process agent session using this model instead of injecting into the current chat. */
@@ -84,7 +97,7 @@ export interface CronToolDetails {
  * Tool parameter schema
  */
 export const CronToolParams = Type.Object({
-  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup"], {
+  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "trigger"], {
     description: "Action to perform",
   }),
   name: Type.Optional(
@@ -109,7 +122,7 @@ export const CronToolParams = Type.Object({
     })
   ),
   type: Type.Optional(
-    StringEnum(["cron", "once", "interval"], {
+    StringEnum(["cron", "once", "interval", "event"], {
       description: "Job type. Use 'once' for relative times like '+10s'. Default is cron",
     })
   ),
@@ -118,6 +131,11 @@ export const CronToolParams = Type.Object({
       description: "Optional job description",
     })
   ),
+  eventName: Type.Optional(Type.String({ description: "Required for trigger. Must match the existing event job schedule." })),
+  eventId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for trigger; stable producer id, never prompt text." })),
+  maxRunsPerDay: Type.Optional(Type.Integer({ minimum: 1, description: "UTC daily admitted-attempt limit." })),
+  catchUp: Type.Optional(StringEnum(["none", "latest"], { description: "Event restart policy; default none." })),
+  github: Type.Optional(Type.Object({ repo: Type.String(), kind: StringEnum(["pull-request", "workflow"]), number: Type.Optional(Type.Integer({ minimum: 1 })), branch: Type.Optional(Type.String()), pollSeconds: Type.Optional(Type.Integer({ minimum: 60, maximum: 3600 })) })),
   maxRuns: Type.Optional(Type.Integer({ minimum: 1, description: "Lifetime dispatch/attempt limit, not a token or invoice cap." })),
   expiresAt: Type.Optional(Type.String({ description: "Absolute ISO expiry. New fires stop at this time." })),
   model: Type.Optional(
