@@ -34,7 +34,7 @@ This scripted faux-provider test proves component wiring and failure/stop behavi
 
 ## Real selected-peer pilot
 
-After fixed-package loading and the same isolated tests pass, select two concrete peer goals and verify the original action/acceptance scope. Record only bounded evidence pointers and observed results. Do not call the pilot complete if peers, current goals, or permission for necessary external actions are missing. Continue independent event/recovery implementation rather than inventing pilot success.
+After fixed-package loading and isolated tests pass, select concrete peer goals and verify the original action/acceptance scope. The initial plan proposed two live goals, but the operator explicitly narrowed the2026-10-20 pilot to only the game-development session. Record only bounded evidence pointers and observed results. Do not call missing live acceptance complete or silently enroll a second peer. The first selected case [proved real wake/status/early-stop](live-supervision-pilot.md): the existing goal was already delivered and awaiting-user, so one native attempt self-disabled instead of repeatedly waking the peer. This does not prove advancing two unfinished live goals. Independent event/recovery implementation was delivered separately.
 
 ## Rollback
 

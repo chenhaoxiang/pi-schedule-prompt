@@ -10,7 +10,7 @@
 - [x] Implement fixed payload/provenance/checksum and installation helpers, with source/file/tamper fixtures.
 - [x] Produce and verify the exact reviewed fixed payload (stage B Release v0.4.1-fork.2, source d18f298).
 - [x] Install into a dedicated supervisor context without disrupting business sessions (explicit pinned launcher; zero active targets/schedules).
-- [x] Record exact source/review/CI/install fixture results and missing real pilot target (PR #2 delivery comment; real business pilot still pending).
+- [x] Record exact source/review/CI/install fixture results and missing real pilot target (PR #2 delivery comment; later operator-selected one-peer stop pilot is recorded separately below).
 
 ## C — Event-driven admission
 - [x] Add explicit local/lifecycle event triggers with unified task admission.
@@ -24,9 +24,9 @@
 - [x] Add bounded native supervisor service/start/status/confirmed stop and concurrency/deadline handling.
 - [x] Add bounded pre-admission contention retry, consecutive-error stop and notification outbox.
 - [x] Run controlled dispatch/receipt/ownership/deadline/duplicate-launch/real parent-crash/stop fixtures with native SDK/RPC and faux inference.
-- [ ] Publish exact-head D review/CI/fixed installation evidence.
-- [ ] Run scoped real selected-peer acceptance (goals/peers not supplied; separate from source delivery).
+- [x] Publish exact-head D review/CI/fixed installation evidence (PR #4/main3594bbe/release fork.4;218 source tests,16 installed cases, actual native CLI and normal-host zero-job readback).
+- [x] Run operator-selected one-peer live stop acceptance (game-development peer, one real native turn, completed/awaiting-user judgment, self-disable and confirmed own-host stop; docs/live-supervision-pilot.md). This narrows the original two-live-goal pilot; unfinished-goal advancement is not claimed.
 
 ## Final source/runtime delivery
-- [ ] Complete independent review, required CI and regular merge/readback per stage.
-- [ ] Report installed/active/live separately; do not declare missing target acceptance complete.
+- [x] Complete independent review, required CI and regular merge/readback for implementation stages B/C/D.
+- [x] Report installed/active/live separately; the selected live stop case does not substitute for unfinished-goal/physical-device/OS-reboot acceptance.
