@@ -1,411 +1,285 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import type { CronStorage } from "./storage.js";
-import { runSubagentOnce, type SubagentResult } from "./subagent.js";
+import { runSubagentOnce } from "./subagent.js";
 import type { CronChangeEvent, CronJob, CronJobType } from "./types.js";
 
-/** Result of `CronScheduler.validateSchedule`. On success, `schedule` is the
- *  resolved form to persist (ISO for `once`, original for `cron`/`interval`). */
 type ValidateScheduleResult =
   | { ok: true; schedule: string; intervalMs?: number }
   | { ok: false; error: string };
+const MAX_DELAY = 2_147_483_647;
+const snippet = (text: string) => text.length > 500 ? text.slice(0, 500) + "…" : text;
 
-const SUBAGENT_OUTPUT_SNIPPET_LENGTH = 500;
-
-/** Truncate `text` to `SUBAGENT_OUTPUT_SNIPPET_LENGTH`, appending an ellipsis if cut. */
-function snippet(text: string): string {
-  return text.length > SUBAGENT_OUTPUT_SNIPPET_LENGTH
-    ? text.slice(0, SUBAGENT_OUTPUT_SNIPPET_LENGTH) + "…"
-    : text;
-}
-
-/**
- * Manages cron job scheduling and execution
- */
+/** Timers own intent only. Host acceptance never proves business completion. */
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
+  private nextRuns = new Map<string, Date>();
+  private pending = new Set<string>();
+  private drainTimer?: NodeJS.Timeout;
+  private stopped = false;
   private activeSubagents = new Set<AbortController>();
-  private readonly storage: CronStorage;
-  private readonly pi: ExtensionAPI;
-  private readonly ctx: ExtensionContext;
+  private activeJobs = new Map<string, AbortController>();
+  private generations = new Map<string, number>();
+  private scheduledTurn = false;
 
-  constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext) {
-    this.storage = storage;
-    this.pi = pi;
-    this.ctx = ctx;
-  }
+  constructor(
+    private readonly storage: CronStorage,
+    private readonly pi: ExtensionAPI,
+    private readonly ctx: ExtensionContext,
+  ) {}
 
-  /**
-   * Schedule all enabled jobs loaded for this session — see `isLoadedFor`.
-   * Foreign-session jobs are skipped so two pis in the same cwd don't double-fire.
-   *
-   * Also clears stale `lastStatus: "running"` from an interrupted prior run of
-   * *this* session (process kill, abort) — otherwise the widget sticks on `⟳`
-   * until the cron next fires. Other sessions' flags are theirs to manage.
-   */
   start(): void {
-    const mySessionId = this.ctx.sessionManager.getSessionId();
+    this.stop();
+    this.stopped = false;
+    const session = this.ctx.sessionManager.getSessionId();
     for (const job of this.storage.getAllJobs()) {
-      if (!CronScheduler.isLoadedFor(job, mySessionId)) continue;
-      if (job.lastStatus === "running") {
-        this.storage.updateJob(job.id, { lastStatus: undefined });
+      if (!CronScheduler.isLoadedFor(job, session)) continue;
+      if (job.lastStatus === "running" || job.lastStatus === "queued") {
+        this.storage.updateJob(job.id, { lastStatus: "unknown" });
       }
-      if (job.enabled) {
-        this.scheduleJob(job);
-      }
+      if (job.enabled) this.scheduleJob(job);
     }
   }
 
-  /** Unbound jobs (no `session` field) load for everyone. */
   static isLoadedFor(job: CronJob, sessionId: string | undefined): boolean {
     return !job.session || job.session === sessionId;
   }
 
-  /**
-   * Stop all scheduled jobs
-   */
+  setScheduledTurn(value: boolean): void { this.scheduledTurn = value; }
+  isScheduledTurn(): boolean { return this.scheduledTurn; }
+
   stop(): void {
-    // Stop all cron jobs
-    for (const cron of this.jobs.values()) {
-      cron.stop();
-    }
+    this.stopped = true;
+    for (const cron of this.jobs.values()) cron.stop();
+    for (const timer of this.intervals.values()) clearTimeout(timer);
     this.jobs.clear();
-
-    // Clear all intervals
-    for (const interval of this.intervals.values()) {
-      clearInterval(interval);
-    }
     this.intervals.clear();
-
-    // Abort any in-flight subagent runs so they don't keep streaming or post
-    // markers against a stale pi reference after session shutdown.
-    for (const controller of this.activeSubagents) {
-      controller.abort();
-    }
+    this.nextRuns.clear();
+    this.pending.clear();
+    if (this.drainTimer) clearTimeout(this.drainTimer);
+    this.drainTimer = undefined;
+    for (const controller of this.activeSubagents) controller.abort();
     this.activeSubagents.clear();
+    this.activeJobs.clear();
+    this.scheduledTurn = false;
   }
 
-  /**
-   * Add and schedule a new job
-   */
   addJob(job: CronJob): void {
-    if (job.enabled) {
-      this.scheduleJob(job);
-    }
+    if (!this.stopped && job.enabled && CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) this.scheduleJob(job);
     this.emitChange({ type: "add", job });
   }
 
-  /**
-   * Remove and unschedule a job
-   */
   removeJob(id: string): void {
     this.unscheduleJob(id);
     this.emitChange({ type: "remove", jobId: id });
   }
 
-  /**
-   * Update a job (reschedule if needed)
-   */
   updateJob(id: string, updated: CronJob): void {
     this.unscheduleJob(id);
-    if (updated.enabled) {
-      this.scheduleJob(updated);
-    }
+    if (!this.stopped && updated.enabled && CronScheduler.isLoadedFor(updated, this.ctx.sessionManager.getSessionId())) this.scheduleJob(updated);
     this.emitChange({ type: "update", job: updated });
   }
 
-  /**
-   * Get next run time for a job
-   */
-  getNextRun(jobId: string): Date | null {
-    const cron = this.jobs.get(jobId);
-    if (cron) {
-      const next = cron.nextRun();
-      return next || null;
-    }
-    return null;
+  getNextRun(id: string): Date | null {
+    return this.jobs.get(id)?.nextRun() || this.nextRuns.get(id) || null;
   }
 
-  /**
-   * Schedule a single job
-   */
   private scheduleJob(job: CronJob): void {
     try {
-      if (job.type === "interval" && job.intervalMs) {
-        // Interval-based scheduling
-        const interval = setInterval(() => {
-          this.executeJob(job);
-        }, job.intervalMs);
-        this.intervals.set(job.id, interval);
-      } else if (job.type === "once") {
-        // One-shot execution at a specific time
-        const targetDate = new Date(job.schedule);
-        const now = new Date();
-        const delay = targetDate.getTime() - now.getTime();
-
-        if (delay > 0) {
-          const timeout = setTimeout(() => {
-            this.executeJob(job);
-            // Auto-disable one-shot jobs after execution
-            this.storage.updateJob(job.id, { enabled: false });
-            this.emitChange({ type: "update", job: { ...job, enabled: false } });
-          }, delay);
-          // Store as interval for cleanup purposes
-          this.intervals.set(job.id, timeout as any);
-        } else {
-          // Job is in the past - disable it and log warning
-          console.warn(`Job ${job.id} (${job.name}) scheduled for past time: ${job.schedule}`);
-          this.storage.updateJob(job.id, { 
-            enabled: false,
-            lastStatus: "error" 
-          });
-          this.emitChange({ 
-            type: "error", 
-            jobId: job.id, 
-            error: `Scheduled time ${job.schedule} is in the past` 
-          });
+      if (job.type === "interval") {
+        if (!job.intervalMs || !Number.isSafeInteger(job.intervalMs) || job.intervalMs > MAX_DELAY) {
+          throw new Error("Interval must be positive and at most 2147483647 milliseconds");
         }
+        this.nextRuns.set(job.id, new Date(Date.now() + job.intervalMs));
+        const timer = setInterval(() => {
+          this.nextRuns.set(job.id, new Date(Date.now() + job.intervalMs!));
+          void this.executeJob(job);
+        }, job.intervalMs);
+        timer.unref?.();
+        this.intervals.set(job.id, timer);
+      } else if (job.type === "once") {
+        const target = Date.parse(job.schedule);
+        if (!Number.isFinite(target) || target <= Date.now()) throw new Error("One-shot time is invalid or in the past");
+        this.nextRuns.set(job.id, new Date(target));
+        const arm = () => {
+          const timer = setTimeout(() => {
+            if (this.stopped) return;
+            if (target > Date.now()) return arm();
+            this.intervals.delete(job.id);
+            this.nextRuns.delete(job.id);
+            void this.executeJob(job);
+          }, Math.min(target - Date.now(), MAX_DELAY));
+          timer.unref?.();
+          this.intervals.set(job.id, timer);
+        };
+        arm();
       } else {
-        // Standard cron expression
-        const cron = new Cron(job.schedule, () => {
-          this.executeJob(job);
-        });
-        this.jobs.set(job.id, cron);
+        this.jobs.set(job.id, new Cron(job.schedule, () => { void this.executeJob(job); }));
       }
     } catch (error) {
-      console.error(`Failed to schedule job ${job.id}:`, error);
-      this.emitChange({
-        type: "error",
-        jobId: job.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      this.fail(job.id, error);
+      this.storage.updateJob(job.id, { enabled: false, lastStatus: "error" });
     }
   }
 
-  /**
-   * Unschedule a job
-   */
   private unscheduleJob(id: string): void {
-    const cron = this.jobs.get(id);
-    if (cron) {
-      cron.stop();
-      this.jobs.delete(id);
-    }
-
-    const interval = this.intervals.get(id);
-    if (interval) {
-      clearInterval(interval);
-      this.intervals.delete(id);
+    this.jobs.get(id)?.stop();
+    this.jobs.delete(id);
+    const timer = this.intervals.get(id);
+    if (timer) clearTimeout(timer);
+    this.intervals.delete(id);
+    this.nextRuns.delete(id);
+    this.pending.delete(id);
+    this.generations.set(id, (this.generations.get(id) ?? 0) + 1);
+    if (!this.pending.size && this.drainTimer) {
+      clearTimeout(this.drainTimer);
+      this.drainTimer = undefined;
     }
   }
 
-  /**
-   * Execute a job's prompt
-   */
-  private async executeJob(job: CronJob): Promise<void> {
-    // Re-read before firing — closure-captured `job` is stale if storage was
-    // edited mid-tick (removed, disabled, or `session` rebound by hand-edit).
-    const fresh = this.storage.getJob(job.id);
-    if (!fresh?.enabled) return;
-    if (!CronScheduler.isLoadedFor(fresh, this.ctx.sessionManager.getSessionId())) return;
-
-    console.log(`Executing scheduled prompt: ${job.name} (${job.id})`);
-
-    if (job.model) {
-      this.executeJobInSubagent(job);
+  private eligible(id: string): CronJob | undefined {
+    if (this.stopped) return;
+    const job = this.storage.getJob(id);
+    if (!job?.enabled || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) return;
+    if ((job.expiresAt && Date.parse(job.expiresAt) <= Date.now()) ||
+      (job.maxRuns !== undefined && (job.attemptCount ?? job.runCount) >= job.maxRuns)) {
+      this.storage.updateJob(id, { enabled: false });
+      this.unscheduleJob(id);
+      this.emitChange({ type: "update", job: { ...job, enabled: false } });
       return;
     }
-
-    try {
-      // Update status to running
-      this.storage.updateJob(job.id, {
-        lastStatus: "running",
-      });
-      this.emitChange({ type: "fire", job });
-
-      // Visible-only marker. The renderer reads from `details`, so `content`
-      // is intentionally empty — putting the prompt text in `content` would
-      // inject it into the LLM context a second time alongside the
-      // `sendUserMessage` delivery below, producing duplicate turns /
-      // "PROMPT\n\nPROMPT" rendering when the agent was streaming at fire
-      // time. No options means: idle → silent append + emit (marker shows
-      // before the user message in the chat), streaming → `agent.steer` with
-      // empty content (no LLM context change, no extra turn triggered).
-      this.pi.sendMessage({
-        customType: "scheduled_prompt",
-        content: [],
-        display: true,
-        details: { jobId: job.id, jobName: job.name, prompt: job.prompt },
-      });
-
-      // Then send the actual prompt to the agent — this is the single LLM-visible delivery.
-      this.pi.sendUserMessage(job.prompt, { deliverAs: "followUp" });
-
-      // Update job execution stats.
-      //
-      // `job` here is captured by the croner closure in `scheduleJob` and is
-      // therefore frozen at the value it had when the scheduler was created —
-      // reading `job.runCount` yields a stale count, so incrementing it writes
-      // the same value to storage on every fire and the counter never advances.
-      // Re-read from storage to get the latest known count.
-      const nextRun = this.getNextRun(job.id);
-      const latest = this.storage.getJob(job.id);
-      const currentRunCount = latest?.runCount ?? job.runCount;
-      this.storage.updateJob(job.id, {
-        lastRun: new Date().toISOString(),
-        lastStatus: "success",
-        runCount: currentRunCount + 1,
-        nextRun: nextRun?.toISOString(),
-      });
-
-      this.emitChange({ type: "fire", job });
-    } catch (error) {
-      console.error(`Failed to execute job ${job.id}:`, error);
-      this.storage.updateJob(job.id, {
-        lastRun: new Date().toISOString(),
-        lastStatus: "error",
-      });
-      this.emitChange({
-        type: "error",
-        jobId: job.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    return job;
   }
 
-  /**
-   * Run a job's prompt in a fresh in-process AgentSession with the chosen model.
-   * Fire-and-forget: the cron tick returns immediately so other jobs keep firing.
-   */
-  private executeJobInSubagent(job: CronJob): void {
+  private async executeJob(snapshot: CronJob): Promise<void> {
+    try {
+      const job = this.eligible(snapshot.id);
+      if (!job) return;
+      if (job.schedule !== snapshot.schedule || job.type !== snapshot.type) {
+        this.updateJob(job.id, job);
+        return;
+      }
+      if (job.model) {
+        if (!this.activeJobs.has(job.id)) this.executeJobInSubagent(job);
+        return;
+      }
+      this.pending.add(job.id);
+      if (job.lastStatus !== "queued") {
+        this.storage.updateJob(job.id, { lastStatus: "queued" });
+        this.emitChange({ type: "fire", job: { ...job, lastStatus: "queued" } });
+      }
+      this.drain();
+    } catch (error) { this.fail(snapshot.id, error); }
+  }
+
+  /** A timer exists only while pending; nothing is queued inside a busy Pi host. */
+  private armDrain(): void {
+    if (!this.pending.size || this.drainTimer || this.stopped) return;
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = undefined;
+      this.drain();
+    }, 100);
+    this.drainTimer.unref?.();
+  }
+
+  private drain(): void {
+    if (this.stopped || !this.pending.size) return;
+    if ((this.ctx.isIdle && !this.ctx.isIdle()) || this.ctx.hasPendingMessages?.()) {
+      this.armDrain();
+      return;
+    }
+    const id = this.pending.values().next().value as string;
+    this.pending.delete(id);
+    try {
+      const eligible = this.eligible(id);
+      if (eligible?.model) {
+        this.executeJobInSubagent(eligible);
+        this.armDrain();
+        return;
+      }
+      const job = eligible && this.storage.admitJob(id, this.ctx.sessionManager.getSessionId());
+      if (job) {
+        const attempts = job.attemptCount!;
+        // Admission is persisted before a potentially effectful send.
+        this.pi.sendMessage({
+          customType: "scheduled_prompt", content: job.prompt, display: true,
+          details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline" },
+        }, { triggerTurn: true, deliverAs: "followUp" });
+        this.storage.updateJob(id, {
+          lastRun: new Date().toISOString(), lastStatus: "dispatched", runCount: job.runCount + 1,
+          ...(job.type === "once" || (job.maxRuns !== undefined && attempts >= job.maxRuns) ? { enabled: false } : {}),
+          nextRun: this.getNextRun(id)?.toISOString(),
+        });
+        if (this.storage.getJob(id)?.enabled === false) this.unscheduleJob(id);
+        this.emitChange({ type: "fire", job: this.storage.getJob(id) });
+      }
+    } catch (error) { this.fail(id, error); }
+    this.armDrain();
+  }
+
+  private executeJobInSubagent(snapshot: CronJob): void {
+    if (this.activeJobs.has(snapshot.id) || this.stopped) return;
+    const job = this.storage.admitJob(snapshot.id, this.ctx.sessionManager.getSessionId());
+    if (!job) return;
     const model = job.model!;
-    const notify = job.notify === true;
-    this.storage.updateJob(job.id, { lastStatus: "running" });
+    const attempts = job.attemptCount!;
+    this.storage.updateJob(job.id, { lastStatus: "running", attemptCount: attempts,
+      ...(job.type === "once" || (job.maxRuns !== undefined && attempts >= job.maxRuns) ? { enabled: false } : {}) });
+    if (this.storage.getJob(job.id)?.enabled === false) this.unscheduleJob(job.id);
+    const generation = this.generations.get(job.id) ?? 0;
     this.emitChange({ type: "fire", job });
-
-    // Start marker needs non-empty content to prevent session poisoning.
-    // Pi-ai's openai-completions provider filters out user messages with
-    // empty content — if the marker lands right after an assistant message,
-    // the conversation ends on assistant and Anthropic 400s.
-    this.pi.sendMessage({
-      customType: "scheduled_prompt",
-      content: [{ type: "text", text: `🕐 Scheduled (subagent: ${model}): ${job.name}` }],
-      display: true,
-      details: {
-        jobId: job.id,
-        jobName: job.name,
-        prompt: job.prompt,
-        mode: "subagent_start",
-        model,
-      },
-    });
-
+    this.pi.sendMessage({ customType: "scheduled_prompt", display: true,
+      content: [{ type: "text", text: "Scheduled model run: " + job.name }],
+      details: { jobId: job.id, jobName: job.name, prompt: job.prompt, mode: "subagent_start", model } });
     const controller = new AbortController();
     this.activeSubagents.add(controller);
-
+    this.activeJobs.set(job.id, controller);
     void (async () => {
       try {
-        let result: SubagentResult;
+        const result = await runSubagentOnce(this.ctx, job.prompt, model, controller.signal,
+          { extensions: job.extensions, skills: job.skills });
+        const latest = this.storage.getJob(job.id);
+        if (controller.signal.aborted || this.stopped || !latest ||
+          generation !== (this.generations.get(job.id) ?? 0)) return;
+        const text = result.ok
+          ? snippet(result.text.trim()) || "(subagent produced no text output)"
+          : snippet(result.error.trim()) || "(subagent failed with empty error)";
+        this.storage.updateJob(job.id, {
+          lastRun: new Date().toISOString(), lastStatus: result.ok ? "success" : "error",
+          runCount: latest.runCount + (result.ok ? 1 : 0), nextRun: this.getNextRun(job.id)?.toISOString(),
+        });
+        this.emitChange({ type: result.ok ? "fire" : "error", jobId: job.id, ...(result.ok ? {} : { error: text }) });
         try {
-          result = await runSubagentOnce(this.ctx, job.prompt, model, controller.signal, { extensions: job.extensions, skills: job.skills });
-        } finally {
-          this.activeSubagents.delete(controller);
+          this.pi.sendMessage({ customType: "scheduled_prompt", display: true,
+            content: [{ type: "text", text }], details: {
+              jobId: job.id, jobName: job.name, prompt: job.prompt, model,
+              mode: result.ok ? "subagent_done" : "subagent_error",
+              ...(result.ok ? { output: text } : { error: text }),
+            } }, job.notify ? { deliverAs: "followUp", triggerTurn: true } : undefined);
+        } catch (error) {
+          console.error("Failed to post " + (result.ok ? "subagent_done" : "subagent_error") + " marker for job " + job.id + ":", error);
         }
-
-        // Scheduler was stopped (session shutdown / switch / fork) while we were
-        // running. Don't touch storage or post markers — pi may be invalidated.
-        if (controller.signal.aborted) return;
-
-        const nextRun = this.getNextRun(job.id);
-
-        // Always advance the storage state to a terminal status BEFORE attempting
-        // to post the marker. The marker is best-effort (pi may be invalidated
-        // during teardown) and must never leave the job stuck in "running".
-        if (result.ok) {
-          const outputSnippet = snippet(result.text.trim()) || "(subagent produced no text output)";
-          // Re-read runCount from storage; `job` here is the closure-captured
-          // snapshot from scheduleJob and would yield a stale count.
-          const latest = this.storage.getJob(job.id);
-          const currentRunCount = latest?.runCount ?? job.runCount;
-          this.storage.updateJob(job.id, {
-            lastRun: new Date().toISOString(),
-            lastStatus: "success",
-            runCount: currentRunCount + 1,
-            nextRun: nextRun?.toISOString(),
-          });
-          this.emitChange({ type: "fire", job });
-          try {
-            // notify=true: snippet in `content` + followUp/triggerTurn wakes
-            // the parent — it sees the result and reacts.
-            // notify=false: content is still non-empty (guarded by #10 fallback)
-            // to prevent session poisoning — pi-ai filters empty user messages,
-            // leaving the conversation ending on assistant which Anthropic 400s.
-            // No delivery options means the marker is silent (parent not woken).
-            this.pi.sendMessage(
-              {
-                customType: "scheduled_prompt",
-                content: [{ type: "text", text: outputSnippet }],
-                display: true,
-                details: {
-                  jobId: job.id,
-                  jobName: job.name,
-                  prompt: job.prompt,
-                  mode: "subagent_done",
-                  model,
-                  output: outputSnippet,
-                },
-              },
-              notify ? { deliverAs: "followUp", triggerTurn: true } : undefined,
-            );
-          } catch (markerErr) {
-            console.error(`Failed to post subagent_done marker for job ${job.id}:`, markerErr);
-          }
-        } else {
-          // Truncate the error the same way as the success snippet — verbose
-          // API errors / stack traces would otherwise overflow the chat row.
-          const errorSnippet = snippet(result.error.trim()) || "(subagent failed with empty error)";
-          this.storage.updateJob(job.id, {
-            lastRun: new Date().toISOString(),
-            lastStatus: "error",
-            nextRun: nextRun?.toISOString(),
-          });
-          this.emitChange({ type: "error", jobId: job.id, error: errorSnippet });
-          try {
-            // Same notify-gated wake-up as the done marker — see comment above.
-            this.pi.sendMessage(
-              {
-                customType: "scheduled_prompt",
-                content: [{ type: "text", text: errorSnippet }],
-                display: true,
-                details: {
-                  jobId: job.id,
-                  jobName: job.name,
-                  prompt: job.prompt,
-                  mode: "subagent_error",
-                  model,
-                  error: errorSnippet,
-                },
-              },
-              notify ? { deliverAs: "followUp", triggerTurn: true } : undefined,
-            );
-          } catch (markerErr) {
-            console.error(`Failed to post subagent_error marker for job ${job.id}:`, markerErr);
-          }
-        }
-      } catch (error) {
-        // Outer backstop: anything else (e.g. storage write failure) shouldn't
-        // escape the IIFE as an unhandled rejection.
-        console.error(`Subagent completion handler failed for job ${job.id}:`, error);
+      } catch (error) { this.fail(job.id, error); }
+      finally {
+        this.activeSubagents.delete(controller);
+        if (this.activeJobs.get(job.id) === controller) this.activeJobs.delete(job.id);
       }
     })();
   }
 
-  /**
-   * Emit a change event via pi.events
-   */
+  private fail(id: string, error: unknown): void {
+    this.unscheduleJob(id);
+    // A failed send can already have been accepted. Pause instead of blind replay.
+    try { this.storage.updateJob(id, { enabled: false, lastStatus: "unknown" }); } catch { /* Preserve corrupt bytes or the other writer. */ }
+    const text = error instanceof Error ? error.message : String(error);
+    console.error("Scheduled job " + id + " failed:", text);
+    this.emitChange({ type: "error", jobId: id, error: text });
+  }
+
   private emitChange(event: CronChangeEvent): void {
-    this.pi.events.emit("cron:change", event);
+    try { this.pi.events.emit("cron:change", event); }
+    catch (error) { console.error("Schedule observer failed:", error); }
   }
 
   /**
@@ -423,7 +297,8 @@ export class CronScheduler {
 
     try {
       // Try parsing as cron expression
-      new Cron(expression, () => {});
+      const cron = new Cron(expression, { paused: true }, () => {});
+      cron.stop();
       return { valid: true };
     } catch (error) {
       return {
@@ -453,7 +328,7 @@ export class CronScheduler {
 
     const ms = value * msMap[unit];
     const futureTime = new Date(Date.now() + ms);
-    return futureTime.toISOString();
+    return Number.isSafeInteger(ms) && ms > 0 && Number.isFinite(futureTime.getTime()) ? futureTime.toISOString() : null;
   }
 
   /**
@@ -473,7 +348,8 @@ export class CronScheduler {
       d: 24 * 60 * 60 * 1000,
     };
 
-    return value * multipliers[unit];
+    const ms = value * multipliers[unit];
+    return Number.isSafeInteger(ms) && ms > 0 && ms <= MAX_DELAY ? ms : null;
   }
 
   /**

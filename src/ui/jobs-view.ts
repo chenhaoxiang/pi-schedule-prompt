@@ -203,6 +203,9 @@ export class JobsView implements Component {
         next ? `Next: ${next.toISOString()}` : null,
         sel.lastRun ? `Last: ${sel.lastRun}` : null,
         `Runs: ${sel.runCount}`,
+        `Status: ${sel.lastStatus ?? "pending"}`,
+        `Attempts: ${sel.attemptCount ?? sel.runCount}${sel.maxRuns ? "/" + sel.maxRuns : ""}`,
+        sel.expiresAt ? `Expires: ${sel.expiresAt}` : null,
       ]
         .filter(Boolean)
         .join("   ");
@@ -232,6 +235,10 @@ export class JobsView implements Component {
       icon = this.theme.fg("warning", "⟳");
     } else if (job.lastStatus === "error") {
       icon = this.theme.fg("error", "!");
+    } else if (job.lastStatus === "queued" || job.lastStatus === "unknown") {
+      icon = this.theme.fg("warning", "?");
+    } else if (job.lastStatus === "dispatched") {
+      icon = this.theme.fg("dim", "→");
     } else {
       icon = this.theme.fg("success", "✓");
     }

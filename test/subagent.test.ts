@@ -17,6 +17,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     return { reload: vi.fn().mockResolvedValue(undefined) };
   }),
   getAgentDir: vi.fn(() => "/tmp/agent-dir"),
+  ModelRuntime: { create: vi.fn(async () => ({ registerNativeProvider: vi.fn(), registerProvider: vi.fn() })) },
   SessionManager: { inMemory: vi.fn(() => ({ getSessionId: () => "test" })) },
   SettingsManager: { create: vi.fn(() => ({})) },
 }));
@@ -70,6 +71,10 @@ describe("resolveModel", () => {
   it("matches via name substring when id substring misses", () => {
     // 'Gemini' appears in the model name but not in the id.
     expect(resolveModel(makeRegistry(), "Gemini")).toEqual(MODELS[4]);
+  });
+
+  it("does not silently switch provider on a provider-qualified fuzzy request", () => {
+    expect(resolveModel(makeRegistry(), "unavailable/haiku")).toBeUndefined();
   });
 
   it("returns undefined for unknown model", () => {
@@ -205,6 +210,7 @@ describe("runSubagentOnce", () => {
   function makeFakeSession() {
     return {
       abort: vi.fn(),
+      dispose: vi.fn(),
       subscribe: vi.fn(() => vi.fn()),
       prompt: vi.fn().mockResolvedValue(undefined),
       messages: [],

@@ -27,21 +27,11 @@ export function createCronTool(
       const storage = getStorage();
       const scheduler = getScheduler();
       
-      // Prevent recursive scheduling from within scheduled prompts
-      if (params.action === "add") {
-        const entries = ctx.sessionManager.getEntries();
-        const recentEntries = entries.slice(-10); // Check last 10 entries
-        const hasScheduledPrompt = recentEntries.some(
-          (entry) => entry.type === "custom" && entry.customType === "scheduled_prompt"
-        );
-        
-        if (hasScheduledPrompt) {
-          throw new Error(
-            "Cannot create scheduled prompts from within a scheduled prompt execution. This prevents infinite loops."
-          );
-        }
+      // Source-based guard: historical notifications are not the current turn.
+      if (params.action === "add" && scheduler.isScheduledTurn?.()) {
+        throw new Error("Cannot create scheduled prompts from within a scheduled prompt execution.");
       }
-      
+
       const action = params.action;
       const details: CronToolDetails = {
         action,
@@ -49,6 +39,18 @@ export function createCronTool(
       };
 
       try {
+        if (["remove", "enable", "disable", "update"].includes(action) && params.jobId) {
+          const target = storage.getJob(params.jobId);
+          if (target && !CronScheduler.isLoadedFor(target, ctx.sessionManager.getSessionId())) {
+            throw new Error("Job belongs to another session and is read-only here");
+          }
+        }
+        if (params.maxRuns !== undefined && (!Number.isSafeInteger(params.maxRuns) || params.maxRuns < 1)) {
+          throw new Error("maxRuns must be a positive safe integer");
+        }
+        if (params.expiresAt !== undefined && (!Number.isFinite(Date.parse(params.expiresAt)) || Date.parse(params.expiresAt) <= Date.now())) {
+          throw new Error("expiresAt must be an absolute future timestamp");
+        }
         switch (action) {
           case "add": {
             if (!params.schedule || !params.prompt) {
@@ -87,6 +89,7 @@ export function createCronTool(
             const now = new Date().toISOString();
             const session =
               getDefaultScope() === "session" ? ctx.sessionManager.getSessionId() : undefined;
+            if (getDefaultScope() === "session" && !session) throw new Error("Session-bound jobs require a session id");
             const job: CronJob = {
               id: nanoid(10),
               name: jobName,
@@ -98,6 +101,8 @@ export function createCronTool(
               createdAt: now,
               runCount: 0,
               description: params.description,
+              maxRuns: params.maxRuns,
+              expiresAt: params.expiresAt,
               model: params.model,
               notify: params.notify,
               extensions: params.extensions,
@@ -244,6 +249,8 @@ export function createCronTool(
             }
 
             const updates: Partial<CronJob> = {};
+            if (params.maxRuns !== undefined) updates.maxRuns = params.maxRuns;
+            if (params.expiresAt !== undefined) updates.expiresAt = params.expiresAt;
             if (params.name) updates.name = params.name;
             if (params.prompt) updates.prompt = params.prompt;
             if (params.description !== undefined) updates.description = params.description;
@@ -327,6 +334,7 @@ export function createCronTool(
       } catch (error) {
         details.error = error instanceof Error ? error.message : String(error);
         return {
+          isError: true,
           content: [
             {
               type: "text",

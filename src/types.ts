@@ -1,4 +1,7 @@
-import { type Static, StringEnum, Type } from "@earendil-works/pi-ai";
+import { type Static, Type } from "@earendil-works/pi-ai";
+
+const StringEnum = <T extends string>(values: T[], options?: { description?: string }) =>
+  Type.Union(values.map((value) => Type.Literal(value)), options);
 
 /**
  * Type of cron job
@@ -8,7 +11,7 @@ export type CronJobType = "cron" | "once" | "interval";
 /**
  * Status of the last job execution
  */
-export type CronJobStatus = "success" | "error" | "running";
+export type CronJobStatus = "success" | "error" | "running" | "queued" | "dispatched" | "unknown";
 
 /**
  * A scheduled cron job
@@ -36,8 +39,14 @@ export interface CronJob {
   lastStatus?: CronJobStatus;
   /** Next scheduled run (computed) */
   nextRun?: string;
-  /** Number of times executed */
+  /** Inline dispatches or successful model runs; not business acceptance. */
   runCount: number;
+  /** Admitted dispatch/model attempts, including failed attempts. */
+  attemptCount?: number;
+  /** Optional lifetime attempt limit. */
+  maxRuns?: number;
+  /** Optional absolute expiry; no new work is admitted at/after this time. */
+  expiresAt?: string;
   /** Optional description */
   description?: string;
   /** If set, run the prompt in a separate in-process agent session using this model instead of injecting into the current chat. */
@@ -109,6 +118,8 @@ export const CronToolParams = Type.Object({
       description: "Optional job description",
     })
   ),
+  maxRuns: Type.Optional(Type.Integer({ minimum: 1, description: "Lifetime dispatch/attempt limit, not a token or invoice cap." })),
+  expiresAt: Type.Optional(Type.String({ description: "Absolute ISO expiry. New fires stop at this time." })),
   model: Type.Optional(
     Type.String({
       minLength: 1,

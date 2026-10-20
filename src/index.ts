@@ -8,7 +8,7 @@
  * - Persistence via .pi/schedule-prompts.json (jobs) and .pi/schedule-prompts-settings.json (settings)
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
 import { CronScheduler } from "./scheduler.js";
@@ -82,7 +82,7 @@ export default async function (pi: ExtensionAPI) {
 
   // --- Session initialization ---
 
-  const initializeSession = (ctx: any) => {
+  const initializeSession = (ctx: ExtensionContext) => {
     // Idempotent: tear down any prior instance before creating a new one.
     // Without this, every `session_start` (fires on reload/resume/fork too, not
     // only on fresh startup) leaks a live croner timer into the event loop,
@@ -94,15 +94,17 @@ export default async function (pi: ExtensionAPI) {
     scheduler = new CronScheduler(storage, pi, ctx);
     widget = new CronWidget(storage, scheduler, pi, isWidgetVisible, ctx.sessionManager.getSessionId());
 
+    // Batch invocations register management tools without running background timers.
+    if (ctx.mode === "print" || ctx.mode === "json") { scheduler.stop(); return; }
     scheduler.start();
 
     // Show widget
-    if (isWidgetVisible()) {
+    if (ctx.hasUI && isWidgetVisible()) {
       widget.show(ctx);
     }
   };
 
-  const cleanupSession = (ctx: any) => {
+  const cleanupSession = (ctx: ExtensionContext) => {
     // Stop scheduler
     if (scheduler) {
       scheduler.stop();
@@ -115,35 +117,25 @@ export default async function (pi: ExtensionAPI) {
     }
   };
 
-  const autoCleanupDisabledJobs = (ctx: any) => {
-    // Only sweep our own (or unbound) disabled jobs — never another session's.
-    if (!storage) return;
-    const mySessionId = ctx.sessionManager.getSessionId();
-    const disabledJobs = storage
-      .getAllJobs()
-      .filter((j) => !j.enabled && CronScheduler.isLoadedFor(j, mySessionId));
-
-    if (disabledJobs.length > 0) {
-      console.log(`Auto-cleanup: removing ${disabledJobs.length} disabled job(s)`);
-      for (const job of disabledJobs) {
-        storage.removeJob(job.id);
-      }
-    }
-  };
-
   // --- Lifecycle events ---
 
-  pi.on("session_start", async (event, ctx) => {
-    if (event.reason !== "startup") {
-      autoCleanupDisabledJobs(ctx);
+  pi.on("session_start", async (_event, ctx) => {
+    try { initializeSession(ctx); }
+    catch (error) {
+      cleanupSession(ctx);
+      console.error("[pi-schedule-prompt] Initialization failed:", error);
+      if (ctx.hasUI) ctx.ui.notify("Schedule store could not be loaded; timers are stopped. Check the local store.", "error");
     }
-    initializeSession(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    autoCleanupDisabledJobs(ctx);
     cleanupSession(ctx);
   });
+
+  pi.on("before_agent_start", (event) => {
+    scheduler?.setScheduledTurn(event.messageType === "custom" && event.message.customType === "scheduled_prompt");
+  });
+  pi.on("agent_end", () => { scheduler?.setScheduledTurn(false); });
 
   // --- Register /schedule-prompt command ---
 

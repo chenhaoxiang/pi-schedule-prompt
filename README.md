@@ -1,297 +1,108 @@
-# pi-schedule-prompt
+# Pi Schedule Prompt — maintained fork
 
-A "Heartbeat" like prompt scheduling [Pi](https://pi.dev) extension that allows the Agent to self-schedule future prompts to execute at specific times or intervals - for reminders, deferred tasks, and recurring automation.
+English | [简体中文](docs/README.zh-CN.md)
 
-<img width="600"  alt="image" src="https://github.com/tintinweb/pi-schedule-prompt/raw/master/media/screenshot.png" />
+Timed prompts for Pi 1.3: recurring cron/interval jobs and one-shot reminders, with session binding, native custom turns and a local management UI.
 
-<https://github.com/user-attachments/assets/8c723cc4-cf3e-4b6a-abf5-85d4f46c73ba>
+This is [chenhaoxiang/pi-schedule-prompt](https://github.com/chenhaoxiang/pi-schedule-prompt), maintained from [tintinweb/pi-schedule-prompt](https://github.com/tintinweb/pi-schedule-prompt). The upstream MIT license and attribution are retained.
 
-> **Status:** Production-ready. Natural language scheduling with cron expressions, intervals, relative time, and one-shot timers.
+## Branches and installation
 
-Schedule future prompts with natural language:
+- `main`: reviewed maintenance/integration line.
+- `upstream-main`: exact community mirror, never an installation source.
+- `upstream`: fetch-only community remote; its push URL is disabled.
+- Fork versions use `0.4.1-fork.N`. Source delivery is separate from a GitHub Release or local installation. This package is private-to-npm to prevent publication under the community identity.
 
-- **"schedule 'analyze logs' every hour"** (recurring)
-- **"remind me to review PR in 30 minutes"** (one-time)
-- **"defer that task until tomorrow at 9am"** (specific time)
+Install the maintained source only after reviewing its changes:
 
-## Features
-
-### Core `schedule_prompt` Tool
-
-- **Natural language scheduling**: "schedule X in 5 minutes", "every hour do Y"
-- **Multiple formats**: Cron expressions, intervals, ISO timestamps, relative time (+5m, +1h)
-- **Job types**:
-  - **Recurring** (cron/interval) — repeats automatically
-  - **One-shot** (once) — runs once then auto-disables
-- **Per-task model (optional)**: set `model` on a job to run that prompt in a separate in-process agent session — your current chat is not affected
-- **Actions**: add, remove, list, enable, disable, update, cleanup
-- **Auto-cleanup**: Removes disabled jobs on session exit
-
-### Use Cases
-
-#### Schedule (Recurring Tasks)
-
-Execute prompts repeatedly at set intervals:
-
-```
-"schedule 'check build status' every 5 minutes"
-"run 'analyze metrics' every hour"
-"execute 'daily summary' at midnight every day"
+```sh
+pi install git:github.com/chenhaoxiang/pi-schedule-prompt@main
 ```
 
-#### Remind (One-time Notifications)
+Pin a reviewed commit for reproducibility. Installation does not hot-upgrade active Pi sessions. This change does not install itself or start monitoring other sessions.
 
-Get prompted to do something once at a specific time:
+Requirements: Node 22.19+ and Pi 1.3.x. Host SDK packages are peers, not bundled copies.
 
-```
-"remind me to review the PR in 30 minutes"
-"remind me to check deployment status in 1 hour"
-"remind me tomorrow at 9am to follow up on the issue"
-```
+## Create and manage jobs
 
-### Enhanced Pi Features
+Ask the agent naturally:
 
-- ✓ **Live widget** below editor showing active schedules (auto-hides when empty)
-- ✓ **Human-readable display**: "every minute", "daily at 9:00" instead of raw cron expressions
-- ✓ **Status tracking**: next run, last run, execution count, errors, prompt preview
-- ✓ **Flexible scheduling**: 6-field cron, intervals (5m, 1h), relative time (+10s), ISO timestamps
-- ✓ **User commands**: `/schedule-prompt` opens a `Jobs` overlay (hotkey-driven: `↑↓` select, `a` add, `t` toggle enabled, `s` toggle scope, `x` remove, `c` cleanup) and a `Settings` submenu
-- ✓ **Persistent settings**: widget visibility persists across sessions and package upgrades (project file overrides global defaults)
-- ✓ **Safety features**: duplicate name prevention, infinite loop detection, past timestamp handling
+- “Check this authorized task every 10 minutes, at most 12 attempts.”
+- “Remind me to review the PR in 30 minutes.”
+- “Run this check on weekdays at 9:00.”
 
-## Install
+The agent uses `schedule_prompt`. Actions: `add`, `list`, `remove`, `enable`, `disable`, `update`, `cleanup`.
 
-**Option A — Install from npm:**
+| Parameter | Meaning |
+| --- | --- |
+| `action` | Operation; required |
+| `name` | Unique display name; generated when omitted |
+| `type` | `cron` (default), `interval`, or `once` |
+| `schedule` | Required on add: six-field cron, interval or one-shot time |
+| `prompt` | Required on add; the authorized work to request |
+| `jobId` | Required for remove/enable/disable/update |
+| `description` | Optional local note |
+| `maxRuns` | Optional positive lifetime attempt cap; not tokens or money |
+| `expiresAt` | Optional absolute future timestamp; re-checked before dispatch |
+| `model` | Explicit model-job mode; see below |
+| `notify` | Model-job only; wake parent on completion, default false |
+| `extensions`, `skills` | Model-job only: true or a name list; default none |
 
-```bash
-pi install npm:pi-schedule-prompt
-```
+Schedule formats:
 
-**Option B — Load directly (dev):**
+| Type | Examples |
+| --- | --- |
+| Once | `+30s`, `+5m`, `2026-12-01T09:00:00Z` |
+| Interval | `30s`, `5m`, `1h` |
+| Cron, with seconds | `0 */5 * * * *`, `0 0 9 * * 1-5` |
 
-```bash
-pi -e ~/projects/pi-cron-schedule/src/index.ts
-```
+Five-field cron is not accepted. Intervals are bounded by the host timer range (2147483647 ms); long one-shot waits are re-armed in bounded chunks. Cron uses the process timezone.
 
-**Option C — Install from local folder:**
+`/schedule-prompt` opens Jobs and Settings. Jobs hotkeys: arrows select, `a` add, `t` enable/disable, `s` scope, `x` remove, `c` explicitly clean disabled jobs, `q` exit. Paused jobs survive shutdown and reload; cleanup is never automatic. Other sessions' bound jobs are read-only.
 
-```bash
-pi install ~/projects/pi-cron-schedule
-```
+## Native dispatch and status
 
-Then run `pi` normally; the extension auto-discovers.
+Inline jobs send one `scheduled_prompt` custom message, not a synthetic human message. While Pi is busy or has pending messages, repeated fires for one job collapse into one local pending entry. Disable/remove/reschedule/shutdown discard that entry. The latest stored prompt, ownership and limits are checked again before dispatch.
 
-## Usage
+| Status | What it proves |
+| --- | --- |
+| `queued` | One local pending fire; no model request yet |
+| `dispatched` | Host accepted an inline custom message; not task completion |
+| `running` | An explicit model job is in progress |
+| `success` / `error` | Explicit model run returned a result/error; not independent business verification |
+| `unknown` | Interrupted work or ambiguous delivery; reconcile before resuming |
 
-### LLM-driven (automatic)
+Ambiguous sends are paused, not blindly retried. Disabling a schedule cannot retract an already delivered prompt or cancel an active tool. This is not an exactly-once guarantee.
 
-The agent automatically uses `schedule_prompt` when you want to schedule, defer, or be reminded:
+## Scope, persistence and safety
 
-```
-You: Remind me to check the deployment logs in 10 minutes
+Jobs live in `<cwd>/.pi/schedule-prompts.json`. New jobs bind to the creating session by default. Unbound/shared jobs deliberately broadcast to every Pi in that cwd; do not use shared mode to elect a supervisor. Storage serialization protects cooperating writers, not single execution of shared jobs.
 
-Agent: [calls schedule_prompt with schedule="+10m", prompt="check the deployment logs"]
-✓ Scheduled job "abc123" to run in 10 minutes
-```
+Mutations use an exclusive local lock and unique atomic replacements. Task files use mode 0600; prompts must not contain secrets. Corrupt stores are not replaced with an empty file. Contention fails visibly instead of blocking Pi. A leftover lock after a crash requires confirming the writer is gone before removing that exact lock. This is a same-user/local-filesystem contract, not adversarial or NFS isolation.
 
-The widget displays below your editor (only when jobs exist):
+Settings merge global `~/.pi/agent/schedule-prompts-settings.json` defaults with project `.pi/schedule-prompts-settings.json`. The UI only writes project settings: `widgetVisible` and `defaultJobScope` (session/workdir).
 
-```
- Scheduled Prompts (3 jobs)
-  ✓ check-logs    every hour      check deployment logs     in 45m    12m ago  5
-  ✗ daily-report  daily           analyze metrics           in 8h     never    0
-  ✓ review-pr     Feb 13 15:30    review PR #123            in 2h     never    0
-```
+Schedules fire only in a compatible live Pi session. Offline ticks are not replayed; past one-shots are disabled with an error. Print/JSON batch sessions do not arm timers. This is not a daemon, OS wake service, permission system or cross-session supervisor.
 
-### Manual commands
+## Explicit model jobs
 
-`/schedule-prompt` opens a two-item menu:
+The upstream `model` option remains available: it creates a fresh in-process session. Default tools are bash/read/edit/write/grep/find/ls, with no extensions or skills. Explicit options can load additional resources and the default host toolset. Provider-qualified fuzzy requests never switch provider. Current host provider configuration is inherited where available, thinking level is preserved, overlapping runs for one local job are suppressed, and sessions are disposed afterward. These are powerful unattended jobs, not a sandbox.
 
-- **Jobs** — full-screen overlay listing every scheduled prompt in this cwd. Your session's jobs are at the top; jobs bound to other sessions render read-only below. Hotkeys: `↑`/`↓` select, `a` add (opens the input series — name/type/schedule/prompt/scope/confirm), `t` toggle enabled, `s` toggle scope (session-bound ↔ shared with all pi sessions in this cwd), `x` remove (with `y/n` confirm), `c` cleanup all disabled jobs, `q`/`esc` close.
-- **Settings** — widget visibility and the default scope for new jobs (`Bind new jobs to session: yes/no`). Persists across sessions.
+For our composed setup, prefer inline waking of the owning session, Intercom for existing peers and pi-subagents for independent workflows/worktrees. Do not register the same recurring job in both schedulers. A persisted schedule does not extend authorization.
 
-### Tool Parameters (`schedule_prompt`)
+## Development and verification
 
-| Param | Type | Required | Description |
-|-------|------|----------|-------------|
-| `action` | `add` \| `remove` \| `list` \| `enable` \| `disable` \| `update` \| `cleanup` | yes | Operation to perform |
-| `name` | string | no | Job name (auto-generated if omitted on `add`) |
-| `schedule` | string | on `add` | Cron expression, ISO timestamp, relative time (`+10s`, `+5m`), or interval (`5m`) |
-| `prompt` | string | on `add` | Prompt text to execute when the job fires |
-| `jobId` | string | on `remove` / `enable` / `disable` / `update` | Target job |
-| `type` | `cron` \| `once` \| `interval` | no | Job type. Default `cron`; use `once` for relative times like `+10s` |
-| `description` | string | no | Free-form note |
-| `model` | non-empty string | no | If set, run the prompt in a fresh in-process agent session with this model instead of injecting into the current chat. Accepts fuzzy names (`haiku`, `sonnet`) or `provider/model-id`. To switch a job from subagent back to inline mode, remove and re-add it without `model` (no in-place clearing) |
-| `notify` | boolean | no | Subagent-only. If `true`, the parent agent is woken to react to the subagent's result. Default `false` (result shown in chat, parent not interrupted). No-op for inline (no-model) jobs — the prompt itself already wakes the parent. Recommended only for low-frequency jobs |
-| `extensions` | boolean or string[] | no | Subagent-only. If `true`, loads all registered extensions; an array of package names loads only those. Unset or empty array = none (default). Enabling extensions also grants the subagent the full builtin toolset (not just the default read/write/bash set) — required for extension-provided tools to activate. No-op for inline (no-model) jobs |
-| `skills` | boolean or string[] | no | Subagent-only. If `true`, loads all skills; an array of skill names loads only those. Unset or empty array = none (default). No-op for inline (no-model) jobs |
-
-### Schedule Formats
-
-The tool accepts multiple time formats:
-
-| Format | Example | Type | Description |
-|--------|---------|------|-------------|
-| **Relative time** | `+5m`, `+1h`, `+30s`, `+2d` | once | Runs once after delay |
-| **Interval** | `5m`, `1h`, `30s`, `2d` | interval | Repeats at interval |
-| **ISO timestamp** | `2026-02-13T15:30:00Z` | once | Runs once at exact time |
-| **Cron expression** | `0 */5 * * * *` | cron | Runs on cron schedule |
-
-**Cron format** (6 fields - **must include seconds**):
-
-```
-┌─ second (0-59)
-│ ┌─ minute (0-59)
-│ │ ┌─ hour (0-23)
-│ │ │ ┌─ day of month (1-31)
-│ │ │ │ ┌─ month (1-12)
-│ │ │ │ │ ┌─ day of week (0-6, Sun-Sat)
-│ │ │ │ │ │
-0 * * * * *   → every minute
-0 0 * * * *   → every hour
-0 */5 * * * * → every 5 minutes
-0 0 0 * * *   → daily at midnight
-0 0 9 * * 1-5 → 9am on weekdays
-* * * * * *   → every second
+```sh
+npm ci --ignore-scripts --no-audit --no-fund
+npm run check
+mkdir -p tmp
+npm pack --ignore-scripts --pack-destination tmp
 ```
 
-**Note:** Traditional 5-field cron expressions (without seconds) are not supported. Use `0 * * * * *` for "every minute", not `* * * * *`.
+The check runs lint, typecheck, provider-free tests with bounded workers, and build. A real Pi lifecycle fixture uses an in-memory faux provider and isolated resources, not real credentials or paid inference. Source, installed-host fixtures, releases, installation and live activation remain distinct.
 
-## How It Works
-
-**Storage:**
-
-- Job data: `.pi/schedule-prompts.json` (project-local, atomic writes, auto-created)
-- Settings: two-layer config — `~/.pi/agent/schedule-prompts-settings.json` (global, hand-edited defaults) and `<cwd>/.pi/schedule-prompts-settings.json` (project, written by the UI). Project overrides global on load.
-
-**Job binding:**
-
-By default a job fires only in the session that created it — opening two pi sessions in the same directory won't double-fire schedules. To make a job fire in every pi in this cwd (useful for hand-edited project-wide cron), remove its `session` field from `<cwd>/.pi/schedule-prompts.json`.
-
-Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new jobs to session`. Flipping only affects future jobs.
-
-**Heads up:** schedules only fire while a pi session is open in this directory; nothing is queued. A `daily 9am` cron only fires on days at least one pi is open at 9am.
-
-**Scheduler:**
-
-- Uses `croner` library for cron expressions
-- Native `setTimeout`/`setInterval` for intervals and one-shots
-- Tracks: next run, last run, execution count, status (running/success/error)
-
-**Execution:**
-
-- Sends scheduled prompt as user message to Pi agent
-- Displays custom message showing what was triggered
-- Updates job statistics after each run
-
-**Safety:**
-
-- **Infinite loop prevention**: Blocks scheduled jobs from creating more schedules
-- **Past timestamp detection**: Auto-disables jobs scheduled in the past
-- **Duplicate names**: Prevents name collisions
-- **Auto-cleanup**: Removes disabled jobs on exit
-
-**Widget:**
-
-- Auto-hides when no jobs configured
-- Shows: status icon, name, schedule (human-readable), prompt (truncated), next run, last run, run count
-- Human-readable formatting: "every minute", "daily", "Feb 13 15:30" instead of raw cron/ISO
-- Auto-refreshes every 30 seconds
-- Visibility togglable via `/schedule-prompt → Settings`; persists across sessions (and package upgrades) in `<cwd>/.pi/schedule-prompts-settings.json`, with `~/.pi/agent/schedule-prompts-settings.json` as the global default
-- Status icons: `✓` enabled, `✗` disabled, `⟳` running, `!` error
-
-## Examples
-
-### One-time reminders
-
-```
-"remind me to check logs in 5 minutes"
-  → schedule="+5m", type=once
-
-"schedule 'review metrics' for 3pm today"
-  → schedule="2026-02-13T15:00:00Z", type=once
-```
-
-### Recurring tasks
-
-```
-"analyze error rates every 10 minutes"
-  → schedule="10m", type=interval
-
-"run daily summary at midnight"
-  → schedule="0 0 0 * * *", type=cron
-
-"check build status every hour"
-  → schedule="0 0 * * * *", type=cron
-
-"execute every minute"
-  → schedule="0 * * * * *", type=cron
-```
-
-### Heartbeat monitoring
-
-```
-"check system health every 5 minutes"
-  → schedule="5m", type=interval
-```
-
-### Run in a separate agent session (per-task model)
-
-By default a scheduled prompt is injected into your current chat. Set `model` on the job to run it in a fresh in-process agent session instead — your current chat keeps its own model and context untouched.
-
-```
-"every morning at 9, summarise yesterday's logs using haiku"
-  → schedule="0 0 9 * * *", type=cron, model="haiku", prompt="summarise yesterday's logs"
-
-"in 30s reply with OK using sonnet"
-  → schedule="+30s", type=once, model="sonnet", prompt="Reply with OK"
-```
-
-`model` is permissive: pass a fuzzy name (`haiku`, `sonnet`) or fully qualified `provider/model-id`. The first match in the available model registry is used. When the job fires you'll see a `🕐 Scheduled (subagent: <model>)` marker in chat, followed by a `✓ finished` (or `✗ failed`) marker with the response snippet once the subagent completes.
-
-By default the result is shown in chat but the parent agent is **not** woken up — you read it, the agent isn't interrupted. Set `notify: true` on the job if you want the parent to react to each completion (e.g. for autonomous workflows). Recommended only for low-frequency jobs; a `notify: true` recurring job that fires every 5 minutes will trigger a parent-agent turn every 5 minutes.
-
-> **Heads up:** Subagent jobs run unattended at fire time with the full default tool set (`bash`, `read`, `edit`, `write`, …) under your credentials. Treat persisted jobs in `.pi/schedule-prompts.json` as you would any auto-executed task — review prompts before adding, especially anything that mutates files or shells out.
-
-## Development
-
-**TypeScript check:**
-
-```bash
-npx tsc --noEmit
-```
-
-**Run the test suite (vitest):**
-
-```bash
-npm test
-```
-
-**Test with Pi:**
-
-```bash
-pi -e ./src/index.ts
-```
-
-## Project Structure
-
-```
-src/
-  types.ts          # CronJob, CronJobType, CronToolParams
-  storage.ts        # Job persistence (.pi/schedule-prompts.json)
-  settings.ts       # Settings persistence (global + project, project overrides)
-  scheduler.ts      # Core scheduling engine with croner
-  subagent.ts       # Lightweight in-process agent runner (per-task model)
-  tool.ts           # schedule_prompt tool definition
-  ui/
-    cron-widget.ts  # Live status widget below editor
-  index.ts          # Extension entry point
-```
+See [reliability design](docs/reliable-scheduling.md) and [the scoped OpenSpec change](openspec/changes/reliable-prompt-scheduling/).
 
 ## License
 
-MIT (see [LICENSE](LICENSE))
-
-## Author
-
-[tintinweb](https://github.com/tintinweb)
+MIT. Original author: [tintinweb](https://github.com/tintinweb). Maintained fork: chenhaoxiang.

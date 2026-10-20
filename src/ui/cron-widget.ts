@@ -142,6 +142,10 @@ export class CronWidget {
         statusIcon = theme.fg("warning", "⟳");
       } else if (job.lastStatus === "error") {
         statusIcon = theme.fg("error", "!");
+      } else if (job.lastStatus === "queued" || job.lastStatus === "unknown") {
+        statusIcon = theme.fg("warning", "?");
+      } else if (job.lastStatus === "dispatched") {
+        statusIcon = theme.fg("dim", "→");
       } else {
         statusIcon = theme.fg("success", "✓");
       }
@@ -193,7 +197,7 @@ export class CronWidget {
 
       // Combine into a row with proper spacing
       lines.push(
-        ` ${statusIcon} ${nameText} ${scheduleText} ${promptText} ${nextText} ${lastText} ${countText}${modelBadge}`
+        ` ${statusIcon} ${nameText} ${scheduleText} ${promptText} ${nextText} ${lastText} ${countText}${modelBadge} [${job.lastStatus ?? "pending"}]`
       );
     }
 
