@@ -11,6 +11,8 @@ This repository is chenhaoxiang/pi-schedule-prompt, maintained from tintinweb/pi
 
 ## Documentation map
 
+- docs/event-admission.md: stage C unified local/lifecycle/GitHub/optional loopback admission, UTC daily bounds, bounded dedup and restart policy.
+
 - docs/online-supervision.md: bounded supervisor prompt, native tool composition, isolated real-component fixtures, fixed installation and selected-peer acceptance.
 - docs/automation-roadmap.md: single overall rollout, fixed reference mapping, online/event/durable stages and separate install/live acceptance.
 - openspec/changes/composed-automation-rollout/: sequential implementation contract/tasks; do not mistake the timer-foundation closeout for the whole rollout.

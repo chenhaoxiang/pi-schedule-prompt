@@ -96,6 +96,14 @@ For our composed setup, prefer inline waking of the owning session, Intercom for
 
 `/supervise` is a packaged bounded supervision recipe using the existing Intercom/Subagents tools. It requires exact selected peers, existing goal/evidence references and finite check/expiry limits; it does not automatically control other sessions. See [online operation](docs/online-supervision.md) and the [single overall roadmap](docs/automation-roadmap.md) for online, event and durable stages.
 
+## Event jobs and daily limits
+
+Stage C adds session-bound `type: "event"` jobs. `schedule` is 1–4 comma-separated event names (for example `local:build,lifecycle:agent-settled`), not a cron expression. `action: "trigger"` requires `jobId`, `eventName`, and a stable `eventId`; it cannot inject a new prompt. `maxRunsPerDay` bounds UTC-calendar admission attempts, and `catchUp: "none" | "latest"` explicitly controls pending-event restoration. Configured model jobs use the same caps.
+
+Optional `github` selects `{repo, kind: "pull-request", number}` or `{repo, kind: "workflow", branch?}` with at least60 seconds between metadata-only GET polls. It is off unless the task explicitly configures it. Optional project `eventApi: {enabled:true,port,tokenEnv}` binds only127.0.0.1 and requires a separately supplied bearer token; POST `/events` accepts only `{jobId,eventName,eventId}`, and HTTP names must start with `api:`. No listener starts by default.
+
+See [event admission](docs/event-admission.md) for version2 storage, dedup bounds, source restrictions, expiry/pause and evidence limits. These are not hard financial budgets or live external-source acceptance.
+
 ## Development and verification
 
 ```sh

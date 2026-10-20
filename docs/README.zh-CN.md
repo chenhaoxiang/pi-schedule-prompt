@@ -69,6 +69,12 @@ created: 2026-10-20
 
 `/supervise` 提供有限范围的监督提示模板，复用现有 Intercom/Subagents 工具；必须明确目标会话、仓库、已有目标/证据来源及次数/到期限制，不会自动接管全部会话。运行与真实试点边界见 [在线总控](online-supervision.md)，事件与常驻阶段见 [统一路线](automation-roadmap.md)。
 
+## 事件触发与每日限制
+
+新增 `type:event`，schedule 填最多四个逗号分隔事件名；任务必须绑定 session。`action:trigger` 只接受既有 jobId、eventName 和稳定 eventId，不能由事件提供新提示或命令。`maxRunsPerDay` 按 UTC 日历日限制已准入尝试，catchUp 明确选 none 或 latest。
+
+生命周期和本地事件共用准入；可选 GitHub 配置只读指定仓库/PR或工作流元数据，至少六十秒轮询。可选 eventApi 默认关闭，只监听回环地址，Token 由指定环境变量提供，HTTP 仅允许 api: 事件名。新状态写入版本2，旧运行时会拒绝，不要混用同一份状态文件。完整边界见 [事件准入](event-admission.md)。
+
 ## 开发与验证
 
 执行 `npm ci --ignore-scripts --no-audit --no-fund`，再执行 `npm run check`。检查包含 lint、类型、有限并发无提供商回归和构建。真实 SDK 夹具使用内存 faux provider、隔离资源，不读取真实凭据或调用付费模型。

@@ -43,7 +43,7 @@ Important differences: routines GitHub polling is not a complete CI event adapte
 
 Native custom turns; busy tick coalescing; latest-definition admission; session binding; truthful queued/dispatched/unknown; paused persistence; private serialized validated storage; optional lifetime maxRuns/expiresAt; isolated SDK coverage. No offline catch-up, external event source or daemon yet.
 
-## 5. Stage B — online supervision and fixed installation (source implemented; rollout/pilot pending)
+## 5. Stage B — online supervision and fixed installation (delivered; real business pilot pending)
 
 ### Smallest implementation
 
@@ -61,7 +61,9 @@ Acceptance sequence: provider-free tool/SDK tests; two isolated peers plus one t
 
 Deliverable: a current-session timed supervisor genuinely advances two selected goals or reports their exact blockers, then stops at its declared boundary.
 
-## 6. Stage C — event-driven admission and daily bounds
+Stage B source was delivered through PR #2, main d18f298, with148 tests and Node22/26 PR/post-merge CI. Release v0.4.1-fork.2 was freshly downloaded/checksummed, installed into a permanent version directory, and passed3/3 installed-manifest component cases. A dedicated pinned launcher exists with zero targets/schedules; global settings and business sessions were unchanged. Real business-goal acceptance still requires selected peers/goals.
+
+## 6. Stage C — event-driven admission and daily bounds (source candidate)
 
 Add optional event triggers to the existing job definitions rather than a second timer store. Begin with lifecycle and explicit local events; GitHub polling follows for actual PR/CI needs. A localhost authenticated API is optional and off by default, with bounded input and no arbitrary prompt/command from event payloads. Events select an existing task id; untrusted body text is data, not instructions or authority.
 

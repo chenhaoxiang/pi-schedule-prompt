@@ -8,9 +8,13 @@
  * - Persistence via .pi/schedule-prompts.json (jobs) and .pi/schedule-prompts-settings.json (settings)
  */
 
+import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
+import { startEventApi } from "./event-api.js";
+import { EVENT_REQUEST, validEventId } from "./events.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
 import { CronStorage } from "./storage.js";
@@ -23,6 +27,8 @@ export default async function (pi: ExtensionAPI) {
   let storage: CronStorage;
   let scheduler: CronScheduler;
   let widget: CronWidget;
+  let eventServer: Server | undefined;
+  let generation = 0;
   // Refreshed in initializeSession; mutated by Settings submenu. The tool and
   // widget read via closure so toggles take effect without re-registering.
   let settings: ScheduleSettings = {};
@@ -105,6 +111,10 @@ export default async function (pi: ExtensionAPI) {
   };
 
   const cleanupSession = (ctx: ExtensionContext) => {
+    generation += 1;
+    eventServer?.closeAllConnections();
+    eventServer?.close();
+    eventServer = undefined;
     // Stop scheduler
     if (scheduler) {
       scheduler.stop();
@@ -120,7 +130,22 @@ export default async function (pi: ExtensionAPI) {
   // --- Lifecycle events ---
 
   pi.on("session_start", async (_event, ctx) => {
-    try { initializeSession(ctx); }
+    try {
+      initializeSession(ctx);
+      if (ctx.mode !== "print" && ctx.mode !== "json") {
+        scheduler.emitEvent("lifecycle:session-start", "start:" + ctx.sessionManager.getSessionId());
+        const api = settings.eventApi;
+        if (api?.enabled) {
+          const own = scheduler;
+          const epoch = generation;
+          try {
+            const server = await startEventApi({ port: api.port, token: process.env[api.tokenEnv] ?? "" }, (id, name, eventId) => own.receiveEvent(id, name, eventId));
+            if (epoch !== generation) { server.closeAllConnections(); server.close(); }
+            else { eventServer = server; pi.appendEntry("schedule_event_api", { port: (server.address() as { port: number }).port, host: "127.0.0.1" }); }
+          } catch { console.error("Local event API could not start; other scheduling remains available"); }
+        }
+      }
+    }
     catch (error) {
       cleanupSession(ctx);
       console.error("[pi-schedule-prompt] Initialization failed:", error);
@@ -136,9 +161,28 @@ export default async function (pi: ExtensionAPI) {
     scheduler?.setScheduledTurn(event.messageType === "custom" && event.message.customType === "scheduled_prompt");
   });
   pi.on("agent_settled", () => {
+    if (scheduler && !scheduler.isScheduledTurn()) {
+      try { scheduler.emitEvent("lifecycle:agent-settled", randomUUID()); }
+      catch { console.error("Lifecycle event admission unavailable"); }
+    }
     scheduler?.setScheduledTurn(false);
     scheduler?.onAgentSettled();
   });
+
+  const stopEventBus = pi.events.on(EVENT_REQUEST, payload => {
+    if (!payload || typeof payload !== "object") return;
+    const request = payload as Record<string, unknown>;
+    if (request.version !== 1 || !validEventId(request.requestId)) return;
+    let result: unknown = { status: "ignored", reason: "invalid-request" };
+    try {
+      if (Object.keys(request).every(key => ["version", "requestId", "jobId", "eventName", "eventId"].includes(key)) && typeof request.jobId === "string" && typeof request.eventName === "string" && typeof request.eventId === "string" && scheduler) {
+        result = scheduler.receiveEvent(request.jobId, request.eventName, request.eventId);
+      }
+    } catch { result = { status: "ignored", reason: "admission-unavailable" }; }
+    try { pi.events.emit(EVENT_REQUEST + ":result:" + request.requestId, result); }
+    catch { console.error("Local event observer failed"); }
+  });
+  pi.on("session_shutdown", () => { stopEventBus(); });
 
   // --- Register /schedule-prompt command ---
 

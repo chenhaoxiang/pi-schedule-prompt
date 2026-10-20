@@ -152,7 +152,7 @@ export class CronWidget {
         statusIcon = theme.fg("warning", "⟳");
       } else if (job.lastStatus === "error") {
         statusIcon = theme.fg("error", "!");
-      } else if (job.lastStatus === "queued" || job.lastStatus === "unknown") {
+      } else if (job.lastStatus === "queued" || job.lastStatus === "unknown" || job.lastStatus === "skipped") {
         statusIcon = theme.fg("warning", "?");
       } else if (job.lastStatus === "dispatched") {
         statusIcon = theme.fg("dim", "→");

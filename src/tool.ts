@@ -1,6 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { nanoid } from "nanoid";
+import { validateGithub } from "./events.js";
 import { CronScheduler } from "./scheduler.js";
 import type { JobScope } from "./settings.js";
 import type { CronStorage } from "./storage.js";
@@ -20,7 +21,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup.",
+      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId). maxRunsPerDay counts UTC attempts.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -48,10 +49,20 @@ export function createCronTool(
         if (params.maxRuns !== undefined && (!Number.isSafeInteger(params.maxRuns) || params.maxRuns < 1)) {
           throw new Error("maxRuns must be a positive safe integer");
         }
+        if (params.maxRunsPerDay !== undefined && (!Number.isSafeInteger(params.maxRunsPerDay) || params.maxRunsPerDay < 1)) throw new Error("maxRunsPerDay must be a positive safe integer");
+        if (params.catchUp !== undefined && !["none", "latest"].includes(params.catchUp)) throw new Error("Invalid catchUp policy");
+        if (params.github !== undefined) validateGithub(params.github);
         if (params.expiresAt !== undefined && (!Number.isFinite(Date.parse(params.expiresAt)) || Date.parse(params.expiresAt) <= Date.now())) {
           throw new Error("expiresAt must be an absolute future timestamp");
         }
         switch (action) {
+          case "trigger": {
+            if (scheduler.isScheduledTurn?.()) throw new Error("Scheduled turns cannot trigger another schedule recursively");
+            if (!params.jobId || !params.eventName || !params.eventId) throw new Error("trigger requires jobId,eventName,eventId");
+            const result = scheduler.receiveEvent(params.jobId, params.eventName, params.eventId);
+            details.jobs = storage.getAllJobs().filter(job => job.id === params.jobId && CronScheduler.isLoadedFor(job, ctx.sessionManager.getSessionId()));
+            return { content: [{ type: "text", text: `Event ${result.status}${result.reason ? ": " + result.reason : ""}` }], details };
+          }
           case "add": {
             if (!params.schedule || !params.prompt) {
               const missing = [];
@@ -102,6 +113,9 @@ export function createCronTool(
               runCount: 0,
               description: params.description,
               maxRuns: params.maxRuns,
+              maxRunsPerDay: params.maxRunsPerDay,
+              catchUp: params.catchUp,
+              github: params.github,
               expiresAt: params.expiresAt,
               model: params.model,
               notify: params.notify,
@@ -250,6 +264,9 @@ export function createCronTool(
 
             const updates: Partial<CronJob> = {};
             if (params.maxRuns !== undefined) updates.maxRuns = params.maxRuns;
+            if (params.maxRunsPerDay !== undefined) updates.maxRunsPerDay = params.maxRunsPerDay;
+            if (params.catchUp !== undefined) updates.catchUp = params.catchUp;
+            if (params.github !== undefined) updates.github = params.github;
             if (params.expiresAt !== undefined) updates.expiresAt = params.expiresAt;
             if (params.name) updates.name = params.name;
             if (params.prompt) updates.prompt = params.prompt;
