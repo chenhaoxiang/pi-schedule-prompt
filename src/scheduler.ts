@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Cron } from "croner";
 import { DurableExecution } from "./durable.js";
 import { dailyLimited, eventBinding, eventNames } from "./events.js";
+import { FOLLOWUP_DUE_EVENT, type FollowupDueRequest } from "./followup.js";
 import { githubFingerprint } from "./github-events.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { runSubagentOnce } from "./subagent.js";
@@ -47,6 +48,12 @@ export class CronScheduler {
     this.durable.restore();
     for (const job of this.storage.getAllJobs()) {
       if (!CronScheduler.isLoadedFor(job, session)) continue;
+      if (job.followUp && ["pending", "dispatched"].includes(job.followUp.state)) {
+        const dueOrExpired = Date.parse(job.followUp.expiresAt) <= Date.now() || (job.followUp.state === "dispatched") || Date.parse(job.schedule) <= Date.now();
+        if (dueOrExpired) {
+          this.storage.markFollowUpUnknown({ ownerSessionId: job.followUp.ownerSessionId, intercomSessionId: job.followUp.intercomSessionId, peerSessionId: job.followUp.peerSessionId, messageId: job.followUp.messageId }, "Owner/scheduler restarted while follow-up state was unresolved");
+        }
+      }
       if (job.github && job.catchUp !== "latest") this.storage.updateJob(job.id, { sourceFingerprint: undefined });
       if (job.type === "event" && job.pendingEvent) {
         if (job.enabled && job.catchUp === "latest" && job.pendingEvent.revision === (job.revision ?? 0)) this.pending.add(job.id);
@@ -132,6 +139,40 @@ export class CronScheduler {
     if (this.activeJobs.has(id)) this.storage.updateJob(id, { lastStatus: "unknown" });
     if (!this.stopped && updated.enabled && CronScheduler.isLoadedFor(updated, this.ctx.sessionManager.getSessionId())) this.scheduleJob(updated);
     this.emitChange({ type: "update", job: updated });
+  }
+
+  cancelFollowUp(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }): { found: boolean; state?: string; jobId?: string; unknown?: boolean } {
+    const existing = this.storage.findFollowUp(binding);
+    const before = existing ? this.storage.getJob(existing.id) : undefined;
+    const result = this.storage.cancelFollowUp(binding);
+    if (result.jobId) {
+      this.unscheduleJob(result.jobId);
+      if (result.unknown && before?.claim?.id && this.durable.activeClaimId() === before.claim.id) this.durable.finish("unknown");
+      this.emitChange({ type: "update", job: this.storage.getJob(result.jobId) });
+    }
+    return result;
+  }
+
+  observeFollowUpReply(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }, reply: { id: string; kind: "ack" | "pending" | "other"; at: string; text?: string }): { found: boolean; state?: string; jobId?: string; completion: "unknown" } {
+    const before = this.storage.getJob(this.storage.findFollowUp(binding)?.id ?? "");
+    const result = this.storage.observeFollowUpReply(binding, reply);
+    if (result.jobId) {
+      this.unscheduleJob(result.jobId);
+      if (before?.claim?.id && this.durable.activeClaimId() === before.claim.id) this.durable.finish("unknown");
+      this.emitChange({ type: "update", job: this.storage.getJob(result.jobId) });
+    }
+    return result;
+  }
+
+  markFollowUpUnknown(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }, reason: string): { found: boolean; state?: string; jobId?: string } {
+    const before = this.storage.getJob(this.storage.findFollowUp(binding)?.id ?? "");
+    const result = this.storage.markFollowUpUnknown(binding, reason);
+    if (result.jobId) {
+      this.unscheduleJob(result.jobId);
+      if (before?.claim?.id && this.durable.activeClaimId() === before.claim.id) this.durable.finish("unknown");
+      this.emitChange({ type: "update", job: this.storage.getJob(result.jobId) });
+    }
+    return result;
   }
 
   getNextRun(id: string): Date | null {
@@ -336,11 +377,15 @@ export class CronScheduler {
         admitted = true;
         this.contention.delete(id);
         const attempts = job.attemptCount!;
-        // Admission is persisted before a potentially effectful send.
-        this.pi.sendMessage({
-          customType: "scheduled_prompt", content: promptFor(job), display: true,
-          details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline", ...(job.claim ? { claimId: job.claim.id } : {}) },
-        }, { triggerTurn: true, deliverAs: "followUp" });
+        if (job.followUp && job.claim) {
+          this.dispatchFollowUp(job);
+        } else {
+          // Admission is persisted before a potentially effectful send.
+          this.pi.sendMessage({
+            customType: "scheduled_prompt", content: promptFor(job), display: true,
+            details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline", ...(job.claim ? { claimId: job.claim.id } : {}) },
+          }, { triggerTurn: true, deliverAs: "followUp" });
+        }
         if (!job.durable) this.storage.updateJob(id, {
           lastRun: new Date().toISOString(), lastStatus: "dispatched", runCount: job.runCount + 1,
           ...(job.type === "once" || (job.maxRuns !== undefined && attempts >= job.maxRuns) ? { enabled: false } : {}),
@@ -354,6 +399,57 @@ export class CronScheduler {
       else { this.durable.finish("unknown"); this.fail(id, error); }
     }
     this.armDrain();
+  }
+
+  private dispatchFollowUp(job: CronJob): void {
+    const binding = job.followUp;
+    const claim = job.claim;
+    if (!binding || !claim) {
+      this.durable.finish("unknown");
+      return;
+    }
+    if (!this.storage.beginFollowUpDispatch(job.id, claim.id)) {
+      this.durable.finish("unknown");
+      return;
+    }
+    let responded = false;
+    const request: FollowupDueRequest = {
+      version: 1,
+      binding: {
+        ownerSessionId: binding.ownerSessionId,
+        intercomSessionId: binding.intercomSessionId,
+        peerSessionId: binding.peerSessionId,
+        messageId: binding.messageId,
+      },
+      record: { ...binding },
+      jobId: job.id,
+      claimId: claim.id,
+      claim: () => undefined,
+      isCurrent: () => {
+        const current = this.storage.getJob(job.id);
+        return !!current && current.claim?.id === claim.id && current.followUp?.state === "dispatched";
+      },
+      respond: result => {
+        if (responded) return;
+        responded = true;
+        try {
+          const current = this.storage.getJob(job.id);
+          if (current?.claim?.id === claim.id && current.followUp) {
+            this.storage.updateFollowUp(job.id, {
+              reminderMessageId: result.messageId,
+              transportState: result.delivered ? "delivered" : "unknown",
+              ...(result.delivered ? {} : { state: "unknown", unknownReason: result.reason ?? "Follow-up transport outcome unknown" }),
+            });
+          }
+        } catch { /* Preserve the claim; durable finish below records unknown. */ }
+        this.durable.finish("unknown");
+      },
+    };
+    try {
+      this.pi.events.emit(FOLLOWUP_DUE_EVENT, request);
+    } catch (error) {
+      request.respond({ delivered: false, unknown: true, reason: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   private executeJobInSubagent(snapshot: CronJob): void {

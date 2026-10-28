@@ -15,6 +15,7 @@ import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
 import { startEventApi } from "./event-api.js";
 import { EVENT_REQUEST, validEventId } from "./events.js";
+import { classifyFollowupReply, FOLLOWUP_CANCEL_TRANSPORT_EVENT, FOLLOWUP_OBSERVED_EVENT, FOLLOWUP_SCHEDULE_EVENT, type FollowupObservation, type FollowupRecord, type FollowupScheduleRequest, followupName, followupPrompt, validateFollowupBinding, validateFollowupOptions } from "./followup.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
 import { CronStorage } from "./storage.js";
@@ -29,6 +30,7 @@ export default async function (pi: ExtensionAPI) {
   let widget: CronWidget;
   let eventServer: Server | undefined;
   let generation = 0;
+  let currentSessionId = "";
   // Refreshed in initializeSession; mutated by Settings submenu. The tool and
   // widget read via closure so toggles take effect without re-registering.
   let settings: ScheduleSettings = {};
@@ -96,6 +98,7 @@ export default async function (pi: ExtensionAPI) {
     cleanupSession(ctx);
 
     settings = loadSettings(ctx.cwd);
+    currentSessionId = ctx.sessionManager.getSessionId();
     storage = new CronStorage(ctx.cwd);
     scheduler = new CronScheduler(storage, pi, ctx);
     widget = new CronWidget(storage, scheduler, pi, isWidgetVisible, ctx.sessionManager.getSessionId());
@@ -116,6 +119,7 @@ export default async function (pi: ExtensionAPI) {
 
   const cleanupSession = (ctx: ExtensionContext) => {
     generation += 1;
+    currentSessionId = "";
     eventServer?.closeAllConnections();
     eventServer?.close();
     eventServer = undefined;
@@ -180,6 +184,106 @@ export default async function (pi: ExtensionAPI) {
     scheduler?.onAgentSettled(event.aborted);
   });
 
+  const stopFollowupBus = pi.events.on(FOLLOWUP_SCHEDULE_EVENT, payload => {
+    if (!payload || typeof payload !== "object") return;
+    const request = payload as FollowupScheduleRequest;
+    if (request.version !== 1 || typeof request.claim !== "function" || typeof request.respond !== "function") return;
+    const ownerSessionId = currentSessionId;
+    if (request.binding?.ownerSessionId !== ownerSessionId) return;
+    request.claim();
+    try {
+      validateFollowupBinding(request.binding);
+      if (request.action === "create") {
+        if (!request.options) throw new Error("Follow-up options are required");
+        validateFollowupOptions(request.options);
+        const now = new Date().toISOString();
+        const record: FollowupRecord = {
+          version: 1,
+          ...request.binding,
+          requestId: request.options.requestId,
+          goal: request.options.goal,
+          phase: request.options.phase,
+          deadlineAt: request.options.deadlineAt,
+          intervalMs: request.options.intervalMs,
+          maxRuns: request.options.maxRuns,
+          expiresAt: request.options.expiresAt,
+          state: "pending",
+          createdAt: now,
+          updatedAt: now,
+          ...(request.options.coveredBy ? { coveredBy: request.options.coveredBy } : {}),
+        };
+        const job = {
+          id: followupName(request.binding),
+          name: followupName(request.binding),
+          schedule: new Date(Date.now() + request.options.intervalMs).toISOString(),
+          prompt: followupPrompt(record),
+          enabled: true,
+          type: "once" as const,
+          createdAt: now,
+          runCount: 0,
+          maxRuns: 1,
+          expiresAt: request.options.expiresAt,
+          durable: true,
+          catchUp: "none" as const,
+          deadlineMs: Math.max(1000, Math.min(86400000, Date.parse(request.options.deadlineAt) - Date.now())),
+          session: ownerSessionId,
+          followUp: record,
+        };
+        const created = storage.createFollowUp(job);
+        if (created.created) scheduler.addJob(created.job);
+        request.respond({ ok: true, created: created.created, jobId: created.job.id, state: created.job.followUp?.state, enabled: created.job.enabled, pending: created.job.followUp?.state === "pending", completion: "unknown" });
+        return;
+      }
+      const found = storage.findFollowUp(request.binding);
+      if (request.action === "get") {
+        request.respond(found
+          ? { ok: true, jobId: found.id, state: found.followUp?.state, enabled: found.enabled, pending: found.followUp?.state === "pending", completion: "unknown" }
+          : { ok: false, state: "unknown", reason: "No exact follow-up binding found", completion: "unknown" });
+        return;
+      }
+      const result = scheduler.cancelFollowUp(request.binding);
+      request.respond({ ok: result.found, jobId: result.jobId, state: result.state as any, enabled: false, pending: false, reason: result.found ? undefined : "No exact follow-up binding found", completion: "unknown" });
+    } catch (error) {
+      request.respond({ ok: false, state: "unknown", reason: error instanceof Error ? error.message : String(error), completion: "unknown" });
+    }
+  });
+
+  const stopFollowupObservationBus = pi.events.on(FOLLOWUP_OBSERVED_EVENT, payload => {
+    if (!payload || typeof payload !== "object") return;
+    const observation = payload as FollowupObservation;
+    if (observation.version !== 1 || observation.ownerSessionId !== currentSessionId) return;
+    try {
+      if (observation.kind === "reply" && observation.peerSessionId && observation.messageId && observation.replyTo) {
+        const result = scheduler.observeFollowUpReply({ ownerSessionId: observation.ownerSessionId, intercomSessionId: observation.intercomSessionId, peerSessionId: observation.peerSessionId, messageId: observation.replyTo }, {
+          id: observation.messageId,
+          kind: classifyFollowupReply(observation.text ?? ""),
+          at: new Date(observation.at).toISOString(),
+          ...(observation.text ? { text: observation.text } : {}),
+        });
+        const reminderMessageId = result.jobId ? storage.getJob(result.jobId)?.followUp?.reminderMessageId : undefined;
+        if (reminderMessageId) {
+          try {
+            pi.events.emit(FOLLOWUP_CANCEL_TRANSPORT_EVENT, {
+              version: 1,
+              ownerSessionId: observation.ownerSessionId,
+              intercomSessionId: observation.intercomSessionId,
+              peerSessionId: observation.peerSessionId,
+              originalMessageId: observation.replyTo,
+              reminderMessageId,
+            });
+          } catch { console.error("[pi-schedule-prompt] Follow-up transport cancellation unavailable"); }
+        }
+      } else if (observation.kind === "disconnected") {
+        for (const job of storage.getAllJobs()) {
+          const record = job.followUp;
+          if (record?.ownerSessionId === observation.ownerSessionId && record.intercomSessionId === observation.intercomSessionId && ["pending", "dispatched"].includes(record.state)) {
+            scheduler.markFollowUpUnknown({ ownerSessionId: record.ownerSessionId, intercomSessionId: record.intercomSessionId, peerSessionId: record.peerSessionId, messageId: record.messageId }, "Intercom disconnected while follow-up was unresolved");
+          }
+        }
+      }
+    } catch { console.error("[pi-schedule-prompt] Follow-up observation could not be reconciled"); }
+  });
+
   const stopEventBus = pi.events.on(EVENT_REQUEST, payload => {
     if (!payload || typeof payload !== "object") return;
     const request = payload as Record<string, unknown>;
@@ -193,7 +297,7 @@ export default async function (pi: ExtensionAPI) {
     try { pi.events.emit(EVENT_REQUEST + ":result:" + request.requestId, result); }
     catch { console.error("Local event observer failed"); }
   });
-  pi.on("session_shutdown", () => { stopEventBus(); });
+  pi.on("session_shutdown", () => { stopEventBus(); stopFollowupBus(); stopFollowupObservationBus(); });
 
   pi.registerCommand("schedule-host-status", {
     description: "Metadata-only readiness handshake for the dedicated native host",

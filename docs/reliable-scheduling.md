@@ -30,6 +30,12 @@ This is a cooperating same-user local process boundary. It does not promise NFS 
 
 Intercom owns peer messaging and explicit wake requests. Subagents owns independent delegated workflow execution, schedules and mission recovery. Messenger owns Crew dependencies where already adopted. This fork does not clone their records or interpret observations as permission. Future event/daemon work must earn its scope and use these existing public interfaces. No raw prompt is sent to Vista; cron:change is a local observational event, not a public sanitized protocol.
 
+## Bounded Intercom reply follow-up
+
+The optional `schedule:reply-followup:v1` seam lets `pi-intercom` persist one finite, exact-message-bound control reminder in this existing store. A record binds the owner/intercom/peer sessions, original message id, request id, goal and phase; it requires a finite delay, `maxRuns=1`, deadline and expiry. An active `coveredBy` schedule is rejected rather than creating a second loop. A matching `replyTo` observation cancels the record and reads back the persisted state; an unrelated message cannot cancel it.
+
+Due work emits `schedule:reply-followup-due:v1` for Intercom to send a status-only reminder. The scheduler rechecks the persisted claim before emission and cancellation purges local pending work. Delivered, wake-requested, injected and ACK/PENDING observations never settle the business goal. A dispatched or interrupted follow-up remains `unknown` when restart, disconnect, late reply or transport uncertainty prevents reconciliation; no original business action is replayed.
+
 ## Verification and boundaries
 
 The original 103-test baseline passed before changes. The first 15 reliability regression cases failed against that baseline. Maintained tests cover coalescing, native delivery, pause/remove/stop, fresh disk content, one-shot retention, expiry/attempt limits, corrupt stores, writer contention, private modes and foreign-session mutation.

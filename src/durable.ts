@@ -38,6 +38,7 @@ export class DurableExecution {
   }
 
   busy(): boolean { return !!this.active || !!this.heldClaim; }
+  activeClaimId(): string | undefined { return this.active?.job.claim?.id; }
   release(claimId: string): void { if (this.heldClaim?.id === claimId) this.heldClaim = undefined; }
   begin(id: string): CronJob | undefined {
     if (this.busy()) return;
