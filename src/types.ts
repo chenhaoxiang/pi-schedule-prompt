@@ -21,6 +21,29 @@ export interface ExecutionClaim {
 }
 export interface ExecutionReceipt { jobId: string; claimId: string; sessionId: string; outcome: ExecutionOutcome; }
 export interface ExecutionNotice { claimId: string; outcome: ExecutionOutcome; state: "pending" | "accepted" | "failed"; attempts: number; }
+export type FollowupState = "pending" | "dispatched" | "answered" | "cancelled" | "unknown";
+export interface FollowupRecord {
+  version: 1;
+  ownerSessionId: string;
+  intercomSessionId: string;
+  peerSessionId: string;
+  messageId: string;
+  requestId: string;
+  goal: string;
+  phase: string;
+  deadlineAt: string;
+  intervalMs: number;
+  maxRuns: number;
+  expiresAt: string;
+  state: FollowupState;
+  createdAt: string;
+  updatedAt: string;
+  coveredBy?: string;
+  lastReply?: { id: string; kind: "ack" | "pending" | "other"; at: string; text?: string };
+  reminderMessageId?: string;
+  transportState?: "delivered" | "unknown";
+  unknownReason?: string;
+}
 
 /**
  * Status of the last job execution
@@ -77,6 +100,8 @@ export interface CronJob {
   claim?: ExecutionClaim;
   consecutiveErrors?: number;
   notice?: ExecutionNotice;
+  /** Exact Intercom request binding for a finite, control-only follow-up. */
+  followUp?: FollowupRecord;
   /** Optional description */
   description?: string;
   /** If set, run the prompt in a separate in-process agent session using this model instead of injecting into the current chat. */

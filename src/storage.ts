@@ -53,6 +53,17 @@ function validate(store: unknown): asserts store is CronStore {
       ![claim.claimedAt, claim.deadlineAt].every(date => Number.isFinite(Date.parse(date))) ||
       (claim.outcome !== undefined && !["success", "error", "aborted", "unknown"].includes(claim.outcome)))) throw new Error("Invalid durable claim");
     if (job.notice && (!validEventId(job.notice.claimId) || !["success", "error", "aborted", "unknown"].includes(job.notice.outcome) || !["pending", "accepted", "failed"].includes(job.notice.state) || !Number.isSafeInteger(job.notice.attempts) || job.notice.attempts < 0 || job.notice.attempts > 3)) throw new Error("Invalid notification state");
+    const followUp = job.followUp;
+    if (followUp && (followUp.version !== 1 || !job.durable || !job.session || followUp.ownerSessionId !== job.session || ![followUp.ownerSessionId, followUp.intercomSessionId, followUp.peerSessionId, followUp.messageId, followUp.requestId, followUp.goal, followUp.phase, followUp.createdAt, followUp.updatedAt].every(value => typeof value === "string" && value.trim()) ||
+      !Number.isSafeInteger(followUp.intervalMs) || followUp.intervalMs < 1000 || followUp.intervalMs > 86400000 ||
+      followUp.maxRuns !== 1 || !["pending", "dispatched", "answered", "cancelled", "unknown"].includes(followUp.state) ||
+      !Number.isFinite(Date.parse(followUp.deadlineAt)) || !Number.isFinite(Date.parse(followUp.expiresAt)) ||
+      (followUp.coveredBy !== undefined && (typeof followUp.coveredBy !== "string" || !followUp.coveredBy.trim())) ||
+      (followUp.reminderMessageId !== undefined && !validEventId(followUp.reminderMessageId)) ||
+      (followUp.transportState !== undefined && !["delivered", "unknown"].includes(followUp.transportState)) ||
+      (followUp.lastReply !== undefined && (!validEventId(followUp.lastReply.id) || !["ack", "pending", "other"].includes(followUp.lastReply.kind) || !Number.isFinite(Date.parse(followUp.lastReply.at)) || (followUp.lastReply.text !== undefined && typeof followUp.lastReply.text !== "string"))))) {
+      throw new Error("Invalid reply follow-up binding");
+    }
     if (ids.has(job.id) || names.has(job.name)) throw new Error("Duplicate scheduled job id or name");
     ids.add(job.id);
     names.add(job.name);
@@ -176,6 +187,26 @@ export class CronStorage {
     });
   }
 
+  beginFollowUpDispatch(id: string, claimId: string, now = Date.now()): boolean {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      const followUp = job?.followUp;
+      if (!job?.enabled || !followUp || followUp.state !== "pending" || job.claim?.id !== claimId || job.claim.phase !== "dispatched") return false;
+      if (Date.parse(followUp.expiresAt) <= now || Date.parse(followUp.deadlineAt) <= now) {
+        job.enabled = false;
+        followUp.state = "unknown";
+        followUp.unknownReason = "Follow-up deadline/expiry reached before dispatch";
+        followUp.updatedAt = new Date().toISOString();
+        job.lastStatus = "unknown";
+        return false;
+      }
+      followUp.state = "dispatched";
+      job.enabled = false;
+      followUp.updatedAt = new Date().toISOString();
+      return true;
+    });
+  }
+
   markClaim(id: string, claimId: string, phase: "dispatched" | "started"): boolean {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
@@ -188,7 +219,7 @@ export class CronStorage {
       job.lastRun = new Date().toISOString();
       if (phase === "dispatched") {
         if (!job.model) job.runCount += 1;
-        if (job.type === "once" || (job.maxRuns !== undefined && (job.attemptCount ?? 0) >= job.maxRuns)) job.enabled = false;
+        if (!job.followUp && (job.type === "once" || (job.maxRuns !== undefined && (job.attemptCount ?? 0) >= job.maxRuns))) job.enabled = false;
       }
       return true;
     });
@@ -295,11 +326,139 @@ export class CronStorage {
     });
   }
 
+  createFollowUp(job: CronJob): { job: CronJob; created: boolean } {
+    const followUp = job.followUp;
+    if (!followUp) throw new Error("Follow-up metadata is required");
+    return this.mutate(store => {
+      const existing = store.jobs.find(item => {
+        const a = item.followUp;
+        const b = followUp;
+        return a?.version === 1 && a.ownerSessionId === b.ownerSessionId && a.intercomSessionId === b.intercomSessionId
+          && a.peerSessionId === b.peerSessionId && a.messageId === b.messageId;
+      });
+      if (existing) return { job: structuredClone(existing), created: false };
+      const coveredBy = followUp.coveredBy;
+      if (coveredBy && store.jobs.some(item => (item.id === coveredBy && item.enabled) || (item.followUp?.version === 1 && item.followUp.ownerSessionId === followUp.ownerSessionId && item.followUp.coveredBy === coveredBy && item.enabled && ["pending", "dispatched"].includes(item.followUp.state)))) {
+        throw new Error(`An active schedule already covers ${coveredBy}; no second loop was created`);
+      }
+      if (store.jobs.some(item => item.id === job.id || item.name === job.name)) throw new Error("A scheduled follow-up id or name already exists");
+      store.jobs.push({ ...structuredClone(job), revision: job.revision ?? 1 });
+      return { job: structuredClone(job), created: true };
+    });
+  }
+
+  cancelFollowUp(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }, reason = "cancelled by exact reply"): { found: boolean; state?: NonNullable<CronJob["followUp"]>["state"]; jobId?: string; unknown?: boolean } {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => {
+        const followUp = item.followUp;
+        return followUp?.version === 1 && followUp.ownerSessionId === binding.ownerSessionId
+          && followUp.intercomSessionId === binding.intercomSessionId && followUp.peerSessionId === binding.peerSessionId
+          && followUp.messageId === binding.messageId;
+      });
+      if (!job?.followUp) return { found: false };
+      if (job.followUp.state === "pending") {
+        job.enabled = false;
+        job.followUp.state = "cancelled";
+        job.followUp.unknownReason = reason;
+        job.lastStatus = "skipped";
+        job.followUp.updatedAt = new Date().toISOString();
+        return { found: true, state: "cancelled", jobId: job.id };
+      }
+      if (job.followUp.state === "dispatched") {
+        job.enabled = false;
+        job.followUp.state = "unknown";
+        job.followUp.unknownReason = "Cancellation raced with dispatch; transport/effect outcome is unknown";
+        job.lastStatus = "unknown";
+        job.followUp.updatedAt = new Date().toISOString();
+        return { found: true, state: "unknown", jobId: job.id, unknown: true };
+      }
+      return { found: true, state: job.followUp.state, jobId: job.id, unknown: job.followUp.state === "unknown" };
+    });
+  }
+
+  markFollowUpUnknown(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }, reason: string): { found: boolean; state?: NonNullable<CronJob["followUp"]>["state"]; jobId?: string } {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => {
+        const followUp = item.followUp;
+        return followUp?.version === 1 && followUp.ownerSessionId === binding.ownerSessionId
+          && followUp.intercomSessionId === binding.intercomSessionId && followUp.peerSessionId === binding.peerSessionId
+          && followUp.messageId === binding.messageId;
+      });
+      if (!job?.followUp) return { found: false };
+      job.enabled = false;
+      if (job.followUp.state === "pending" || job.followUp.state === "dispatched") job.followUp.state = "unknown";
+      job.followUp.unknownReason = reason;
+      job.followUp.updatedAt = new Date().toISOString();
+      job.lastStatus = "unknown";
+      return { found: true, state: job.followUp.state, jobId: job.id };
+    });
+  }
+
+  observeFollowUpReply(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }, reply: { id: string; kind: "ack" | "pending" | "other"; at: string; text?: string }): { found: boolean; state?: NonNullable<CronJob["followUp"]>["state"]; jobId?: string; completion: "unknown" } {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => {
+        const followUp = item.followUp;
+        return followUp?.version === 1 && followUp.ownerSessionId === binding.ownerSessionId
+          && followUp.intercomSessionId === binding.intercomSessionId && followUp.peerSessionId === binding.peerSessionId
+          && followUp.messageId === binding.messageId;
+      });
+      if (!job?.followUp) return { found: false, completion: "unknown" as const };
+      const previous = job.followUp.state;
+      job.enabled = false;
+      job.followUp.lastReply = reply;
+      if (["pending", "dispatched"].includes(previous)) {
+        job.followUp.state = "answered";
+        job.lastStatus = "dispatched";
+      }
+      job.followUp.updatedAt = new Date().toISOString();
+      return { found: true, state: job.followUp.state, jobId: job.id, completion: "unknown" as const };
+    });
+  }
+
+  expireFollowUp(id: string, now = Date.now()): boolean {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job?.followUp || !["pending", "dispatched"].includes(job.followUp.state)) return false;
+      if (Date.parse(job.followUp.expiresAt) > now) return false;
+      job.enabled = false;
+      job.followUp.state = "unknown";
+      job.followUp.unknownReason = "Follow-up expired before a conclusive reply/receipt";
+      job.followUp.updatedAt = new Date().toISOString();
+      job.lastStatus = "unknown";
+      return true;
+    });
+  }
+
   removeJob(id: string): boolean {
     return this.mutate(store => {
       const count = store.jobs.length;
       store.jobs = store.jobs.filter(job => job.id !== id);
       return store.jobs.length !== count;
+    });
+  }
+
+  findFollowUp(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }): CronJob | undefined {
+    return this.load().jobs.find(job => {
+      const followUp = job.followUp;
+      return followUp?.version === 1
+        && followUp.ownerSessionId === binding.ownerSessionId
+        && followUp.intercomSessionId === binding.intercomSessionId
+        && followUp.peerSessionId === binding.peerSessionId
+        && followUp.messageId === binding.messageId;
+    });
+  }
+
+  findActiveFollowUpByCoverage(ownerSessionId: string, coveredBy: string): CronJob | undefined {
+    return this.load().jobs.find(job => job.followUp?.version === 1 && job.followUp.ownerSessionId === ownerSessionId && job.followUp.coveredBy === coveredBy && job.enabled && ["pending", "dispatched"].includes(job.followUp.state));
+  }
+
+  updateFollowUp(id: string, update: Partial<NonNullable<CronJob["followUp"]>>): boolean {
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      const followUp = job?.followUp;
+      if (followUp?.version !== 1) return false;
+      Object.assign(followUp, update, { updatedAt: new Date().toISOString() });
+      return true;
     });
   }
 
