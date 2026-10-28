@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.5
+- Bind optional Intercom reply follow-ups to the existing session-bound schedule store with exact message/request/goal/phase identity.
+- Enforce finite one-shot delay/deadline/expiry and `maxRuns=1`; deduplicate active bindings and reject a second loop covered by an existing schedule.
+- Cancel exact replies with persisted readback, purge queued work and re-check state before due transport; preserve `unknown` for restart, disconnect, late reply and uncertain delivery.
+- Keep ACK/PENDING and transport/wake receipts separate from execution and business completion.
+
 ### Maintained fork 0.4.1-fork.4
 - Add opt-in session-owned durable timers/events with schema3 intent/claim metadata, exact native execution receipts and conservative restart reconciliation.
 - Bound local durable concurrency/deadlines and pre-effect contention retries; pause ambiguous/aborted work, stop after three confirmed errors and retain notification delivery separately.
