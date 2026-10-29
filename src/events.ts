@@ -2,11 +2,16 @@ import { createHash } from "node:crypto";
 import type { CronJob, GithubTrigger } from "./types.js";
 
 export const EVENT_REQUEST = "schedule:event:v1";
+export const PROGRESS_REQUEST = "schedule:progress:v1";
 export const EVENT_KEY_LIMIT = 128;
 export const validEventName = (value: unknown): value is string =>
   typeof value === "string" && /^[a-z][a-z0-9:-]{0,63}$/.test(value);
 export const validEventId = (value: unknown): value is string =>
   typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(value);
+export const validEvidenceFingerprint = (value: unknown): value is string =>
+  typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+export const validProgressOutcome = (value: unknown): value is "advanced" | "unchanged" | "unknown" =>
+  value === "advanced" || value === "unchanged" || value === "unknown";
 export function eventNames(schedule: string): string[] {
   const names = schedule.split(",").map(value => value.trim());
   if (!names.length || names.length > 4 || new Set(names).size !== names.length || !names.every(validEventName)) {
@@ -18,8 +23,8 @@ export function eventKey(job: CronJob, name: string, id: string): string {
   return createHash("sha256").update(`${job.id}:${name}:${id}`).digest("hex");
 }
 export function eventBinding(job: CronJob): string {
-  const { type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp, durable, deadlineMs, followUp } = job;
-  return createHash("sha256").update(JSON.stringify({ type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp, durable, deadlineMs, followUp })).digest("hex");
+  const { type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp, durable, deadlineMs, followUp, quietOnNoChange, noChangeThreshold, quietForMs } = job;
+  return createHash("sha256").update(JSON.stringify({ type, schedule, prompt, session, model, notify, extensions, skills, maxRuns, maxRunsPerDay, expiresAt, github, catchUp, durable, deadlineMs, followUp, quietOnNoChange, noChangeThreshold, quietForMs })).digest("hex");
 }
 export function dailyLimited(job: CronJob, now = Date.now()): boolean {
   return job.maxRunsPerDay !== undefined && job.dailyUsage?.day === new Date(now).toISOString().slice(0, 10)

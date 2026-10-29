@@ -55,6 +55,26 @@ describe("unified event admission", () => {
     expect(h.storage.getJob("event")?.attemptCount).toBe(2); h.scheduler.stop();
   });
 
+  it("quietly suppresses repeated unchanged evidence and resets on progress", () => {
+    const h = setup({ quietOnNoChange: true, noChangeThreshold: 2, quietForMs: 60_000 });
+    const fingerprint = "a".repeat(64);
+    expect(h.scheduler.receiveEvent("event", "local:build", "one", fingerprint).status).toBe("queued");
+    h.idle();
+    expect(h.pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.storage.getJob("event")).toMatchObject({ lastEvidenceFingerprint: fingerprint, noChangeCount: 0 });
+    expect(h.scheduler.receiveEvent("event", "local:build", "two", fingerprint)).toEqual({ status: "duplicate", reason: "no-change" });
+    expect(h.storage.getJob("event")).toMatchObject({ noChangeCount: 1, waitingReason: "no_change" });
+    expect(h.scheduler.receiveEvent("event", "local:build", "three", fingerprint)).toEqual({ status: "duplicate", reason: "no-change" });
+    expect(h.storage.getJob("event")).toMatchObject({ lastStatus: "quiet", noChangeCount: 2, quietUntil: expect.any(String) });
+    expect(h.pi.sendMessage).toHaveBeenCalledTimes(1);
+    const nextFingerprint = "b".repeat(64);
+    expect(h.scheduler.receiveEvent("event", "local:build", "four", nextFingerprint).status).toBe("queued");
+    expect(h.storage.getJob("event")).toMatchObject({ lastEvidenceFingerprint: nextFingerprint, noChangeCount: 0 });
+    expect(h.storage.getJob("event")?.waitingReason).toBeUndefined();
+    expect(h.storage.getJob("event")?.quietUntil).toBeUndefined();
+    h.scheduler.stop();
+  });
+
   it("coalesces pending events, persists dedup and dispatches only the configured prompt", () => {
     const h = setup();
     expect(h.scheduler.receiveEvent("event", "local:build", "one").status).toBe("queued");

@@ -36,6 +36,27 @@ The optional `schedule:reply-followup:v1` seam lets `pi-intercom` persist one fi
 
 Due work emits `schedule:reply-followup-due:v1` for Intercom to send a status-only reminder. The scheduler rechecks the persisted claim before emission and cancellation purges local pending work. Delivered, wake-requested, injected and ACK/PENDING observations never settle the business goal. A dispatched or interrupted follow-up remains `unknown` when restart, disconnect, late reply or transport uncertainty prevents reconciliation; no original business action is replayed.
 
+## Bounded no-change quieting
+
+Event jobs may opt in to no-change quieting with `quietOnNoChange`, a bounded
+`noChangeThreshold` (1–10) and `quietForMs` (1 second–24 hours). A producer may
+supply an `evidenceFingerprint` (64 lowercase hex characters) with an admitted
+event or send a `schedule:progress:v1` observation for an active durable claim.
+The scheduler stores only the fingerprint, bounded counter, `waitingReason` and
+`quietUntil`; it never stores raw evidence or prompt content.
+
+A repeated fingerprint is returned as `{ status: "duplicate", reason:
+"no-change" }` and does not create another pending event or consume an attempt.
+Once the threshold is reached, the job enters `lastStatus: "quiet"` until its
+bounded quiet window expires. A new fingerprint resets the no-change counter and
+clears the quiet marker. This is opt-in and does not change legacy timer jobs,
+external business completion, or the existing ambiguous-delivery `unknown`
+semantics.
+
+`progress` observations are metadata only: `advanced`, `unchanged`, and
+`unknown` do not prove business completion. Receipt persistence remains
+receipt-first; observer or notice failure does not replay the original action.
+
 ## Verification and boundaries
 
 The original 103-test baseline passed before changes. The first 15 reliability regression cases failed against that baseline. Maintained tests cover coalescing, native delivery, pause/remove/stop, fresh disk content, one-shot retention, expiry/attempt limits, corrupt stores, writer contention, private modes and foreign-session mutation.

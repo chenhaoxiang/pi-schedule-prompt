@@ -14,7 +14,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
 import { startEventApi } from "./event-api.js";
-import { EVENT_REQUEST, validEventId } from "./events.js";
+import { EVENT_REQUEST, PROGRESS_REQUEST, validEventId, validEvidenceFingerprint, validProgressOutcome } from "./events.js";
 import { classifyFollowupReply, FOLLOWUP_CANCEL_TRANSPORT_EVENT, FOLLOWUP_OBSERVED_EVENT, FOLLOWUP_SCHEDULE_EVENT, type FollowupObservation, type FollowupRecord, type FollowupScheduleRequest, followupName, followupPrompt, validateFollowupBinding, validateFollowupOptions } from "./followup.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
@@ -147,7 +147,7 @@ export default async function (pi: ExtensionAPI) {
           const own = scheduler;
           const epoch = generation;
           try {
-            const server = await startEventApi({ port: api.port, token: process.env[api.tokenEnv] ?? "" }, (id, name, eventId) => own.receiveEvent(id, name, eventId));
+            const server = await startEventApi({ port: api.port, token: process.env[api.tokenEnv] ?? "" }, (id, name, eventId, evidenceFingerprint) => own.receiveEvent(id, name, eventId, evidenceFingerprint));
             if (epoch !== generation) { server.closeAllConnections(); server.close(); }
             else { eventServer = server; pi.appendEntry("schedule_event_api", { port: (server.address() as { port: number }).port, host: "127.0.0.1" }); }
           } catch {
@@ -284,6 +284,23 @@ export default async function (pi: ExtensionAPI) {
     } catch { console.error("[pi-schedule-prompt] Follow-up observation could not be reconciled"); }
   });
 
+  const stopProgressBus = pi.events.on(PROGRESS_REQUEST, payload => {
+    if (!payload || typeof payload !== "object") return;
+    const request = payload as Record<string, unknown>;
+    let result: unknown = { status: "ignored", reason: "invalid-progress" };
+    try {
+      if (request.version === 1 &&
+        typeof request.jobId === "string" && validEventId(request.jobId) &&
+        typeof request.claimId === "string" && validEventId(request.claimId) &&
+        validProgressOutcome(request.progress) && validEvidenceFingerprint(request.evidenceFingerprint) &&
+        (request.waitingReason === undefined || (typeof request.waitingReason === "string" && request.waitingReason.length <= 128 && !/[\u0000-\u001f\u007f]/.test(request.waitingReason)))) {
+        result = { status: scheduler?.recordProgress({ jobId: request.jobId, claimId: request.claimId, progress: request.progress, evidenceFingerprint: request.evidenceFingerprint, ...(request.waitingReason === undefined ? {} : { waitingReason: request.waitingReason }) }) ? "recorded" : "ignored" };
+      }
+    } catch { result = { status: "ignored", reason: "admission-unavailable" }; }
+    try { pi.events.emit(PROGRESS_REQUEST + ":result:" + String(request.requestId ?? "unknown"), result); }
+    catch { console.error("Local progress observer failed"); }
+  });
+
   const stopEventBus = pi.events.on(EVENT_REQUEST, payload => {
     if (!payload || typeof payload !== "object") return;
     const request = payload as Record<string, unknown>;
@@ -297,7 +314,7 @@ export default async function (pi: ExtensionAPI) {
     try { pi.events.emit(EVENT_REQUEST + ":result:" + request.requestId, result); }
     catch { console.error("Local event observer failed"); }
   });
-  pi.on("session_shutdown", () => { stopEventBus(); stopFollowupBus(); stopFollowupObservationBus(); });
+  pi.on("session_shutdown", () => { stopProgressBus(); stopEventBus(); stopFollowupBus(); stopFollowupObservationBus(); });
 
   pi.registerCommand("schedule-host-status", {
     description: "Metadata-only readiness handshake for the dedicated native host",
