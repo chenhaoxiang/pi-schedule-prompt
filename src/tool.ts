@@ -5,6 +5,7 @@ import { validateGithub } from "./events.js";
 import { CronScheduler } from "./scheduler.js";
 import type { JobScope } from "./settings.js";
 import type { CronStorage } from "./storage.js";
+import { resolveModelRoute } from "./subagent.js";
 import type { CronJob, CronJobType, CronToolDetails, } from "./types.js";
 import { CronToolParams } from "./types.js";
 
@@ -37,6 +38,12 @@ export function createCronTool(
       const details: CronToolDetails = {
         action,
         jobs: [],
+      };
+      const canonicalModel = (value: string | undefined): string | undefined => {
+        if (value === undefined) return undefined;
+        const resolution = resolveModelRoute(ctx.modelRegistry, value);
+        if (!resolution.ok) throw new Error(resolution.error);
+        return resolution.route;
       };
 
       try {
@@ -79,11 +86,12 @@ export function createCronTool(
 
             // Defense-in-depth — the schema also enforces this with minLength: 1,
             // but tool callers can bypass the schema by passing params directly.
-            if (params.model !== undefined && params.model.length === 0) {
+            if (params.model !== undefined && !params.model.trim()) {
               throw new Error(
                 "'model' must be a non-empty string. Omit the field for inline (no-model) jobs."
               );
             }
+            const model = canonicalModel(params.model);
 
             // Generate name if not provided
             const jobName = params.name || `job-${nanoid(6)}`;
@@ -126,7 +134,7 @@ export function createCronTool(
               quietForMs: params.quietForMs,
               github: params.github,
               expiresAt: params.expiresAt,
-              model: params.model,
+              model,
               notify: params.notify,
               extensions: params.extensions,
               skills: params.skills,
@@ -194,8 +202,10 @@ export function createCronTool(
             }
 
             const enabled = action === "enable";
-            storage.updateJob(params.jobId, { enabled });
-            const updated = { ...job, enabled };
+            const model = enabled ? canonicalModel(job.model) : undefined;
+            const modelUpdate = model && model !== job.model ? { model } : {};
+            storage.updateJob(params.jobId, { enabled, ...modelUpdate });
+            const updated = { ...job, enabled, ...modelUpdate };
             scheduler.updateJob(params.jobId, updated);
 
             details.jobs = [updated];
@@ -265,7 +275,7 @@ export function createCronTool(
             // Reject empty-string model (schema also enforces minLength: 1).
             // To switch a job from subagent → inline mode, remove and re-add
             // it without `model` — there's no in-place clearing.
-            if (params.model !== undefined && params.model.length === 0) {
+            if (params.model !== undefined && !params.model.trim()) {
               throw new Error(
                 "'model' must be a non-empty string. To switch a job from subagent back to inline, remove and re-add it without a model."
               );
@@ -286,7 +296,7 @@ export function createCronTool(
             if (params.name) updates.name = params.name;
             if (params.prompt) updates.prompt = params.prompt;
             if (params.description !== undefined) updates.description = params.description;
-            if (params.model !== undefined) updates.model = params.model;
+            if (params.model !== undefined) updates.model = canonicalModel(params.model);
             if (params.notify !== undefined) updates.notify = params.notify;
             if (params.extensions !== undefined) updates.extensions = params.extensions;
             if (params.skills !== undefined) updates.skills = params.skills;

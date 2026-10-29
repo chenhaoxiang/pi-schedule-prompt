@@ -6,7 +6,7 @@ import { dailyLimited, eventBinding, eventNames } from "./events.js";
 import { FOLLOWUP_DUE_EVENT, type FollowupDueRequest } from "./followup.js";
 import { githubFingerprint } from "./github-events.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
-import { runSubagentOnce } from "./subagent.js";
+import { resolveModelRoute, runSubagentOnce } from "./subagent.js";
 import type { CronChangeEvent, CronJob, CronJobType, EventResult } from "./types.js";
 
 type ValidateScheduleResult =
@@ -46,8 +46,10 @@ export class CronScheduler {
     this.stopped = false;
     const session = this.ctx.sessionManager.getSessionId();
     this.durable.restore();
-    for (const job of this.storage.getAllJobs()) {
-      if (!CronScheduler.isLoadedFor(job, session)) continue;
+    for (const rawJob of this.storage.getAllJobs()) {
+      if (!CronScheduler.isLoadedFor(rawJob, session)) continue;
+      const job = this.prepareModel(rawJob);
+      if (!job) continue;
       if (job.followUp && ["pending", "dispatched"].includes(job.followUp.state)) {
         const dueOrExpired = Date.parse(job.followUp.expiresAt) <= Date.now() || (job.followUp.state === "dispatched") || Date.parse(job.schedule) <= Date.now();
         if (dueOrExpired) {
@@ -128,8 +130,10 @@ export class CronScheduler {
   }
 
   addJob(job: CronJob): void {
-    if (!this.stopped && job.enabled && CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) this.scheduleJob(job);
-    this.emitChange({ type: "add", job });
+    const prepared = this.prepareModel(job);
+    if (!prepared) return;
+    if (!this.stopped && prepared.enabled && CronScheduler.isLoadedFor(prepared, this.ctx.sessionManager.getSessionId())) this.scheduleJob(prepared);
+    this.emitChange({ type: "add", job: prepared });
   }
 
   removeJob(id: string): void {
@@ -140,8 +144,10 @@ export class CronScheduler {
   updateJob(id: string, updated: CronJob): void {
     this.unscheduleJob(id);
     if (this.activeJobs.has(id)) this.storage.updateJob(id, { lastStatus: "unknown" });
-    if (!this.stopped && updated.enabled && CronScheduler.isLoadedFor(updated, this.ctx.sessionManager.getSessionId())) this.scheduleJob(updated);
-    this.emitChange({ type: "update", job: updated });
+    const prepared = this.prepareModel(updated);
+    if (!prepared) return;
+    if (!this.stopped && prepared.enabled && CronScheduler.isLoadedFor(prepared, this.ctx.sessionManager.getSessionId())) this.scheduleJob(prepared);
+    this.emitChange({ type: "update", job: prepared });
   }
 
   cancelFollowUp(binding: { ownerSessionId: string; intercomSessionId: string; peerSessionId: string; messageId: string }): { found: boolean; state?: string; jobId?: string; unknown?: boolean } {
@@ -298,10 +304,31 @@ export class CronScheduler {
     }
   }
 
+  private prepareModel(job: CronJob): CronJob | undefined {
+    if (!job.model) return job;
+    const resolution = resolveModelRoute(this.ctx.modelRegistry, job.model);
+    if (!resolution.ok) {
+      const error = `Scheduled job '${job.name}' has an invalid model: ${resolution.error}`;
+      try { this.storage.updateJob(job.id, { enabled: false, lastStatus: "error" }); }
+      catch { /* Preserve the original store error for the next explicit read. */ }
+      this.unscheduleJob(job.id);
+      this.emitChange({ type: "error", jobId: job.id, error });
+      return;
+    }
+    if (resolution.route !== job.model) {
+      try { this.storage.updateJob(job.id, { model: resolution.route }); }
+      catch { return; }
+      return { ...job, model: resolution.route };
+    }
+    return job;
+  }
+
   private eligible(id: string): CronJob | undefined {
     if (this.stopped) return;
-    const job = this.storage.getJob(id);
-    if (!job?.enabled || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) return;
+    const stored = this.storage.getJob(id);
+    if (!stored?.enabled || !CronScheduler.isLoadedFor(stored, this.ctx.sessionManager.getSessionId())) return;
+    const job = this.prepareModel(stored);
+    if (!job) return;
     if (job.quietOnNoChange && job.quietUntil) {
       const quietUntil = Date.parse(job.quietUntil);
       if (Number.isFinite(quietUntil) && quietUntil > Date.now()) return;

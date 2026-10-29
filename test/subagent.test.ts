@@ -3,6 +3,7 @@ import {
   describeAvailableModels,
   getLastAssistantText,
   resolveModel,
+  resolveModelRoute,
   runSubagentOnce,
 } from "../src/subagent.js";
 
@@ -45,6 +46,33 @@ function makeRegistry(available = MODELS) {
 }
 
 describe("resolveModel", () => {
+  it("canonicalizes a bare id to provider/id", () => {
+    expect(resolveModelRoute(makeRegistry(), "gpt-4o")).toMatchObject({
+      ok: true,
+      route: "openai/gpt-4o",
+    });
+  });
+
+  it("rejects an ambiguous bare id instead of using registry order", () => {
+    const shared = { id: "same-model", name: "Same Model", provider: "one" };
+    const other = { ...shared, provider: "two" };
+    const result = resolveModelRoute(makeRegistry([shared, other]), "same-model");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("full provider/model route");
+      expect(result.error).toContain("one/same-model");
+      expect(result.error).toContain("two/same-model");
+    }
+  });
+
+  it("rejects an unavailable model before execution", () => {
+    const result = resolveModelRoute(makeRegistry(), "not-configured");
+    expect(result).toEqual({
+      ok: false,
+      error: expect.stringContaining("Unknown model 'not-configured'"),
+    });
+  });
+
   it("matches exact provider/id", () => {
     expect(resolveModel(makeRegistry(), "anthropic/claude-opus-4-6")).toEqual(MODELS[0]);
   });

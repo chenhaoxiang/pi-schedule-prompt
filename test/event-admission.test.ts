@@ -8,7 +8,14 @@ import { runSubagentOnce } from "../src/subagent.js";
 import { createCronTool } from "../src/tool.js";
 import { JobsView } from "../src/ui/jobs-view.js";
 
-vi.mock("../src/subagent.js", () => ({ runSubagentOnce: vi.fn() }));
+vi.mock("../src/subagent.js", () => ({
+  runSubagentOnce: vi.fn(),
+  resolveModelRoute: vi.fn((_registry: unknown, model: string) => ({
+    ok: true,
+    model: { provider: "fixture", id: model, name: model },
+    route: model,
+  })),
+}));
 
 import type { CronJob } from "../src/types.js";
 

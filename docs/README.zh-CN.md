@@ -29,7 +29,7 @@ created: 2026-10-20
 - type=cron：六字段且包含秒，如 `0 */5 * * * *`；不接受五字段，使用进程时区。
 - maxRuns：可选的终身尝试次数上限，不是 Token 或资金限额。
 - expiresAt：可选绝对到期时间，在实际投递前再次检查。
-- model：保留上游显式模型任务；notify 控制是否唤醒父会话，默认否；extensions/skills 可设 true 或名称列表，默认不加载。
+- model：显式模型任务。创建或更新时会按当前已配置凭据的模型注册表做前置解析，并保存完整的 `provider/model-id` 路由；裸模型名仅在唯一匹配时接受，未知或跨 provider 歧义会在调度建立前拒绝。运行前还会再次核验。notify 控制是否唤醒父会话，默认否；extensions/skills 可设 true 或名称列表，默认不加载。
 
 /schedule-prompt 打开 Jobs 或 Settings。上下键选择，a 新增、t 启停、s 切作用域、x 删除、c 显式清理停用项、q 退出。暂停不等于删除，重载和退出不自动清理停用任务。
 

@@ -70,7 +70,14 @@ describe("Pi 1.3 native host integration", () => {
       const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(),
         modelsStore: new InMemoryModelsStore(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
       runtime.registerNativeProvider(faux.provider);
-      const result = await runSubagentOnce({ cwd, modelRegistry: new ModelRegistry(runtime), thinkingLevel: "off" } as any,
+      const registry = new ModelRegistry(runtime);
+      const modelRegistry = {
+        find: registry.find.bind(registry),
+        getAvailable: () => [faux.getModel()],
+        getRegisteredNativeProvider: registry.getRegisteredNativeProvider?.bind(registry),
+        getRegisteredProviderConfig: registry.getRegisteredProviderConfig?.bind(registry),
+      };
+      const result = await runSubagentOnce({ cwd, modelRegistry, thinkingLevel: "off" } as any,
         "Reply MODEL_FIXTURE_OK without tools", "schedule-model-fixture/" + faux.getModel().id);
       expect(result).toEqual({ ok: true, text: "MODEL_FIXTURE_OK" });
       expect(faux.state.callCount).toBe(1);
