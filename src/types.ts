@@ -9,17 +9,26 @@ const StringEnum = <T extends string>(values: T[], options?: { description?: str
 export type CronJobType = "cron" | "once" | "interval" | "event";
 
 export interface GithubTrigger { repo: string; kind: "pull-request" | "workflow"; number?: number; branch?: string; pollSeconds?: number; }
-export interface PendingEvent { revision: number; binding: string; keys: string[]; acceptedAt: string; }
+export interface PendingEvent { revision: number; binding: string; keys: string[]; acceptedAt: string; evidenceFingerprint?: string; }
 export type EventResult = { status: "queued" | "duplicate" | "ignored"; reason?: string };
 
 export type ExecutionOutcome = "success" | "error" | "aborted" | "unknown";
+export type ProgressOutcome = "advanced" | "unchanged" | "unknown";
 export interface DurableIntent { revision: number; binding: string; acceptedAt: string; }
 export interface ExecutionClaim {
   id: string; sessionId: string; ownerPid: number; ownerId: string;
   binding: string; phase: "claimed" | "dispatched" | "started" | "settled";
   claimedAt: string; deadlineAt: string; outcome?: ExecutionOutcome;
 }
-export interface ExecutionReceipt { jobId: string; claimId: string; sessionId: string; outcome: ExecutionOutcome; }
+export interface ExecutionReceipt {
+  jobId: string;
+  claimId: string;
+  sessionId: string;
+  outcome: ExecutionOutcome;
+  progress?: ProgressOutcome;
+  evidenceFingerprint?: string;
+  waitingReason?: string;
+}
 export interface ExecutionNotice { claimId: string; outcome: ExecutionOutcome; state: "pending" | "accepted" | "failed"; attempts: number; }
 export type FollowupState = "pending" | "dispatched" | "answered" | "cancelled" | "unknown";
 export interface FollowupRecord {
@@ -48,7 +57,7 @@ export interface FollowupRecord {
 /**
  * Status of the last job execution
  */
-export type CronJobStatus = "success" | "error" | "running" | "queued" | "dispatched" | "unknown" | "skipped";
+export type CronJobStatus = "success" | "error" | "running" | "queued" | "dispatched" | "unknown" | "skipped" | "quiet";
 
 /**
  * A scheduled cron job
@@ -102,6 +111,20 @@ export interface CronJob {
   notice?: ExecutionNotice;
   /** Exact Intercom request binding for a finite, control-only follow-up. */
   followUp?: FollowupRecord;
+  /** Optional bounded no-progress quieting; disabled by default for compatibility. */
+  quietOnNoChange?: boolean;
+  /** Number of consecutive unchanged evidence observations before quieting. */
+  noChangeThreshold?: number;
+  /** Quiet duration after the threshold is reached. */
+  quietForMs?: number;
+  /** Last evidence fingerprint reported by the owner. */
+  lastEvidenceFingerprint?: string;
+  /** Consecutive unchanged observations for the current fingerprint. */
+  noChangeCount?: number;
+  /** Human-readable bounded reason for waiting/quiet state. */
+  waitingReason?: string;
+  /** Until when automatic admission remains quiet. */
+  quietUntil?: string;
   /** Optional description */
   description?: string;
   /** If set, run the prompt in a separate in-process agent session using this model instead of injecting into the current chat. */
@@ -179,6 +202,9 @@ export const CronToolParams = Type.Object({
   catchUp: Type.Optional(StringEnum(["none", "latest"], { description: "Missed event/durable timer policy; default none." })),
   durable: Type.Optional(Type.Boolean({ description: "Opt-in durable claims; requires session binding. Unknown execution pauses, never blindly retries." })),
   deadlineMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86400000, description: "Durable run elapsed deadline; default 600000. Abort is not rollback." })),
+  quietOnNoChange: Type.Optional(Type.Boolean({ description: "Event/evidence jobs only. Quiet after repeated unchanged fingerprints; default false." })),
+  noChangeThreshold: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "Consecutive unchanged evidence observations before quieting; default 2." })),
+  quietForMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86400000, description: "Quiet duration after no-change threshold; default 3600000." })),
   github: Type.Optional(Type.Object({ repo: Type.String(), kind: StringEnum(["pull-request", "workflow"]), number: Type.Optional(Type.Integer({ minimum: 1 })), branch: Type.Optional(Type.String()), pollSeconds: Type.Optional(Type.Integer({ minimum: 60, maximum: 3600 })) })),
   maxRuns: Type.Optional(Type.Integer({ minimum: 1, description: "Lifetime dispatch/attempt limit, not a token or invoice cap." })),
   expiresAt: Type.Optional(Type.String({ description: "Absolute ISO expiry. New fires stop at this time." })),

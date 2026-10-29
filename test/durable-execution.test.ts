@@ -79,6 +79,15 @@ describe("durable intent/claim recovery", () => {
 });
 
 describe("native execution envelope", () => {
+  it("persists progress metadata in the native receipt without claiming business completion", () => {
+    const h = fixture({ quietOnNoChange: true, noChangeThreshold: 2, quietForMs: 60_000 });
+    h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!;
+    expect(h.durable.recordProgress({ jobId: "one", claimId: job.claim!.id, progress: "unchanged", evidenceFingerprint: "a".repeat(64), waitingReason: "waiting_external" })).toBe(true);
+    h.durable.started(job.claim!.id); h.durable.messageEnd({ role: "assistant", stopReason: "stop" }); h.durable.settled(false);
+    expect(h.receipts[0]).toMatchObject({ progress: "unchanged", evidenceFingerprint: "a".repeat(64), waitingReason: "waiting_external" });
+    expect(h.storage.getJob("one")).toMatchObject({ lastEvidenceFingerprint: "a".repeat(64), noChangeCount: 1, waitingReason: "waiting_external" });
+  });
+
   it("persists claim-before-send, correlates exact turn, then receipt-before-terminal state", () => {
     const h = fixture(); h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!;
     expect(h.storage.getJob("one")?.claim?.phase).toBe("dispatched");

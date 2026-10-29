@@ -1,11 +1,11 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { validEventId, validEventName } from "./events.js";
+import { validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import type { EventResult } from "./types.js";
 
 export interface EventApiOptions { port: number; token: string; requestsPerMinute?: number; }
 export function startEventApi(options: EventApiOptions,
-  trigger: (jobId: string, name: string, id: string) => EventResult): Promise<Server> {
+  trigger: (jobId: string, name: string, id: string, evidenceFingerprint?: string) => EventResult): Promise<Server> {
   if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535 || options.token.length < 24) {
     throw new Error("Event API requires an explicit valid port and token of at least 24 characters");
   }
@@ -41,10 +41,13 @@ export function startEventApi(options: EventApiOptions,
       try { data = JSON.parse(text); } catch { return reply(400, { error: "invalid-json" }); }
       if (!data || typeof data !== "object" || Array.isArray(data)) return reply(400, { error: "invalid-event" });
       const body = data as Record<string, unknown>;
-      if (Object.keys(body).some(key => !["jobId", "eventName", "eventId"].includes(key)) ||
+      if (Object.keys(body).some(key => !["jobId", "eventName", "eventId", "evidenceFingerprint"].includes(key)) ||
         typeof body.jobId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.jobId) ||
-        !validEventName(body.eventName) || !body.eventName.startsWith("api:") || !validEventId(body.eventId)) return reply(400, { error: "invalid-event" });
-      const result = trigger(body.jobId, body.eventName, body.eventId);
+        !validEventName(body.eventName) || !body.eventName.startsWith("api:") || !validEventId(body.eventId) ||
+        (body.evidenceFingerprint !== undefined && !validEvidenceFingerprint(body.evidenceFingerprint))) return reply(400, { error: "invalid-event" });
+      const result = body.evidenceFingerprint === undefined
+        ? trigger(body.jobId, body.eventName, body.eventId)
+        : trigger(body.jobId, body.eventName, body.eventId, body.evidenceFingerprint);
       return reply(result.status === "ignored" ? 423 : 202, result);
     } catch { reply(503, { error: "admission-unavailable" }); }
   });

@@ -254,7 +254,7 @@ export class JobsView implements Component {
       icon = this.theme.fg("warning", "⟳");
     } else if (job.lastStatus === "error") {
       icon = this.theme.fg("error", "!");
-    } else if (job.lastStatus === "queued" || job.lastStatus === "unknown" || job.lastStatus === "skipped") {
+    } else if (job.lastStatus === "queued" || job.lastStatus === "unknown" || job.lastStatus === "skipped" || job.lastStatus === "quiet") {
       icon = this.theme.fg("warning", "?");
     } else if (job.lastStatus === "dispatched") {
       icon = this.theme.fg("dim", "→");

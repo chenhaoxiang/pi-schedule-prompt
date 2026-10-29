@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName } from "./events.js";
-import type { CronJob, CronStore, EventResult, ExecutionOutcome, ExecutionReceipt } from "./types.js";
+import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
+import type { CronJob, CronStore, EventResult, ExecutionOutcome, ExecutionReceipt, ProgressOutcome } from "./types.js";
 
-const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped"]);
+const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
 
 function validate(store: unknown): asserts store is CronStore {
   if (!store || typeof store !== "object") throw new Error("Invalid schedule store");
@@ -22,6 +22,13 @@ function validate(store: unknown): asserts store is CronStore {
       (job.model !== undefined && (typeof job.model !== "string" || !job.model.trim())) ||
       (job.lastStatus !== undefined && !STATUSES.has(job.lastStatus)) ||
       (job.attemptCount !== undefined && (!Number.isSafeInteger(job.attemptCount) || job.attemptCount < 0)) ||
+      (job.quietOnNoChange !== undefined && typeof job.quietOnNoChange !== "boolean") ||
+      (job.noChangeThreshold !== undefined && (!Number.isSafeInteger(job.noChangeThreshold) || job.noChangeThreshold < 1 || job.noChangeThreshold > 10)) ||
+      (job.quietForMs !== undefined && (!Number.isSafeInteger(job.quietForMs) || job.quietForMs < 1000 || job.quietForMs > 86400000)) ||
+      (job.lastEvidenceFingerprint !== undefined && !validEvidenceFingerprint(job.lastEvidenceFingerprint)) ||
+      (job.noChangeCount !== undefined && (!Number.isSafeInteger(job.noChangeCount) || job.noChangeCount < 0)) ||
+      (job.waitingReason !== undefined && (typeof job.waitingReason !== "string" || job.waitingReason.length > 128 || /[\u0000-\u001f\u007f]/.test(job.waitingReason))) ||
+      (job.quietUntil !== undefined && (typeof job.quietUntil !== "string" || !Number.isFinite(Date.parse(job.quietUntil)))) ||
       (job.maxRuns !== undefined && (!Number.isSafeInteger(job.maxRuns) || job.maxRuns < 1)) ||
       (job.maxRunsPerDay !== undefined && (!Number.isSafeInteger(job.maxRunsPerDay) || job.maxRunsPerDay < 1)) ||
       (job.revision !== undefined && (!Number.isSafeInteger(job.revision) || job.revision < 0)) ||
@@ -41,7 +48,7 @@ function validate(store: unknown): asserts store is CronStore {
     for (const keys of [job.recentEventKeys, job.pendingEvent?.keys]) {
       if (keys !== undefined && (!Array.isArray(keys) || keys.length > EVENT_KEY_LIMIT || !keys.every(key => typeof key === "string" && /^[a-f0-9]{64}$/.test(key)))) throw new Error("Invalid bounded event keys");
     }
-    if (job.pendingEvent && (!Number.isSafeInteger(job.pendingEvent.revision) || !/^[a-f0-9]{64}$/.test(job.pendingEvent.binding) || !Number.isFinite(Date.parse(job.pendingEvent.acceptedAt)))) throw new Error("Invalid pending event");
+    if (job.pendingEvent && (!Number.isSafeInteger(job.pendingEvent.revision) || !/^[a-f0-9]{64}$/.test(job.pendingEvent.binding) || !Number.isFinite(Date.parse(job.pendingEvent.acceptedAt)) || (job.pendingEvent.evidenceFingerprint !== undefined && !validEvidenceFingerprint(job.pendingEvent.evidenceFingerprint)))) throw new Error("Invalid pending event");
     if (job.sourceFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(job.sourceFingerprint)) throw new Error("Invalid source fingerprint");
     if ((job.durable !== undefined && typeof job.durable !== "boolean") || (job.durable && (!job.session || job.notify === true)) ||
       (job.deadlineMs !== undefined && (!Number.isSafeInteger(job.deadlineMs) || job.deadlineMs < 1000 || job.deadlineMs > 86400000)) ||
@@ -225,11 +232,25 @@ export class CronStorage {
     });
   }
 
-  private settleInto(job: CronJob, outcome: ExecutionOutcome): void {
+  private applyProgress(job: CronJob, progress: ProgressOutcome | undefined, evidenceFingerprint: string | undefined, waitingReason: string | undefined): void {
+    if (progress === undefined) return;
+    if (evidenceFingerprint === undefined || !validEvidenceFingerprint(evidenceFingerprint)) return;
+    if (progress === "advanced") job.noChangeCount = 0;
+    if (progress === "unchanged") job.noChangeCount = (job.noChangeCount ?? 0) + 1;
+    job.lastEvidenceFingerprint = evidenceFingerprint;
+    if (waitingReason !== undefined) job.waitingReason = waitingReason;
+    if (job.quietOnNoChange && progress === "unchanged" && (job.noChangeCount ?? 0) >= (job.noChangeThreshold ?? 2)) {
+      job.quietUntil = new Date(Date.now() + (job.quietForMs ?? 3600000)).toISOString();
+      job.lastStatus = "quiet";
+    }
+  }
+
+  private settleInto(job: CronJob, outcome: ExecutionOutcome, receipt?: ExecutionReceipt): void {
     if (!job.claim || job.claim.phase === "settled") return;
     job.claim.phase = "settled";
     job.claim.outcome = outcome;
     job.lastStatus = outcome === "aborted" ? "unknown" : outcome;
+    this.applyProgress(job, receipt?.progress, receipt?.evidenceFingerprint, receipt?.waitingReason);
     if (job.model && outcome === "success") job.runCount += 1;
     job.consecutiveErrors = outcome === "error" ? (job.consecutiveErrors ?? 0) + 1 : outcome === "success" ? 0 : job.consecutiveErrors;
     if (["unknown", "aborted"].includes(outcome) || (job.consecutiveErrors ?? 0) >= 3) job.enabled = false;
@@ -240,7 +261,10 @@ export class CronStorage {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === receipt.jobId);
       if (!job?.claim || job.claim.id !== receipt.claimId || job.claim.sessionId !== receipt.sessionId) return false;
-      this.settleInto(job, receipt.outcome);
+      if (receipt.evidenceFingerprint !== undefined && !validEvidenceFingerprint(receipt.evidenceFingerprint)) return false;
+      if (receipt.progress !== undefined && !["advanced", "unchanged", "unknown"].includes(receipt.progress)) return false;
+      if (receipt.waitingReason !== undefined && (receipt.waitingReason.length > 128 || /[\u0000-\u001f\u007f]/.test(receipt.waitingReason))) return false;
+      this.settleInto(job, receipt.outcome, receipt);
       return true;
     });
   }
@@ -262,7 +286,7 @@ export class CronStorage {
       if (!job?.durable || job.session !== sessionId || !job.claim || job.claim.phase === "settled") return;
       const claim = job.claim;
       const receipt = receipts.find(item => item.jobId === id && item.claimId === claim.id && item.sessionId === sessionId);
-      if (receipt) { this.settleInto(job, receipt.outcome); return; }
+      if (receipt) { this.settleInto(job, receipt.outcome, receipt); return; }
       if (claim.ownerId === ownerId || ownerAlive(claim.ownerPid)) return;
       if (claim.phase === "claimed") {
         // No effectful dispatch was entered. Release exactly this unspent attempt.
@@ -279,8 +303,9 @@ export class CronStorage {
     });
   }
 
-  private queueInto(job: CronJob | undefined, name: string, eventId: string, sessionId: string | undefined): EventResult {
+  private queueInto(job: CronJob | undefined, name: string, eventId: string, sessionId: string | undefined, evidenceFingerprint?: string): EventResult {
     if (job?.type !== "event") return { status: "ignored", reason: "not-event" };
+    if (evidenceFingerprint !== undefined && !validEvidenceFingerprint(evidenceFingerprint)) return { status: "ignored", reason: "invalid-evidence" };
     if (job.session && job.session !== sessionId) return { status: "ignored", reason: "foreign-session" };
     if (!eventNames(job.schedule).includes(name)) return { status: "ignored", reason: "event-mismatch" };
     const key = eventKey(job, name, eventId);
@@ -288,15 +313,36 @@ export class CronStorage {
     if (!job.enabled) return { status: "ignored", reason: "paused" };
     if ((job.expiresAt && Date.parse(job.expiresAt) <= Date.now()) || (job.maxRuns !== undefined && (job.attemptCount ?? job.runCount) >= job.maxRuns)) return { status: "ignored", reason: "expired-or-limited" };
     if (dailyLimited(job)) return { status: "ignored", reason: "daily-limit" };
+    if (evidenceFingerprint !== undefined && job.quietOnNoChange && job.lastEvidenceFingerprint === evidenceFingerprint) {
+      job.noChangeCount = (job.noChangeCount ?? 0) + 1;
+      job.waitingReason = "no_change";
+      if ((job.noChangeCount ?? 0) >= (job.noChangeThreshold ?? 2)) {
+        job.quietUntil = new Date(Date.now() + (job.quietForMs ?? 3600000)).toISOString();
+        job.lastStatus = "quiet";
+      }
+      return { status: "duplicate", reason: "no-change" };
+    }
     job.recentEventKeys = [...(job.recentEventKeys ?? []), key].slice(-EVENT_KEY_LIMIT);
-    job.pendingEvent = { revision: job.revision ?? 0, binding: eventBinding(job), keys: [...(job.pendingEvent?.keys ?? []), key].slice(-EVENT_KEY_LIMIT), acceptedAt: new Date().toISOString() };
+    if (evidenceFingerprint !== undefined && job.lastEvidenceFingerprint !== evidenceFingerprint) {
+      job.noChangeCount = 0;
+      job.waitingReason = undefined;
+      job.quietUntil = undefined;
+    }
+    job.lastEvidenceFingerprint = evidenceFingerprint ?? job.lastEvidenceFingerprint;
+    job.pendingEvent = {
+      revision: job.revision ?? 0,
+      binding: eventBinding(job),
+      keys: [...(job.pendingEvent?.keys ?? []), key].slice(-EVENT_KEY_LIMIT),
+      acceptedAt: new Date().toISOString(),
+      ...(evidenceFingerprint === undefined ? {} : { evidenceFingerprint }),
+    };
     job.lastStatus = "queued";
     return { status: "queued" };
   }
 
-  queueEvent(id: string, name: string, eventId: string, sessionId: string | undefined): EventResult {
+  queueEvent(id: string, name: string, eventId: string, sessionId: string | undefined, evidenceFingerprint?: string): EventResult {
     if (!validEventName(name) || !validEventId(eventId)) throw new Error("Invalid event name/id; no free-form payload is accepted");
-    return this.mutate(store => this.queueInto(store.jobs.find(job => job.id === id), name, eventId, sessionId));
+    return this.mutate(store => this.queueInto(store.jobs.find(job => job.id === id), name, eventId, sessionId, evidenceFingerprint));
   }
 
   observeGithub(id: string, revision: number, fingerprint: string, sessionId: string | undefined, binding: string): EventResult {
@@ -466,7 +512,7 @@ export class CronStorage {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job) return false;
-      const configKeys = ["name", "schedule", "prompt", "enabled", "model", "notify", "extensions", "skills", "session", "maxRuns", "expiresAt", "maxRunsPerDay", "catchUp", "github", "durable", "deadlineMs"];
+      const configKeys = ["name", "schedule", "prompt", "enabled", "model", "notify", "extensions", "skills", "session", "maxRuns", "expiresAt", "maxRunsPerDay", "catchUp", "github", "durable", "deadlineMs", "quietOnNoChange", "noChangeThreshold", "quietForMs"];
       const changed = configKeys.some(key => key in partial && JSON.stringify(job[key as keyof CronJob]) !== JSON.stringify(partial[key as keyof CronJob]));
       Object.assign(job, partial);
       if (changed) { job.revision = (job.revision ?? 0) + 1; job.pendingEvent = undefined; job.pendingIntent = undefined; job.sourceFingerprint = undefined; job.nextRun = undefined; }

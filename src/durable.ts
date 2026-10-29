@@ -14,6 +14,7 @@ export function processAlive(pid: number): boolean {
 export class DurableExecution {
   readonly ownerId = randomUUID();
   private active?: { job: CronJob; started: boolean; stopReason?: string; deadline: NodeJS.Timeout; abort?: () => void };
+  private progress?: { progress: "advanced" | "unchanged" | "unknown"; evidenceFingerprint: string; waitingReason?: string };
   private sessionId: string;
   private heldClaim?: { id: string; started: boolean; model: boolean };
   private turnClaimId?: string;
@@ -40,6 +41,15 @@ export class DurableExecution {
   busy(): boolean { return !!this.active || !!this.heldClaim; }
   activeClaimId(): string | undefined { return this.active?.job.claim?.id; }
   release(claimId: string): void { if (this.heldClaim?.id === claimId) this.heldClaim = undefined; }
+  recordProgress(progress: { jobId: string; claimId: string; progress: "advanced" | "unchanged" | "unknown"; evidenceFingerprint: string; waitingReason?: string }): boolean {
+    if (!this.active?.job.claim || this.active.job.id !== progress.jobId || this.active.job.claim.id !== progress.claimId) return false;
+    this.progress = {
+      progress: progress.progress,
+      evidenceFingerprint: progress.evidenceFingerprint,
+      ...(progress.waitingReason === undefined ? {} : { waitingReason: progress.waitingReason }),
+    };
+    return true;
+  }
   begin(id: string): CronJob | undefined {
     if (this.busy()) return;
     this.flushNotices();
@@ -99,7 +109,14 @@ export class DurableExecution {
     const active = this.active;
     if (!active?.job.claim) return;
     clearTimeout(active.deadline);
-    const receipt: ExecutionReceipt = { jobId: active.job.id, claimId: active.job.claim.id, sessionId: this.sessionId, outcome };
+    const receipt: ExecutionReceipt = {
+      jobId: active.job.id,
+      claimId: active.job.claim.id,
+      sessionId: this.sessionId,
+      outcome,
+      ...(this.progress ?? {}),
+    };
+    this.progress = undefined;
     // Receipt-first lets a later store write failure reconcile without replay.
     try { this.pi.appendEntry(RECEIPT_TYPE, receipt); }
     catch { console.error("[pi-schedule-prompt] Native execution receipt unavailable"); }

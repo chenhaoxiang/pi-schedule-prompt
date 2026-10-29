@@ -77,9 +77,9 @@ export class CronScheduler {
     return !job.session || job.session === sessionId;
   }
 
-  receiveEvent(jobId: string, name: string, eventId: string): EventResult {
+  receiveEvent(jobId: string, name: string, eventId: string, evidenceFingerprint?: string): EventResult {
     if (this.stopped) return { status: "ignored", reason: "stopped" };
-    const result = this.storage.queueEvent(jobId, name, eventId, this.ctx.sessionManager.getSessionId());
+    const result = this.storage.queueEvent(jobId, name, eventId, this.ctx.sessionManager.getSessionId(), evidenceFingerprint);
     if (result.status === "queued" || (result.status === "duplicate" && this.storage.getJob(jobId)?.pendingEvent)) {
       this.pending.add(jobId);
       this.emitChange({ type: "fire", job: this.storage.getJob(jobId) });
@@ -88,10 +88,10 @@ export class CronScheduler {
     return result;
   }
 
-  emitEvent(name: string, eventId: string = randomUUID()): void {
+  emitEvent(name: string, eventId: string = randomUUID(), evidenceFingerprint?: string): void {
     for (const job of this.storage.getAllJobs()) {
       if (job.type === "event" && CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId()) && eventNames(job.schedule).includes(name)) {
-        try { this.receiveEvent(job.id, name, eventId); }
+        try { this.receiveEvent(job.id, name, eventId, evidenceFingerprint); }
         catch { this.emitChange({ type: "error", jobId: job.id, error: "Lifecycle event not admitted; selected store unavailable" }); }
       }
     }
@@ -102,6 +102,9 @@ export class CronScheduler {
   isRunning(): boolean { return !this.stopped; }
   onAgentSettled(aborted = false): void { this.durable.settled(aborted); this.drain(); }
   onScheduledStart(claimId: unknown): void { this.durable.started(claimId); }
+  recordProgress(progress: { jobId: string; claimId: string; progress: "advanced" | "unchanged" | "unknown"; evidenceFingerprint: string; waitingReason?: string }): boolean {
+    return this.durable.recordProgress(progress);
+  }
   onMessageEnd(message: { role: string; stopReason?: string }): void { this.durable.messageEnd(message); }
 
   stop(): void {
@@ -299,6 +302,12 @@ export class CronScheduler {
     if (this.stopped) return;
     const job = this.storage.getJob(id);
     if (!job?.enabled || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) return;
+    if (job.quietOnNoChange && job.quietUntil) {
+      const quietUntil = Date.parse(job.quietUntil);
+      if (Number.isFinite(quietUntil) && quietUntil > Date.now()) return;
+      try { this.storage.updateJob(id, { quietUntil: undefined, lastStatus: "skipped" }); }
+      catch { return; }
+    }
     if (process.env.PI_SCHEDULE_SERVICE_SESSION && (!job.durable || !job.session || !job.maxRuns || !job.expiresAt)) { this.fail(id, new Error("Dedicated service requires finite durable session jobs")); return; }
     if ((job.expiresAt && Date.parse(job.expiresAt) <= Date.now()) ||
       (job.maxRuns !== undefined && (job.attemptCount ?? job.runCount) >= job.maxRuns)) {
