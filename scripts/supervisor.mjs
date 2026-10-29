@@ -131,7 +131,10 @@ export async function run(config) {
     } else fs.writeFileSync(recordFile, JSON.stringify(record), { flag: 'wx', mode: 0o600 });
     owned = true; persist();
     privateDir(path.join(config.stateDir, 'sessions'));
-    const args = ['--mode', 'rpc', '--offline', '--session-id', config.sessionId, '--session-dir', path.join(config.stateDir, 'sessions'), '--model', config.model, '--extension', config.packageRoot, '--prompt-template', path.join(config.packageRoot, 'prompts')];
+    // The fixed supervisor must load exactly its pinned extension. A normal Pi
+    // session may also have a git-installed scheduler in settings; discovering
+    // both copies causes a schedule_prompt tool collision and prevents readiness.
+    const args = ['--mode', 'rpc', '--offline', '--no-extensions', '--session-id', config.sessionId, '--session-dir', path.join(config.stateDir, 'sessions'), '--model', config.model, '--extension', config.packageRoot, '--prompt-template', path.join(config.packageRoot, 'prompts')];
     if (config.thinkingLevel !== undefined) args.push('--thinking', config.thinkingLevel);
     rpc = new NativeRpc(config.piCli, args, { cwd: config.cwd, env: { ...process.env, PI_SCHEDULE_SERVICE_SESSION: config.sessionId },
       onExit: () => { if (!stopping) void shutdown('native-exited'); },
