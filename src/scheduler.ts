@@ -315,10 +315,9 @@ export class CronScheduler {
       this.emitChange({ type: "error", jobId: job.id, error });
       return;
     }
-    if (resolution.route !== job.model) {
-      this.storage.updateJob(job.id, { model: resolution.route });
-      return this.storage.getJob(job.id);
-    }
+    // Automatic preflight is validation-only. Rewriting a legacy alias here
+    // is a configuration change: it invalidates accepted event/durable bindings.
+    // New definitions and explicit management updates persist canonical routes.
     return job;
   }
 
