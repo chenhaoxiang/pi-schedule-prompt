@@ -6,11 +6,17 @@ import type { CronJob } from "../src/types.js";
 // in-memory AgentSession, just verify the scheduler's wiring around it.
 vi.mock("../src/subagent.js", () => ({
   runSubagentOnce: vi.fn(),
+  resolveModelRoute: vi.fn((_registry: unknown, model: string) => ({
+    ok: true,
+    model: { provider: "fixture", id: model, name: model },
+    route: model,
+  })),
 }));
 
-import { runSubagentOnce } from "../src/subagent.js";
+import { resolveModelRoute, runSubagentOnce } from "../src/subagent.js";
 
 const mockRunSubagentOnce = vi.mocked(runSubagentOnce);
+const mockResolveModelRoute = vi.mocked(resolveModelRoute);
 
 // In-memory CronStorage stand-in.
 function makeStorage(seedJobs: CronJob[] = []) {
@@ -290,6 +296,28 @@ describe("CronScheduler — subagent path marker delivery", () => {
     const [errMsg] = pi.sendMessage.mock.calls[1];
     expect(errMsg.content[0].text).toBe("(subagent failed with empty error)");
   });
+
+describe("CronScheduler — model preflight", () => {
+  it("disables a persisted job with an unavailable model before arming its timer", () => {
+    mockResolveModelRoute.mockImplementationOnce(() => ({ ok: false, error: "Unknown model 'bad-model'" }));
+    const pi = makePi();
+    const job = exampleJob({ model: "bad-model" });
+    const storage = makeStorage([job]);
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+
+    try {
+      scheduler.start();
+      expect(storage.getJob(job.id)).toMatchObject({ enabled: false, lastStatus: "error" });
+      expect((scheduler as any).jobs.has(job.id)).toBe(false);
+      expect(pi.events.emit).toHaveBeenCalledWith("cron:change", expect.objectContaining({
+        type: "error",
+        jobId: job.id,
+      }));
+    } finally {
+      scheduler.stop();
+    }
+  });
+});
 
 describe("CronScheduler — start() recovery", () => {
   it("clears stale lastStatus=running on start (interrupted-by-shutdown recovery)", () => {

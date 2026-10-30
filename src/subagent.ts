@@ -33,32 +33,72 @@ export interface RunSubagentOptions {
   skills?: boolean | string[];
 }
 
+export type ModelResolution =
+  | { ok: true; model: Model<any>; route: string }
+  | { ok: false; error: string };
+
+const modelRoute = (model: Model<any>): string => `${model.provider}/${model.id}`;
+
+function ambiguousModelError(requested: string, candidates: Model<any>[]): string {
+  const matches = [...new Set(candidates.map(modelRoute))].sort((a, b) => a.localeCompare(b));
+  return `Model '${requested}' is ambiguous. Use a full provider/model route. Matches: ${matches.join(", ")}`;
+}
+
+/**
+ * Resolve a scheduled model only against the host's currently available
+ * (authenticated) registry and return its canonical provider/id route.
+ *
+ * Bare ids and the historical fuzzy aliases remain supported for compatibility,
+ * but an ambiguous match is rejected instead of being selected by registry
+ * order. Persisting the canonical route prevents a later execution from
+ * choosing a different provider for the same model id.
+ */
+export function resolveModelRoute(
+  registry: ExtensionContext["modelRegistry"],
+  modelStr: string,
+): ModelResolution {
+  const requested = modelStr.trim();
+  if (!requested) return { ok: false, error: "Model must be a non-empty string" };
+
+  let needle = requested;
+  let providerHint: string | undefined;
+  const slash = requested.indexOf("/");
+  if (slash !== -1) {
+    providerHint = requested.slice(0, slash).trim();
+    needle = requested.slice(slash + 1).trim();
+  }
+  if (!needle || (slash !== -1 && !providerHint)) {
+    return { ok: false, error: `Invalid model route '${modelStr}'. Use provider/model-id.` };
+  }
+
+  const candidates = registry.getAvailable().filter((model) =>
+    !providerHint || model.provider.toLowerCase() === providerHint.toLowerCase(),
+  );
+  const lowerNeedle = needle.toLowerCase();
+  const exact = candidates.filter((model) => model.id.toLowerCase() === lowerNeedle);
+  if (exact.length === 1) return { ok: true, model: exact[0], route: modelRoute(exact[0]) };
+  if (exact.length > 1) return { ok: false, error: ambiguousModelError(modelStr, exact) };
+
+  const idMatches = candidates.filter((model) => model.id.toLowerCase().includes(lowerNeedle));
+  if (idMatches.length === 1) return { ok: true, model: idMatches[0], route: modelRoute(idMatches[0]) };
+  if (idMatches.length > 1) return { ok: false, error: ambiguousModelError(modelStr, idMatches) };
+
+  const nameMatches = candidates.filter((model) => model.name.toLowerCase().includes(lowerNeedle));
+  if (nameMatches.length === 1) return { ok: true, model: nameMatches[0], route: modelRoute(nameMatches[0]) };
+  if (nameMatches.length > 1) return { ok: false, error: ambiguousModelError(modelStr, nameMatches) };
+
+  return {
+    ok: false,
+    error: `Unknown model '${modelStr}'. ${describeAvailableModels(registry)}`,
+  };
+}
+
 export function resolveModel(
   registry: ExtensionContext["modelRegistry"],
   modelStr: string,
 ): Model<any> | undefined {
-  let fuzzyNeedle = modelStr;
-  let providerHint: string | undefined;
-  const slash = modelStr.indexOf("/");
-  if (slash !== -1) {
-    const provider = modelStr.slice(0, slash);
-    providerHint = provider;
-    const id = modelStr.slice(slash + 1);
-    const found = registry.find(provider, id);
-    if (found) return found;
-    // Slash-form didn't exact-match; fuzzy against the id portion only —
-    // matching against "anthropic/haiku" would never find anything since model
-    // ids don't include the provider prefix.
-    fuzzyNeedle = id;
-  }
-
-  const needle = fuzzyNeedle.toLowerCase();
-  const candidates = registry.getAvailable().filter(m => !providerHint || m.provider === providerHint);
-  return (
-    candidates.find((m) => m.id.toLowerCase() === needle) ??
-    candidates.find((m) => m.id.toLowerCase().includes(needle)) ??
-    candidates.find((m) => m.name.toLowerCase().includes(needle))
-  );
+  const result = resolveModelRoute(registry, modelStr);
+  return result.ok ? result.model : undefined;
 }
 
 export function getLastAssistantText(session: AgentSession): string {
@@ -99,13 +139,9 @@ export async function runSubagentOnce(
   options: RunSubagentOptions = {},
 ): Promise<SubagentResult> {
   try {
-    const model = resolveModel(ctx.modelRegistry, modelStr);
-    if (!model) {
-      return {
-        ok: false,
-        error: `Unknown model '${modelStr}'. ${describeAvailableModels(ctx.modelRegistry)}`,
-      };
-    }
+    const resolution = resolveModelRoute(ctx.modelRegistry, modelStr);
+    if (!resolution.ok) return { ok: false, error: resolution.error };
+    const { model } = resolution;
 
     if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
     const agentDir = getAgentDir();

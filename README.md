@@ -90,7 +90,7 @@ Schedules fire only in a compatible live Pi session. Legacy offline ticks are no
 
 The upstream `model` option remains available: it creates a fresh in-process session. Default tools are bash/read/edit/write/grep/find/ls, with no extensions or skills. Explicit options can load additional resources and the default host toolset. Provider-qualified fuzzy requests never switch provider. Current host provider configuration is inherited where available, thinking level is preserved, overlapping runs for one local job are suppressed, and sessions are disposed afterward. These are powerful unattended jobs, not a sandbox.
 
-For our composed setup, prefer inline waking of the owning session, Intercom for existing peers and pi-subagents for independent workflows/worktrees. Do not register the same recurring job in both schedulers. A persisted schedule does not extend authorization.
+Before an explicit model job is saved, the scheduler resolves the request against the current host registry of available (authenticated) models and persists the canonical `provider/model-id` route. Bare ids and aliases remain supported only when they resolve uniquely; unknown or provider-ambiguous requests are rejected with the matching full routes, so a first fire cannot discover a bad model identifier. The route is checked again when the schedule starts and immediately before execution. For our composed setup, prefer inline waking of the owning session, Intercom for existing peers and pi-subagents for independent workflows/worktrees. Do not register the same recurring job in both schedulers. A persisted schedule does not extend authorization.
 
 ## Composed supervision rollout
 

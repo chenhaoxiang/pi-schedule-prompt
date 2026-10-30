@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.6 (2026-10-30)
+- Preflight explicit model jobs against the current authenticated model registry and persist the canonical `provider/model-id` route; reject unknown or ambiguous bare ids before saving or firing.
+- Include the reviewed opt-in no-change quieting and fixed supervisor extension-discovery isolation from the maintenance main branch.
+
 ### Maintained fork 0.4.1-fork.5
 - Bind optional Intercom reply follow-ups to the existing session-bound schedule store with exact message/request/goal/phase identity.
 - Enforce finite one-shot delay/deadline/expiry and `maxRuns=1`; deduplicate active bindings and reject a second loop covered by an existing schedule.

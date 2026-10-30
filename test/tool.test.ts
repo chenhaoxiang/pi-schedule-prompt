@@ -35,8 +35,15 @@ function makeScheduler() {
 
 // Current-turn recursion is scheduler-owned; history is not a permission signal.
 // A stable session id lets tests assert what gets persisted.
-function makeCtx(sessionId = "test-session") {
+function makeCtx(
+  sessionId = "test-session",
+  models = [{ provider: "fixture", id: "haiku", name: "Fixture Haiku" }],
+) {
   return {
+    modelRegistry: {
+      find: (provider: string, id: string) => models.find(model => model.provider === provider && model.id === id),
+      getAvailable: () => models,
+    },
     sessionManager: {
       getEntries: () => [],
       getSessionId: () => sessionId,
@@ -111,7 +118,7 @@ describe("schedule_prompt — notify behavior", () => {
         makeCtx(),
       );
       expect(result.details?.error).toBeUndefined();
-      expect(result.details?.jobs?.[0].model).toBe("haiku");
+      expect(result.details?.jobs?.[0].model).toBe("fixture/haiku");
       expect(result.details?.jobs?.[0].notify).toBe(true);
     });
 
@@ -166,6 +173,19 @@ describe("schedule_prompt — notify behavior", () => {
       expect(result.details?.error).toBeUndefined();
     });
 
+    it("canonicalizes a model route when updating a job", async () => {
+      const { tool, storage } = buildTool([exampleJob({ id: "j2" })]);
+      const result = await tool.execute(
+        "call",
+        { action: "update", jobId: "j2", model: "haiku" } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      expect(result.details?.error).toBeUndefined();
+      expect(storage.getJob("j2").model).toBe("fixture/haiku");
+    });
+
     it("accepts setting notify=true alongside model in the same call", async () => {
       const { tool } = buildTool([exampleJob({ id: "j2" })]);
       const result = await tool.execute(
@@ -205,6 +225,91 @@ describe("schedule_prompt — notify behavior", () => {
     });
   });
 
+  describe("add — model preflight", () => {
+    it("stores the canonical provider/model route before the first fire", async () => {
+      const { tool, storage } = buildTool();
+      const result = await tool.execute(
+        "call",
+        {
+          action: "add",
+          schedule: "+10s",
+          type: "once",
+          prompt: "test",
+          model: "haiku",
+        } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      expect(result.details?.error).toBeUndefined();
+      const id = result.details?.jobs?.[0].id as string;
+      expect(storage.getJob(id).model).toBe("fixture/haiku");
+    });
+
+    it("canonicalizes gpt-6.1-sol to the configured provider route", async () => {
+      const { tool, storage } = buildTool();
+      const result = await tool.execute(
+        "call",
+        {
+          action: "add",
+          schedule: "+10s",
+          type: "once",
+          prompt: "test",
+          model: "gpt-6.1-sol",
+        } as any,
+        undefined,
+        undefined,
+        makeCtx("test-session", [{ provider: "codex-local-8319", id: "gpt-6.1-sol", name: "GPT-6.1 Sol" }]),
+      );
+      expect(result.details?.error).toBeUndefined();
+      const id = result.details?.jobs?.[0].id as string;
+      expect(storage.getJob(id).model).toBe("codex-local-8319/gpt-6.1-sol");
+    });
+
+    it("rejects an unavailable model during add instead of persisting a doomed job", async () => {
+      const { tool, storage } = buildTool();
+      const result = await tool.execute(
+        "call",
+        {
+          action: "add",
+          schedule: "+10s",
+          type: "once",
+          prompt: "test",
+          model: "gpt-6.1-sol",
+        } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      expect(result.details?.error).toContain("Unknown model 'gpt-6.1-sol'");
+      expect(storage.getAllJobs()).toHaveLength(0);
+    });
+
+    it("requires the full route when a model id is offered by multiple providers", async () => {
+      const { tool, storage } = buildTool();
+      const models = [
+        { provider: "openai", id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+        { provider: "codex-local-8319", id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+      ];
+      const result = await tool.execute(
+        "call",
+        {
+          action: "add",
+          schedule: "+10s",
+          type: "once",
+          prompt: "test",
+          model: "gpt-6.1-sol",
+        } as any,
+        undefined,
+        undefined,
+        makeCtx("test-session", models),
+      );
+      expect(result.details?.error).toContain("full provider/model route");
+      expect(result.details?.error).toContain("codex-local-8319/gpt-6.1-sol");
+      expect(storage.getAllJobs()).toHaveLength(0);
+    });
+  });
+
   describe("add — empty model rejection", () => {
     it("rejects empty-string model on add", async () => {
       const { tool } = buildTool();
@@ -223,6 +328,26 @@ describe("schedule_prompt — notify behavior", () => {
       );
       expect(result.details?.error).toContain("'model' must be a non-empty string");
     });
+  });
+});
+
+describe("schedule_prompt — model management preflight", () => {
+  it.each(["enable", "update"] as const)("rejects %s with an unavailable stored model before any write", async action => {
+    const job = exampleJob({ model: "not-configured", enabled: action !== "enable" });
+    const before = structuredClone(job);
+    const { tool, storage } = buildTool([job]);
+    const result = await tool.execute("call", { action, jobId: job.id, prompt: "changed" } as any, undefined, undefined, makeCtx());
+    expect(result.isError).toBe(true);
+    expect(result.details?.error).toContain("Unknown model");
+    expect(storage.getJob(job.id)).toEqual(before);
+  });
+
+  it("can still disable an unavailable model job", async () => {
+    const job = exampleJob({ model: "not-configured" });
+    const { tool, storage } = buildTool([job]);
+    const result = await tool.execute("call", { action: "disable", jobId: job.id } as any, undefined, undefined, makeCtx());
+    expect(result.isError).not.toBe(true);
+    expect(storage.getJob(job.id).enabled).toBe(false);
   });
 });
 
