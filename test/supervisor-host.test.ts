@@ -59,7 +59,12 @@ async function ready(h: Awaited<ReturnType<typeof fixture>>, process: ReturnType
   await vi.waitFor(() => {
     const status = JSON.parse(fs.readFileSync(path.join(h.stateDir, "status.json"), "utf8"));
     if (process.child.exitCode !== null) throw new Error("Fixture host exited: " + process.stderr() + (fs.existsSync(path.join(h.cwd, "tmp/native-fixture-error")) ? fs.readFileSync(path.join(h.cwd, "tmp/native-fixture-error"), "utf8") : (fs.existsSync(path.join(h.cwd, "tmp/native-fixture-stderr")) ? fs.readFileSync(path.join(h.cwd, "tmp/native-fixture-stderr"), "utf8") : JSON.stringify(status))));
-    expect(JSON.parse(fs.readFileSync(path.join(h.stateDir, "host.json"), "utf8")).pid).toBe(process.child.pid);
+    const owner = JSON.parse(fs.readFileSync(path.join(h.stateDir, "host.json"), "utf8"));
+    expect(owner.pid).toBe(process.child.pid);
+    // Recovery writes the new owner record before replacing the previous status.
+    // Bind readiness to this exact native child, not a dead child's ready=true.
+    expect(owner.childPid).toBeTypeOf("number");
+    expect(status.childPid).toBe(owner.childPid);
     expect(status.ready, JSON.stringify(status)).toBe(true);
   }, { timeout: 20000, interval: 100 });
 }
