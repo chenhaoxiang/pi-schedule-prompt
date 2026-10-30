@@ -305,7 +305,7 @@ export class CronScheduler {
   }
 
   private prepareModel(job: CronJob): CronJob | undefined {
-    if (!job.model) return job;
+    if (!job.model || !job.enabled || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) return job;
     const resolution = resolveModelRoute(this.ctx.modelRegistry, job.model);
     if (!resolution.ok) {
       const error = `Scheduled job '${job.name}' has an invalid model: ${resolution.error}`;
@@ -316,9 +316,8 @@ export class CronScheduler {
       return;
     }
     if (resolution.route !== job.model) {
-      try { this.storage.updateJob(job.id, { model: resolution.route }); }
-      catch { return; }
-      return { ...job, model: resolution.route };
+      this.storage.updateJob(job.id, { model: resolution.route });
+      return this.storage.getJob(job.id);
     }
     return job;
   }
@@ -490,7 +489,9 @@ export class CronScheduler {
 
   private executeJobInSubagent(snapshot: CronJob): void {
     if (this.activeJobs.has(snapshot.id) || this.stopped) return;
-    const job = snapshot.durable ? this.durable.begin(snapshot.id) : this.storage.admitJob(snapshot.id, this.ctx.sessionManager.getSessionId());
+    const eligible = this.eligible(snapshot.id);
+    if (!eligible?.model) return;
+    const job = eligible.durable ? this.durable.begin(eligible.id) : this.storage.admitJob(eligible.id, this.ctx.sessionManager.getSessionId());
     if (!job) return;
     const model = job.model!;
     const attempts = job.attemptCount!;

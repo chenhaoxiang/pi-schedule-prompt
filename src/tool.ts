@@ -296,7 +296,8 @@ export function createCronTool(
             if (params.name) updates.name = params.name;
             if (params.prompt) updates.prompt = params.prompt;
             if (params.description !== undefined) updates.description = params.description;
-            if (params.model !== undefined) updates.model = canonicalModel(params.model);
+            const model = canonicalModel(params.model ?? (job.enabled ? job.model : undefined));
+            if (model !== undefined && model !== job.model) updates.model = model;
             if (params.notify !== undefined) updates.notify = params.notify;
             if (params.extensions !== undefined) updates.extensions = params.extensions;
             if (params.skills !== undefined) updates.skills = params.skills;

@@ -331,6 +331,26 @@ describe("schedule_prompt — notify behavior", () => {
   });
 });
 
+describe("schedule_prompt — model management preflight", () => {
+  it.each(["enable", "update"] as const)("rejects %s with an unavailable stored model before any write", async action => {
+    const job = exampleJob({ model: "not-configured", enabled: action !== "enable" });
+    const before = structuredClone(job);
+    const { tool, storage } = buildTool([job]);
+    const result = await tool.execute("call", { action, jobId: job.id, prompt: "changed" } as any, undefined, undefined, makeCtx());
+    expect(result.isError).toBe(true);
+    expect(result.details?.error).toContain("Unknown model");
+    expect(storage.getJob(job.id)).toEqual(before);
+  });
+
+  it("can still disable an unavailable model job", async () => {
+    const job = exampleJob({ model: "not-configured" });
+    const { tool, storage } = buildTool([job]);
+    const result = await tool.execute("call", { action: "disable", jobId: job.id } as any, undefined, undefined, makeCtx());
+    expect(result.isError).not.toBe(true);
+    expect(storage.getJob(job.id).enabled).toBe(false);
+  });
+});
+
 describe("schedule_prompt — update resolves relative time on schedule (T17)", () => {
   it("accepts schedule='+5m' on update for a once job (resolves to ISO)", async () => {
     const { tool, storage } = buildTool([
