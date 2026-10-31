@@ -93,6 +93,22 @@ describe("dedicated native RPC supervisor service", () => {
     expect(JSON.parse((await command("status", h.file)).data)).toMatchObject({ active: false, state: "stopped" });
     expect(running.stderr()).not.toContain("synthetic consent");
   }, 40000);
+  it("reads health metadata during a live turn without steering or extending the turn", async () => {
+    const h = await fixture(); h.storage.addJob({ id: "live", name: "live", type: "once", schedule: new Date(Date.now() + 3000).toISOString(), prompt: "synthetic live status check", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, durable: true, catchUp: "latest", maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
+    const running = start(h.file, { SCHEDULE_FIXTURE_BLOCK: "1" }); await ready(h, running);
+    await vi.waitFor(() => expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(true), { timeout: 10000 });
+    const status = await command("status", h.file);
+    expect(status.code, status.error).toBe(0);
+    expect(JSON.parse(status.data)).toMatchObject({ ready: true, active: true, jobStatusFresh: true, jobSummary: [{ id: "live", claim: { phase: "started", ownerAlive: true }, reconciliation: "owner-live" }] });
+    expect(fs.readFileSync(path.join(h.cwd, "inference-started"), "utf8").trim().split("\n")).toHaveLength(1);
+    fs.writeFileSync(path.join(h.cwd, "inference-release"), "ok");
+    await vi.waitFor(() => expect(h.storage.getJob("live")?.claim?.outcome).toBe("success"), { timeout: 12000 });
+    await command("stop", h.file); await vi.waitFor(() => expect(running.child.exitCode).toBe(0), { timeout: 12000 });
+    const sessionFile = fs.readdirSync(path.join(h.stateDir, "sessions")).find(name => name.endsWith(".jsonl"))!;
+    const entries = fs.readFileSync(path.join(h.stateDir, "sessions", sessionFile), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(entries.filter(entry => entry.type === "message" && entry.message?.role === "assistant")).toHaveLength(1);
+    expect(entries.some(entry => entry.type === "message" && entry.message?.customType === "schedule_host_status")).toBe(false);
+  }, 40000);
   it("executes one durable custom turn with a persisted exact native receipt", async () => {
     const h = await fixture(); h.storage.addJob({ id: "once", name: "once", type: "once", schedule: new Date(Date.now() + 4000).toISOString(), prompt: "synthetic bounded check", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, durable: true, catchUp: "latest", maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
     const running = start(h.file); await ready(h, running);
