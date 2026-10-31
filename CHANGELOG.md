@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.9 (2026-10-31)
+- Keep read-only host-status probes on the native metadata side channel so a status check cannot steer or extend a scheduled model turn.
+
 ### Maintained fork 0.4.1-fork.8 (2026-10-31)
 - Expose bounded native-service/job health summaries that distinguish online readiness, enabled/disabled state, last outcome and stale UNKNOWN claims without exposing prompts or transcripts.
 - Add a read-only `supervisor.mjs reconcile <config> <jobId>` inspection path and one-time, state-backed attention metadata; it never replays, enables or marks business work complete.
