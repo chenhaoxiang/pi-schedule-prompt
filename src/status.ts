@@ -26,6 +26,7 @@ export interface ScheduleJobStatus {
     id: string;
     phase: NonNullable<CronJob["claim"]>["phase"];
     outcome?: NonNullable<CronJob["claim"]>["outcome"];
+    outcomeReason?: NonNullable<CronJob["claim"]>["outcomeReason"];
     ownerAlive?: boolean;
     receiptOutcome?: ExecutionReceipt["outcome"];
   };
@@ -71,6 +72,9 @@ function defaultOwnerAlive(pid: number): boolean {
 
 function unknownReason(job: CronJob): string {
   return job.followUp?.unknownReason
+    ?? (job.claim?.outcomeReason === "deadline_exceeded" ? "Scheduled turn exceeded its hard elapsed deadline; inspect the exact claim and external evidence before any new attempt." : undefined)
+    ?? (job.claim?.outcomeReason === "host_aborted" ? "The owning host aborted this turn; inspect the exact claim and external evidence before any new attempt." : undefined)
+    ?? (job.claim?.outcomeReason === "user_stopped" ? "The owning session stopped this turn; inspect the exact claim and external evidence before any new attempt." : undefined)
     ?? job.waitingReason
     ?? "Execution outcome is unknown; inspect the exact claim and external evidence before any new attempt.";
 }
@@ -126,6 +130,7 @@ export function summarizeJob(job: CronJob, options: JobStatusOptions = {}): Sche
         id: job.claim.id,
         phase: job.claim.phase,
         ...(job.claim.outcome ? { outcome: job.claim.outcome } : {}),
+        ...(job.claim.outcomeReason ? { outcomeReason: job.claim.outcomeReason } : {}),
         ...(job.claim.phase === "settled" ? {} : { ownerAlive: ownerAlive(job.claim.ownerPid) }),
         ...(receipt ? { receiptOutcome: receipt.outcome } : {}),
       },

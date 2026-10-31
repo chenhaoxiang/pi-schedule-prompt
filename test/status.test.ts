@@ -33,6 +33,14 @@ describe("bounded scheduling status", () => {
     expect(summarizeJobs([job], { ownerAlive: () => false })).toHaveLength(1);
   });
 
+  it("exposes the exact deadline cause without inventing a reason for historical claims", () => {
+    const job = base({ lastStatus: "unknown", claim: { id: "claim-1", sessionId: "service", ownerPid: 42, ownerId: "owner-1", binding: "a".repeat(64), phase: "settled", outcome: "unknown", outcomeReason: "deadline_exceeded", claimedAt: "2026-10-31T00:00:00.000Z", deadlineAt: "2026-10-31T00:45:00.000Z" } });
+    expect(summarizeJob(job)).toMatchObject({ claim: { outcomeReason: "deadline_exceeded" } });
+    expect(summarizeJob(job).reconciliationReason).toContain("hard elapsed deadline");
+    delete job.claim!.outcomeReason;
+    expect(summarizeJob(job).claim?.outcomeReason).toBeUndefined();
+  });
+
   it("distinguishes a live owner and a provably pre-dispatch dead owner", () => {
     const claim = { id: "claim-1", sessionId: "service", ownerPid: 42, ownerId: "owner-1", binding: "a".repeat(64), phase: "dispatched" as const, claimedAt: "2026-10-31T00:00:00.000Z", deadlineAt: "2026-10-31T00:10:00.000Z" };
     expect(summarizeJob(base({ enabled: true, lastStatus: "dispatched", claim }), { ownerAlive: () => true })).toMatchObject({ reconciliation: "owner-live", claim: { ownerAlive: true } });

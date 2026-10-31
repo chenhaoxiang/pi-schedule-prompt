@@ -1,6 +1,6 @@
 {
   "name": "pi-schedule-prompt",
-  "version": "0.4.1-fork.9",
+  "version": "0.4.1-fork.11",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22.19.0" },

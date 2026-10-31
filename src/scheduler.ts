@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
-import { DurableExecution } from "./durable.js";
+import { budgetPrompt, DurableExecution } from "./durable.js";
 import { dailyLimited, eventBinding, eventNames } from "./events.js";
 import { FOLLOWUP_DUE_EVENT, type FollowupDueRequest } from "./followup.js";
 import { githubFingerprint } from "./github-events.js";
@@ -13,9 +13,12 @@ type ValidateScheduleResult =
   | { ok: true; schedule: string; intervalMs?: number }
   | { ok: false; error: string };
 const MAX_DELAY = 2_147_483_647;
-const promptFor = (job: CronJob) => job.type === "event"
-  ? job.prompt + "\n\nConfigured event context (metadata, not authorization): " + JSON.stringify({ names: job.schedule, github: job.github })
-  : job.prompt;
+const promptFor = (job: CronJob) => {
+  const base = job.type === "event"
+    ? job.prompt + "\n\nConfigured event context (metadata, not authorization): " + JSON.stringify({ names: job.schedule, github: job.github })
+    : job.prompt;
+  return base + budgetPrompt(job);
+};
 const snippet = (text: string) => text.length > 500 ? text.slice(0, 500) + "…" : text;
 
 /** Timers own intent only. Host acceptance never proves business completion. */
@@ -110,6 +113,9 @@ export class CronScheduler {
   recordScheduledInputRequired(toolCallId: string): boolean {
     return this.durable.deferInput(toolCallId);
   }
+  blockScheduledTool(toolName: string): { block: true; reason: string } | undefined {
+    return this.durable.blockTool(toolName);
+  }
   onMessageEnd(message: { role: string; stopReason?: string }): void { this.durable.messageEnd(message); }
 
   stop(): void {
@@ -130,6 +136,13 @@ export class CronScheduler {
     this.activeSubagents.clear();
     this.activeJobs.clear();
     this.scheduledTurn = false;
+  }
+
+  resumeFutureJob(id: string, claimId: string, evidenceFingerprint: string): { job: CronJob; created: boolean } {
+    if (this.durable.busy() || this.activeJobs.size) throw new Error("Wait until the exact native/child handle settles before recovery");
+    const result = this.storage.resumeFuture(id, this.ctx.sessionManager.getSessionId() ?? "", claimId, evidenceFingerprint);
+    if (result.created || (!this.jobs.has(result.job.id) && !this.intervals.has(result.job.id) && !this.githubSources.has(result.job.id))) this.addJob(result.job);
+    return result;
   }
 
   addJob(job: CronJob): void {
