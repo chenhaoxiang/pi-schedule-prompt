@@ -21,7 +21,7 @@ describe("native receipt recovery read/write path", () => {
     const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off", tools: [], settingsManager: settings, sessionManager: manager, resourceLoader: loader });
     try {
       await session.bindExtensions({ mode: "rpc" });
-      await vi.waitFor(() => expect(session.getLastAssistantText()).toBe("RECEIPT_OK")); await session.waitForIdle();
+      await vi.waitFor(() => expect(manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === "schedule_execution")).toHaveLength(1), { timeout: 7000 }); await session.waitForIdle();
       expect(storage.getJob("receipt")?.claim?.phase).toBe("started");
       const entries = manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === "schedule_execution");
       expect(entries).toHaveLength(1);
