@@ -19,6 +19,7 @@ import { classifyFollowupReply, FOLLOWUP_CANCEL_TRANSPORT_EVENT, FOLLOWUP_OBSERV
 import { scheduledToolCallBlock } from "./input-guard.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
+import { receiptsByClaim, summarizeJobs } from "./status.js";
 import { CronStorage } from "./storage.js";
 import { createCronTool } from "./tool.js";
 import { runAddFlow } from "./ui/add-flow.js";
@@ -324,12 +325,26 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => { stopProgressBus(); stopEventBus(); stopFollowupBus(); stopFollowupObservationBus(); });
 
   pi.registerCommand("schedule-host-status", {
-    description: "Metadata-only readiness handshake for the dedicated native host",
+    description: "Read-only readiness, job state and exact-claim reconciliation metadata for the dedicated native host",
     handler: async (args, ctx) => {
-      if (!/^[a-f0-9]{32}$/.test(args)) return;
-      pi.sendMessage({ customType: "schedule_host_status", display: false, content: "Scheduling host readiness", details: {
-        requestId: args, ready: !!scheduler?.isRunning(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(),
-        jobs: storage?.getAllJobs().filter(job => CronScheduler.isLoadedFor(job, ctx.sessionManager.getSessionId())).length ?? 0,
+      const match = /^([a-f0-9]{32})(?: ([a-zA-Z0-9][a-zA-Z0-9._-]{0,127}))?$/.exec(args);
+      if (!match) return;
+      const sessionId = ctx.sessionManager.getSessionId();
+      const jobs = storage?.getAllJobs().filter(job => CronScheduler.isLoadedFor(job, sessionId)) ?? [];
+      const selected = match[2] ? jobs.filter(job => job.id === match[2]) : jobs.slice(0, 20);
+      const jobSummary = summarizeJobs(selected, {
+        receiptByClaim: receiptsByClaim(ctx.sessionManager.getEntries?.()),
+        nextRun: id => scheduler?.getNextRun(id) ?? null,
+      });
+      pi.sendMessage({ customType: "schedule_host_status", display: false, content: "Scheduling host metadata", details: {
+        requestId: match[1], ready: !!scheduler?.isRunning(), pid: process.pid, sessionId,
+        jobs: jobs.length,
+        counts: {
+          enabled: jobs.filter(job => job.enabled).length,
+          disabled: jobs.filter(job => !job.enabled).length,
+          disabledUnknown: jobs.filter(job => !job.enabled && (job.lastStatus === "unknown" || job.claim?.outcome === "unknown" || job.followUp?.state === "unknown")).length,
+        },
+        jobSummary, jobSummaryTruncated: !match[2] && jobs.length > selected.length,
       } });
     },
   });

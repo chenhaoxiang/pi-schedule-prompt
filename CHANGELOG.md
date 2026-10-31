@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.8 (2026-10-31)
+- Expose bounded native-service/job health summaries that distinguish online readiness, enabled/disabled state, last outcome and stale UNKNOWN claims without exposing prompts or transcripts.
+- Add a read-only `supervisor.mjs reconcile <config> <jobId>` inspection path and one-time, state-backed attention metadata; it never replays, enables or marks business work complete.
+- Keep service/runtime pointers explicit in the fixed supervisor status and preserve exact claim/receipt evidence across restarts.
+
 ### Maintained fork 0.4.1-fork.7 (2026-10-31)
 - Block unattended scheduled turns from opening `ask_user_question` dialogs before tool execution, returning a local input blocker instead of waiting until the durable deadline aborts.
 - Preserve exact-claim input-required metadata in native receipts without changing elapsed deadlines, UNKNOWN recovery, attempt budgets or ordinary user-turn questions.
