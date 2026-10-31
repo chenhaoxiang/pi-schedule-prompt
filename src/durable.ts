@@ -18,6 +18,7 @@ export class DurableExecution {
   private sessionId: string;
   private heldClaim?: { id: string; started: boolean; model: boolean };
   private turnClaimId?: string;
+  private inputRequired = false;
   constructor(private storage: CronStorage, private pi: ExtensionAPI, private ctx: ExtensionContext) {
     this.sessionId = ctx.sessionManager.getSessionId() ?? "";
   }
@@ -90,6 +91,17 @@ export class DurableExecution {
     catch { this.ctx.abort(); this.finish("unknown"); }
   }
 
+  deferInput(toolCallId: string): boolean {
+    const current = this.active;
+    if (!current?.started || current.job.model || this.turnClaimId !== current.job.claim?.id) return false;
+    if (!this.inputRequired) {
+      this.inputRequired = true;
+      try { this.pi.appendEntry("schedule_input_required", { jobId: current.job.id, claimId: current.job.claim!.id, sessionId: this.sessionId, toolCallId }); }
+      catch { console.error("[pi-schedule-prompt] Input blocker metadata unavailable; question remains deferred"); }
+    }
+    return true;
+  }
+
   messageEnd(message: { role: string; stopReason?: string }): void {
     if (this.active?.started && !this.active.job.model && message.role === "assistant") this.active.stopReason = message.stopReason;
   }
@@ -115,8 +127,10 @@ export class DurableExecution {
       sessionId: this.sessionId,
       outcome,
       ...(this.progress ?? {}),
+      ...(this.inputRequired ? { waitingReason: "user_input_required" } : {}),
     };
     this.progress = undefined;
+    this.inputRequired = false;
     // Receipt-first lets a later store write failure reconcile without replay.
     try { this.pi.appendEntry(RECEIPT_TYPE, receipt); }
     catch { console.error("[pi-schedule-prompt] Native execution receipt unavailable"); }

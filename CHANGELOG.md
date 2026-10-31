@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.7 (2026-10-31)
+- Block unattended scheduled turns from opening `ask_user_question` dialogs before tool execution, returning a local input blocker instead of waiting until the durable deadline aborts.
+- Preserve exact-claim input-required metadata in native receipts without changing elapsed deadlines, UNKNOWN recovery, attempt budgets or ordinary user-turn questions.
+
 ### Maintained fork 0.4.1-fork.6 (2026-10-30)
 - Preflight explicit model jobs against the current authenticated model registry and persist the canonical `provider/model-id` route; reject unknown or ambiguous bare ids before saving or firing.
 - Include the reviewed opt-in no-change quieting and fixed supervisor extension-discovery isolation from the maintenance main branch.

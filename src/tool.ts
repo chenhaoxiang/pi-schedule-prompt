@@ -353,7 +353,7 @@ export function createCronTool(
 
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
-              if (job.durable) lines.push(`  Durable claim: ${job.claim?.id ?? "none"} | Phase: ${job.claim?.phase ?? "none"} | Outcome: ${job.claim?.outcome ?? "not-proven"} | Deadline ms: ${job.deadlineMs ?? 600000} | Notice: ${job.notice?.state ?? "none"}`);
+              if (job.durable) lines.push(`  Durable claim: ${job.claim?.id ?? "none"} | Phase: ${job.claim?.phase ?? "none"} | Outcome: ${job.claim?.outcome ?? "not-proven"} | Deadline ms: ${job.deadlineMs ?? 600000} | Waiting: ${job.waitingReason ?? "none"} | Notice: ${job.notice?.state ?? "none"}`);
               if (job.quietOnNoChange) lines.push(`  No-change quiet: ${job.noChangeCount ?? 0}/${job.noChangeThreshold ?? 2} | Until: ${job.quietUntil ?? "not-quiet"} | Reason: ${job.waitingReason ?? "none"}`);
               if (job.maxRunsPerDay) lines.push(`  UTC daily cap: ${job.maxRunsPerDay} | Tracked day: ${job.dailyUsage?.day ?? "not-yet-tracked"} | Attempts: ${job.dailyUsage?.attempts ?? "unknown"}`);
               if (job.type === "event") lines.push(`  Event restore: ${job.catchUp ?? "none"} | Pending: ${!!job.pendingEvent}`);
