@@ -13,23 +13,33 @@ export interface PendingEvent { revision: number; binding: string; keys: string[
 export type EventResult = { status: "queued" | "duplicate" | "ignored"; reason?: string };
 
 export type ExecutionOutcome = "success" | "error" | "aborted" | "unknown";
+export const EXECUTION_REASONS = ["deadline_exceeded", "host_aborted", "user_stopped", "claim_changed", "settlement_unknown", "owner_lost"] as const;
+export type ExecutionReason = (typeof EXECUTION_REASONS)[number];
 export type ProgressOutcome = "advanced" | "unchanged" | "unknown";
 export interface DurableIntent { revision: number; binding: string; acceptedAt: string; }
 export interface ExecutionClaim {
   id: string; sessionId: string; ownerPid: number; ownerId: string;
   binding: string; phase: "claimed" | "dispatched" | "started" | "settled";
-  claimedAt: string; deadlineAt: string; outcome?: ExecutionOutcome;
+  claimedAt: string; deadlineAt: string;
+  outcome?: ExecutionOutcome; outcomeReason?: ExecutionReason;
 }
 export interface ExecutionReceipt {
   jobId: string;
   claimId: string;
   sessionId: string;
   outcome: ExecutionOutcome;
+  reason?: ExecutionReason;
   progress?: ProgressOutcome;
   evidenceFingerprint?: string;
   waitingReason?: string;
 }
-export interface ExecutionNotice { claimId: string; outcome: ExecutionOutcome; state: "pending" | "accepted" | "failed"; attempts: number; }
+export interface ExecutionNotice {
+  claimId: string;
+  outcome: ExecutionOutcome;
+  reason?: ExecutionReason;
+  state: "pending" | "accepted" | "failed";
+  attempts: number;
+}
 export type FollowupState = "pending" | "dispatched" | "answered" | "cancelled" | "unknown";
 export interface FollowupRecord {
   version: 1;
@@ -109,6 +119,8 @@ export interface CronJob {
   claim?: ExecutionClaim;
   consecutiveErrors?: number;
   notice?: ExecutionNotice;
+  /** Future-only continuation; never rewrites the retained UNKNOWN claim. */
+  recovery?: { claimId: string; successorJobId: string; evidenceFingerprint: string; resumedAt: string };
   /** Exact Intercom request binding for a finite, control-only follow-up. */
   followUp?: FollowupRecord;
   /** Optional bounded no-progress quieting; disabled by default for compatibility. */
@@ -162,7 +174,7 @@ export interface CronToolDetails {
  * Tool parameter schema
  */
 export const CronToolParams = Type.Object({
-  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "trigger"], {
+  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "trigger", "resume"], {
     description: "Action to perform",
   }),
   name: Type.Optional(
@@ -196,6 +208,8 @@ export const CronToolParams = Type.Object({
       description: "Optional job description",
     })
   ),
+  claimId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for resume: exact settled UNKNOWN/aborted claim ID." })),
+  evidenceFingerprint: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "Required for resume: SHA-256 of reconciled checkpoint/effect evidence. Explicit future occurrences only, never replay or mark the old claim successful." })),
   eventName: Type.Optional(Type.String({ description: "Required for trigger. Must match the existing event job schedule." })),
   eventId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for trigger; stable producer id, never prompt text." })),
   maxRunsPerDay: Type.Optional(Type.Integer({ minimum: 1, description: "UTC daily admitted-attempt limit." })),

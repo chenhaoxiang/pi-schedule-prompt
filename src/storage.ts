@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
-import type { CronJob, CronStore, EventResult, ExecutionOutcome, ExecutionReceipt, ProgressOutcome } from "./types.js";
+import { type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type ProgressOutcome } from "./types.js";
 
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
 
@@ -58,8 +58,10 @@ function validate(store: unknown): asserts store is CronStore {
     if (claim && (!job.durable || !validEventId(claim.id) || !validEventId(claim.ownerId) || claim.sessionId !== job.session || !Number.isSafeInteger(claim.ownerPid) || claim.ownerPid < 1 ||
       !/^[a-f0-9]{64}$/.test(claim.binding) || !["claimed", "dispatched", "started", "settled"].includes(claim.phase) ||
       ![claim.claimedAt, claim.deadlineAt].every(date => Number.isFinite(Date.parse(date))) ||
-      (claim.outcome !== undefined && !["success", "error", "aborted", "unknown"].includes(claim.outcome)))) throw new Error("Invalid durable claim");
-    if (job.notice && (!validEventId(job.notice.claimId) || !["success", "error", "aborted", "unknown"].includes(job.notice.outcome) || !["pending", "accepted", "failed"].includes(job.notice.state) || !Number.isSafeInteger(job.notice.attempts) || job.notice.attempts < 0 || job.notice.attempts > 3)) throw new Error("Invalid notification state");
+      (claim.outcome !== undefined && !["success", "error", "aborted", "unknown"].includes(claim.outcome)) ||
+      (claim.outcomeReason !== undefined && !EXECUTION_REASONS.includes(claim.outcomeReason)))) throw new Error("Invalid durable claim");
+    if (job.notice && (!validEventId(job.notice.claimId) || !["success", "error", "aborted", "unknown"].includes(job.notice.outcome) || (job.notice.reason !== undefined && !EXECUTION_REASONS.includes(job.notice.reason)) || !["pending", "accepted", "failed"].includes(job.notice.state) || !Number.isSafeInteger(job.notice.attempts) || job.notice.attempts < 0 || job.notice.attempts > 3)) throw new Error("Invalid notification state");
+    if (job.recovery && (!validEventId(job.recovery.claimId) || !validEventId(job.recovery.successorJobId) || !validEvidenceFingerprint(job.recovery.evidenceFingerprint) || !Number.isFinite(Date.parse(job.recovery.resumedAt)))) throw new Error("Invalid exact-claim recovery");
     const followUp = job.followUp;
     if (followUp && (followUp.version !== 1 || !job.durable || !job.session || followUp.ownerSessionId !== job.session || ![followUp.ownerSessionId, followUp.intercomSessionId, followUp.peerSessionId, followUp.messageId, followUp.requestId, followUp.goal, followUp.phase, followUp.createdAt, followUp.updatedAt].every(value => typeof value === "string" && value.trim()) ||
       !Number.isSafeInteger(followUp.intervalMs) || followUp.intervalMs < 1000 || followUp.intervalMs > 86400000 ||
@@ -189,7 +191,9 @@ export class CronStorage {
       job.pendingIntent = undefined;
       job.pendingEvent = undefined;
       if (job.waitingReason === "user_input_required") job.waitingReason = undefined;
-      job.claim = { id: randomUUID(), ownerId, ownerPid: process.pid, sessionId, binding: eventBinding(job), phase: "claimed", claimedAt: new Date().toISOString(), deadlineAt: new Date(Date.now() + (job.deadlineMs ?? 600000)).toISOString() };
+      const claimedAt = new Date();
+      const deadlineAt = new Date(claimedAt.getTime() + (job.deadlineMs ?? 600000));
+      job.claim = { id: randomUUID(), ownerId, ownerPid: process.pid, sessionId, binding: eventBinding(job), phase: "claimed", claimedAt: claimedAt.toISOString(), deadlineAt: deadlineAt.toISOString() };
       job.lastStatus = "unknown";
       return structuredClone(job);
     });
@@ -250,12 +254,13 @@ export class CronStorage {
     if (!job.claim || job.claim.phase === "settled") return;
     job.claim.phase = "settled";
     job.claim.outcome = outcome;
+    if (receipt?.reason !== undefined) job.claim.outcomeReason = receipt.reason;
     job.lastStatus = outcome === "aborted" ? "unknown" : outcome;
     this.applyProgress(job, receipt?.progress, receipt?.evidenceFingerprint, receipt?.waitingReason);
     if (job.model && outcome === "success") job.runCount += 1;
     job.consecutiveErrors = outcome === "error" ? (job.consecutiveErrors ?? 0) + 1 : outcome === "success" ? 0 : job.consecutiveErrors;
     if (["unknown", "aborted"].includes(outcome) || (job.consecutiveErrors ?? 0) >= 3) job.enabled = false;
-    job.notice = { claimId: job.claim.id, outcome, state: "pending", attempts: 0 };
+    job.notice = { claimId: job.claim.id, outcome, ...(receipt?.reason ? { reason: receipt.reason } : {}), state: "pending", attempts: 0 };
   }
 
   settleClaim(receipt: ExecutionReceipt): boolean {
@@ -263,6 +268,7 @@ export class CronStorage {
       const job = store.jobs.find(item => item.id === receipt.jobId);
       if (!job?.claim || job.claim.id !== receipt.claimId || job.claim.sessionId !== receipt.sessionId) return false;
       if (receipt.evidenceFingerprint !== undefined && !validEvidenceFingerprint(receipt.evidenceFingerprint)) return false;
+      if (receipt.reason !== undefined && !EXECUTION_REASONS.includes(receipt.reason)) return false;
       if (receipt.progress !== undefined && !["advanced", "unchanged", "unknown"].includes(receipt.progress)) return false;
       if (receipt.waitingReason !== undefined && (receipt.waitingReason.length > 128 || /[\u0000-\u001f\u007f]/.test(receipt.waitingReason))) return false;
       this.settleInto(job, receipt.outcome, receipt);
@@ -300,7 +306,48 @@ export class CronStorage {
           else job.pendingIntent = intent;
           job.lastStatus = "queued";
         } else job.lastStatus = "skipped";
-      } else this.settleInto(job, "unknown");
+      } else this.settleInto(job, "unknown", { jobId: job.id, claimId: claim.id, sessionId, outcome: "unknown", reason: "owner_lost" });
+    });
+  }
+
+  /** Explicit operator reconciliation permits FUTURE fires, never replays the old claim. */
+  resumeFuture(id: string, sessionId: string, claimId: string, evidenceFingerprint: string): { job: CronJob; created: boolean } {
+    if (!validEventId(claimId) || !validEvidenceFingerprint(evidenceFingerprint)) throw new Error("resume requires exact claimId and SHA-256 evidenceFingerprint");
+    return this.mutate(store => {
+      const previous = store.jobs.find(job => job.id === id);
+      if (!previous?.durable || previous.session !== sessionId || previous.followUp || !["cron", "interval"].includes(previous.type)) throw new Error("Only the owning session may resume a recurring timed durable job; event/follow-up/one-shot work is not replayable");
+      if (previous.claim?.id !== claimId || previous.claim.phase !== "settled" || !["unknown", "aborted"].includes(previous.claim.outcome ?? "")) throw new Error("Expected the exact settled UNKNOWN/aborted claim");
+      if (previous.recovery) {
+        if (previous.recovery.claimId !== claimId || previous.recovery.evidenceFingerprint !== evidenceFingerprint) throw new Error("This claim was already reconciled with different evidence");
+        const existing = store.jobs.find(job => job.id === previous.recovery!.successorJobId);
+        if (!existing) throw new Error("Recorded successor is missing; do not recreate or reset its budget");
+        return { job: structuredClone(existing), created: false };
+      }
+      if (previous.enabled) throw new Error("Disable the UNKNOWN job before exact-claim recovery");
+      if (store.jobs.some(job => job.claim?.sessionId === sessionId && job.claim.phase !== "settled")) throw new Error("Owning session still has an unsettled claim");
+      const spent = previous.attemptCount ?? previous.runCount;
+      if (!previous.maxRuns || !previous.expiresAt || Date.parse(previous.expiresAt) <= Date.now() || spent >= previous.maxRuns) throw new Error("Future recovery requires unexpired, finite remaining attempts");
+      const successorId = randomUUID();
+      const now = new Date().toISOString();
+      const successor: CronJob = {
+        id: successorId, name: `${previous.name}-resume-${successorId.slice(0, 8)}`,
+        type: previous.type, schedule: previous.schedule, intervalMs: previous.intervalMs,
+        prompt: previous.prompt + `\n\n[Exact-claim recovery]\nPrevious job ${id}, claim ${claimId} remains UNKNOWN and is retained. Reconciled checkpoint fingerprint: ${evidenceFingerprint}. This is a FUTURE occurrence only: consume saved work, do not replay any previous or UNKNOWN effect. Preserve original authorization and expiry; do not reset the total attempt budget.`,
+        enabled: true, createdAt: now, runCount: 0, attemptCount: 0,
+        session: sessionId, durable: true, catchUp: "none", deadlineMs: previous.deadlineMs,
+        maxRuns: previous.maxRuns - spent, maxRunsPerDay: previous.maxRunsPerDay,
+        dailyUsage: previous.dailyUsage ? { ...previous.dailyUsage } : undefined,
+        expiresAt: previous.expiresAt, model: previous.model, notify: previous.notify,
+        extensions: previous.extensions, skills: previous.skills,
+        github: previous.github, recentEventKeys: previous.recentEventKeys,
+        quietOnNoChange: previous.quietOnNoChange, noChangeThreshold: previous.noChangeThreshold, quietForMs: previous.quietForMs,
+        description: `Future-only continuation of ${id}; old claim ${claimId} retained; no replay.`, revision: 1,
+      };
+      previous.recovery = { claimId, successorJobId: successorId, evidenceFingerprint, resumedAt: now };
+      previous.pendingIntent = undefined;
+      previous.pendingEvent = undefined;
+      store.jobs.push(successor);
+      return { job: structuredClone(successor), created: true };
     });
   }
 

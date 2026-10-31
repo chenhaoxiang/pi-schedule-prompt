@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.10 (2026-11-01)
+- Add absolute per-round time budgets and a native tool-boundary wind-down reserve inside the unchanged hard deadline; preserve local checkpointing and prevent new long/effectful work during finalization.
+- Preserve exact interruption reasons in receipts, claims, notices and read-only status.
+- Add explicit idempotent future-only recovery for finite recurring timed jobs: retain old UNKNOWN evidence, subtract spent lifetime attempts, carry daily usage/expiry, and never replay missed or uncertain effects.
+
 ### Maintained fork 0.4.1-fork.9 (2026-10-31)
 - Keep read-only host-status probes on the native metadata side channel so a status check cannot steer or extend a scheduled model turn.
 

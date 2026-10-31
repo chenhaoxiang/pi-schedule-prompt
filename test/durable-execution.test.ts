@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DurableExecution } from "../src/durable.js";
 import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
+import { createCronTool } from "../src/tool.js";
 import type { CronJob, ExecutionReceipt } from "../src/types.js";
 
 const owned: string[] = [];
@@ -147,12 +148,25 @@ describe("native execution envelope", () => {
     expect(h.receipts).toEqual([{ jobId: "one", claimId: job.claim!.id, sessionId: "owner", outcome: "success" }]);
     expect(h.storage.getJob("one")).toMatchObject({ lastStatus: "success", notice: { state: "accepted" } });
   });
-  it("aborts only the exact started native turn at its deadline and does not restart it", async () => {
+  it("aborts only the exact started native turn at its deadline and records the reason", async () => {
     const h = fixture({ deadlineMs: 1000 }); h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!; h.durable.started(job.claim!.id);
     await vi.advanceTimersByTimeAsync(1100);
     expect(h.ctx.abort).toHaveBeenCalledTimes(1);
-    expect(h.storage.getJob("one")).toMatchObject({ enabled: false, lastStatus: "unknown" });
+    expect(h.receipts[0]).toMatchObject({ outcome: "unknown", reason: "deadline_exceeded" });
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: false, lastStatus: "unknown", claim: { outcomeReason: "deadline_exceeded" } });
     expect(h.durable.busy()).toBe(true); h.durable.settled(true); expect(h.durable.busy()).toBe(false);
+  });
+  it("enters a finalization reserve, blocks new effectful tools, and lets the turn settle", async () => {
+    const h = fixture({ deadlineMs: 3000 });
+    const scheduler = new CronScheduler(h.storage, h.pi as any, h.ctx as any);
+    h.storage.queueTime("one", "owner"); const job = (scheduler as any).durable.begin("one")!; (scheduler as any).durable.started(job.claim!.id);
+    await vi.advanceTimersByTimeAsync(2100);
+    expect(h.ctx.abort).not.toHaveBeenCalled();
+    expect(scheduler.blockScheduledTool("bash")).toMatchObject({ block: true });
+    expect(scheduler.blockScheduledTool("read")).toBeUndefined();
+    expect(h.pi.appendEntry.mock.calls.filter(([type]) => type === "schedule_wind_down")).toHaveLength(1);
+    (scheduler as any).durable.messageEnd({ role: "assistant", stopReason: "stop" }); scheduler.onAgentSettled(false);
+    expect(h.storage.getJob("one")).toMatchObject({ lastStatus: "success", claim: { outcome: "success" } });
   });
   it("does not abort unrelated user work when dispatch never started", async () => {
     const h = fixture({ deadlineMs: 1000 }); h.storage.queueTime("one", "owner"); h.durable.begin("one");
@@ -190,6 +204,65 @@ describe("native execution envelope", () => {
       h.durable.messageEnd({ role: "assistant", stopReason: "error" }); h.durable.settled(false);
     }
     expect(h.storage.getJob("one")).toMatchObject({ enabled: false, consecutiveErrors: 3, lastStatus: "error" });
+  });
+  it("creates an exact-claim future-only continuation without replaying the old claim", () => {
+    const h = fixture({ maxRuns: 3, expiresAt: new Date(Date.now() + 86400000).toISOString() });
+    const claim = claimed(h); h.storage.markClaim("one", claim.id, "dispatched");
+    expect(h.storage.settleClaim({ jobId: "one", claimId: claim.id, sessionId: "owner", outcome: "unknown", reason: "deadline_exceeded" })).toBe(true);
+    const resumed = h.storage.resumeFuture("one", "owner", claim.id, "a".repeat(64));
+    expect(resumed.created).toBe(true);
+    expect(resumed.job).toMatchObject({ enabled: true, maxRuns: 2, attemptCount: 0, durable: true });
+    expect(resumed.job.id).not.toBe("one");
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: false, recovery: { claimId: claim.id, successorJobId: resumed.job.id, evidenceFingerprint: "a".repeat(64) }, claim: { outcome: "unknown", outcomeReason: "deadline_exceeded" } });
+    expect(h.storage.resumeFuture("one", "owner", claim.id, "a".repeat(64)).created).toBe(false);
+  });
+  it("preserves lifetime/daily limits and the original UNKNOWN across idempotent recovery", () => {
+    const h = fixture({ maxRuns: 158, maxRunsPerDay: 24, expiresAt: new Date(Date.now() + 86400000).toISOString(), deadlineMs: 2700000 });
+    const claim = claimed(h); h.storage.markClaim("one", claim.id, "dispatched");
+    h.storage.settleClaim({ jobId: "one", claimId: claim.id, sessionId: "owner", outcome: "unknown" });
+    const before = h.storage.getJob("one")!;
+    const resumed = h.storage.resumeFuture("one", "owner", claim.id, "c".repeat(64)).job;
+    expect(resumed).toMatchObject({ maxRuns: 157, expiresAt: before.expiresAt, deadlineMs: 2700000, dailyUsage: before.dailyUsage, catchUp: "none" });
+    expect(resumed.pendingIntent).toBeUndefined();
+    h.storage.queueTime(resumed.id, "owner"); h.storage.claimJob(resumed.id, "owner", "new-owner");
+    expect(h.storage.resumeFuture("one", "owner", claim.id, "c".repeat(64)).job.attemptCount).toBe(1);
+    expect(h.storage.getAllJobs()).toHaveLength(2);
+    expect(h.storage.getJob("one")?.claim).toEqual(before.claim);
+    expect(() => h.storage.resumeFuture("one", "foreign", claim.id, "c".repeat(64))).toThrow(/owning session/);
+    expect(() => h.storage.resumeFuture("one", "owner", "stale-claim", "c".repeat(64))).toThrow(/exact settled/);
+    expect(() => h.storage.resumeFuture("one", "owner", claim.id, "d".repeat(64))).toThrow(/different evidence/);
+  });
+  it.each(["expired", "exhausted", "running"])("rejects %s recovery without modifying original bytes", kind => {
+    const h = fixture({ maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
+    const claim = claimed(h); h.storage.markClaim("one", claim.id, "dispatched");
+    if (kind !== "running") h.storage.settleClaim({ jobId: "one", claimId: claim.id, sessionId: "owner", outcome: "unknown" });
+    if (kind === "expired") vi.advanceTimersByTime(61000);
+    const before = fs.readFileSync(h.storage.getStorePath(), "utf8");
+    expect(() => h.storage.resumeFuture("one", "owner", claim.id, "e".repeat(64))).toThrow();
+    expect(fs.readFileSync(h.storage.getStorePath(), "utf8")).toBe(before);
+  });
+  it("exposes resume through the native tool and never recurses from scheduled work", async () => {
+    const h = fixture({ maxRuns: 2, expiresAt: new Date(Date.now() + 86400000).toISOString() });
+    const claim = claimed(h); h.storage.markClaim("one", claim.id, "dispatched");
+    h.storage.settleClaim({ jobId: "one", claimId: claim.id, sessionId: "owner", outcome: "unknown" });
+    const scheduler = new CronScheduler(h.storage, h.pi as any, h.ctx as any);
+    const tool = createCronTool(() => h.storage, () => scheduler);
+    const params = { action: "resume" as const, jobId: "one", claimId: claim.id, evidenceFingerprint: "f".repeat(64) };
+    scheduler.setScheduledTurn(true);
+    await expect(tool.execute("call", params, undefined, undefined, h.ctx as any)).rejects.toThrow(/within a scheduled/);
+    scheduler.setScheduledTurn(false);
+    const result = await tool.execute("call", params, undefined, undefined, h.ctx as any);
+    expect(result.isError).not.toBe(true); expect(result.details?.jobs[0].maxRuns).toBe(1);
+    const cleanup = await tool.execute("cleanup", { action: "cleanup" }, undefined, undefined, h.ctx as any);
+    expect(cleanup.details?.jobs).toEqual([]); expect(h.storage.getJob("one")?.claim?.outcome).toBe("unknown");
+    scheduler.stop();
+  });
+  it("does not wind down or abort an unrelated user turn", async () => {
+    const h = fixture({ deadlineMs: 3000 }); h.storage.queueTime("one", "owner");
+    const job = h.durable.begin("one")!; h.durable.started(job.claim!.id); h.durable.started(undefined);
+    await vi.advanceTimersByTimeAsync(3100);
+    expect(h.durable.blockTool("bash")).toBeUndefined(); expect(h.ctx.abort).not.toHaveBeenCalled();
+    expect(h.storage.getJob("one")?.claim?.outcomeReason).toBe("deadline_exceeded");
   });
   it("retains failed notification separately and retries it without a model call", () => {
     const h = fixture(); h.pi.events.emit.mockImplementation(() => { throw new Error("broken observer"); });

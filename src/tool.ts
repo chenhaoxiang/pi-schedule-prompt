@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { nanoid } from "nanoid";
-import { validateGithub } from "./events.js";
+import { validateGithub, validEventId, validEvidenceFingerprint } from "./events.js";
 import { CronScheduler } from "./scheduler.js";
 import type { JobScope } from "./settings.js";
 import type { CronStorage } from "./storage.js";
@@ -22,7 +22,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId). maxRunsPerDay counts UTC attempts.",
+      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId), resume (needs jobId, exact settled UNKNOWN/aborted claimId and SHA-256 evidenceFingerprint). Resume creates only a FUTURE continuation; it never replays or marks the old claim successful. maxRunsPerDay counts UTC attempts.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -30,7 +30,7 @@ export function createCronTool(
       const scheduler = getScheduler();
       
       // Source-based guard: historical notifications are not the current turn.
-      if (params.action === "add" && scheduler.isScheduledTurn?.()) {
+      if (["add", "resume"].includes(params.action) && scheduler.isScheduledTurn?.()) {
         throw new Error("Cannot create scheduled prompts from within a scheduled prompt execution.");
       }
 
@@ -47,7 +47,7 @@ export function createCronTool(
       };
 
       try {
-        if (["remove", "enable", "disable", "update"].includes(action) && params.jobId) {
+        if (["remove", "enable", "disable", "update", "resume"].includes(action) && params.jobId) {
           const target = storage.getJob(params.jobId);
           if (target && !CronScheduler.isLoadedFor(target, ctx.sessionManager.getSessionId())) {
             throw new Error("Job belongs to another session and is read-only here");
@@ -66,6 +66,15 @@ export function createCronTool(
           throw new Error("expiresAt must be an absolute future timestamp");
         }
         switch (action) {
+          case "resume": {
+            if (!params.jobId || !params.claimId || !params.evidenceFingerprint) throw new Error("resume requires jobId, exact claimId and evidenceFingerprint");
+            if (!validEventId(params.claimId) || !validEvidenceFingerprint(params.evidenceFingerprint)) throw new Error("resume requires a safe exact claimId and lowercase SHA-256 evidenceFingerprint");
+            const resumed = scheduler.resumeFutureJob(params.jobId, params.claimId, params.evidenceFingerprint);
+            details.jobs = [resumed.job];
+            details.jobId = resumed.job.id;
+            details.jobName = resumed.job.name;
+            return { content: [{ type: "text", text: `✓ Future-only continuation ${resumed.created ? "created" : "already recorded"} for claim ${params.claimId}; the old UNKNOWN/aborted claim was not replayed` }], details };
+          }
           case "trigger": {
             if (scheduler.isScheduledTurn?.()) throw new Error("Scheduled turns cannot trigger another schedule recursively");
             if (!params.jobId || !params.eventName || !params.eventId) throw new Error("trigger requires jobId,eventName,eventId");
@@ -229,7 +238,7 @@ export function createCronTool(
             const mySessionId = ctx.sessionManager.getSessionId();
             const disabledJobs = storage
               .getAllJobs()
-              .filter((j) => !j.enabled && CronScheduler.isLoadedFor(j, mySessionId));
+              .filter((j) => !j.enabled && !j.recovery && !["unknown", "aborted"].includes(j.claim?.outcome ?? "") && CronScheduler.isLoadedFor(j, mySessionId));
 
             if (disabledJobs.length === 0) {
               details.jobs = [];
@@ -353,7 +362,7 @@ export function createCronTool(
 
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
-              if (job.durable) lines.push(`  Durable claim: ${job.claim?.id ?? "none"} | Phase: ${job.claim?.phase ?? "none"} | Outcome: ${job.claim?.outcome ?? "not-proven"} | Deadline ms: ${job.deadlineMs ?? 600000} | Waiting: ${job.waitingReason ?? "none"} | Notice: ${job.notice?.state ?? "none"}`);
+              if (job.durable) lines.push(`  Durable claim: ${job.claim?.id ?? "none"} | Phase: ${job.claim?.phase ?? "none"} | Outcome: ${job.claim?.outcome ?? "not-proven"} | Deadline ms: ${job.deadlineMs ?? 600000} | Waiting: ${job.waitingReason ?? "none"} | Reason: ${job.claim?.outcomeReason ?? "not-recorded"} | Notice: ${job.notice?.state ?? "none"}`);
               if (job.quietOnNoChange) lines.push(`  No-change quiet: ${job.noChangeCount ?? 0}/${job.noChangeThreshold ?? 2} | Until: ${job.quietUntil ?? "not-quiet"} | Reason: ${job.waitingReason ?? "none"}`);
               if (job.maxRunsPerDay) lines.push(`  UTC daily cap: ${job.maxRunsPerDay} | Tracked day: ${job.dailyUsage?.day ?? "not-yet-tracked"} | Attempts: ${job.dailyUsage?.attempts ?? "unknown"}`);
               if (job.type === "event") lines.push(`  Event restore: ${job.catchUp ?? "none"} | Pending: ${!!job.pendingEvent}`);

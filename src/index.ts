@@ -177,6 +177,8 @@ export default async function (pi: ExtensionAPI) {
     scheduler?.onScheduledStart(event.messageType === "custom" && event.message.customType === "scheduled_prompt" ? (event.message.details as { claimId?: string } | undefined)?.claimId : undefined);
   });
   pi.on("tool_call", event => {
+    const windDown = scheduler?.blockScheduledTool(event.toolName);
+    if (windDown) return windDown;
     const blocked = scheduledToolCallBlock(scheduler?.isScheduledTurn() ?? false, event.toolName);
     if (!blocked) return;
     scheduler?.recordScheduledInputRequired(event.toolCallId);
