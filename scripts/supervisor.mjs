@@ -88,10 +88,13 @@ export async function run(config) {
   let refreshing;
   const readJobs = async (jobId, timeoutMs = 1500) => {
     const requestId = randomBytes(16).toString('hex');
-    const event = rpc.waitFor(event => event.type === 'message_end' && event.message?.customType === 'schedule_host_status' && event.message.details?.requestId === requestId, timeoutMs);
+    const event = rpc.waitFor(event => {
+      if (event.type !== 'extension_ui_request' || event.method !== 'setStatus' || event.statusKey !== 'schedule_host_status' || typeof event.statusText !== 'string') return false;
+      try { return JSON.parse(event.statusText).requestId === requestId; } catch { return false; }
+    }, timeoutMs);
     const disposition = await rpc.request('prompt', { message: '/schedule-host-status ' + requestId + (jobId ? ' ' + jobId : '') }, timeoutMs);
     if (disposition.disposition !== 'handled') throw new Error('Native status command was not handled locally');
-    const details = (await event).message.details;
+    const details = JSON.parse((await event).statusText);
     if (details.pid !== rpc.child.pid || details.sessionId !== config.sessionId) throw new Error('Native status identity mismatch');
     return details;
   };

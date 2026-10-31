@@ -336,7 +336,7 @@ export default async function (pi: ExtensionAPI) {
         receiptByClaim: receiptsByClaim(ctx.sessionManager.getEntries?.()),
         nextRun: id => scheduler?.getNextRun(id) ?? null,
       });
-      pi.sendMessage({ customType: "schedule_host_status", display: false, content: "Scheduling host metadata", details: {
+      const details = {
         requestId: match[1], ready: !!scheduler?.isRunning(), pid: process.pid, sessionId,
         jobs: jobs.length,
         counts: {
@@ -345,7 +345,12 @@ export default async function (pi: ExtensionAPI) {
           disabledUnknown: jobs.filter(job => !job.enabled && (job.lastStatus === "unknown" || job.claim?.outcome === "unknown" || job.followUp?.state === "unknown")).length,
         },
         jobSummary, jobSummaryTruncated: !match[2] && jobs.length > selected.length,
-      } });
+      };
+      // RPC UI status is an immediate side channel. A custom message during
+      // streaming would otherwise steer/extend the active model turn (or, with
+      // triggerTurn:false, wait until settlement instead of answering now).
+      if (ctx.mode === "rpc") ctx.ui.setStatus("schedule_host_status", JSON.stringify(details));
+      else pi.sendMessage({ customType: "schedule_host_status", display: false, content: "Scheduling host metadata", details }, { triggerTurn: false });
     },
   });
 
