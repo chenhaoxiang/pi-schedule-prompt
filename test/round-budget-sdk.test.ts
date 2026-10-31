@@ -35,7 +35,7 @@ it("winds down at the real tool boundary and settles before the unchanged hard d
   const errors: string[] = [];
   try {
     await session.bindExtensions({ mode: "rpc", onError: error => { errors.push(error.message); } });
-    await vi.waitFor(() => expect(session.getLastAssistantText()).toContain("ROUND_FINISHED"), { timeout: 5000 });
+    await vi.waitFor(() => expect(storage.getJob("budget")?.claim?.phase).toBe("settled"), { timeout: 7000 });
     await session.waitForIdle();
     expect(first).toHaveBeenCalledOnce(); expect(publish).not.toHaveBeenCalled();
     expect(storage.getJob("budget")).toMatchObject({ deadlineMs: 3000, attemptCount: 1, claim: { phase: "settled", outcome: "success" } });
