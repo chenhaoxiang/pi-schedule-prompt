@@ -49,7 +49,7 @@ function validatePins(config) {
   }
 }
 
-async function control(config, op) {
+async function control(config, op, jobId) {
   const recordFile = path.join(config.stateDir, 'host.json');
   if (!fs.existsSync(recordFile)) {
     if (op === 'status') return { ...(fs.existsSync(path.join(config.stateDir, 'status.json')) ? JSON.parse(fs.readFileSync(path.join(config.stateDir, 'status.json'), 'utf8')) : { state: 'stopped' }), active: false };
@@ -60,8 +60,8 @@ async function control(config, op) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host: '127.0.0.1', port: config.controlPort }); let buffer = '';
     socket.setTimeout(5000);
-    socket.on('connect', () => socket.write(JSON.stringify({ token: record.token, op }) + '\n'));
-    socket.on('data', chunk => { buffer += chunk; if (buffer.length > 8192) { socket.destroy(); reject(new Error('Invalid host response')); } else if (buffer.includes('\n')) { socket.end(); try { resolve(JSON.parse(buffer.split('\n')[0])); } catch { reject(new Error('Invalid host response')); } } });
+    socket.on('connect', () => socket.write(JSON.stringify({ token: record.token, op, ...(jobId ? { jobId } : {}) }) + '\n'));
+    socket.on('data', chunk => { buffer += chunk; if (Buffer.byteLength(buffer) > 131072) { socket.destroy(); reject(new Error('Invalid host response')); } else if (buffer.includes('\n')) { socket.end(); try { resolve(JSON.parse(buffer.split('\n')[0])); } catch { reject(new Error('Invalid host response')); } } });
     socket.on('error', () => reject(new Error('Owned control unavailable; retained owner/child requires reconciliation, not arbitrary PID kill')));
     socket.on('timeout', () => { socket.destroy(); reject(new Error('Owned control timed out; stop not confirmed')); });
   });
@@ -78,13 +78,53 @@ export async function run(config) {
   let owned = false;
   let record = { version: 1, pid: process.pid, childPid: null, fingerprint: config.fingerprint, token };
   const stateFile = path.join(config.stateDir, 'status.json');
-  const state = { version: 1, state: 'starting', ready: false, sessionId: config.sessionId, sourceCommit: config.sourceCommit, childPid: null, uiDenied: 0, stderrBytes: 0 };
+  const state = { version: 1, state: 'starting', ready: false, sessionId: config.sessionId, sourceCommit: config.sourceCommit, packageRoot: config.packageRoot, stateDir: config.stateDir, childPid: null, uiDenied: 0, stderrBytes: 0, jobStatusFresh: false, healthAlerts: [] };
+  try {
+    const previous = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    if (previous.sessionId === config.sessionId && previous.sourceCommit === config.sourceCommit && Array.isArray(previous.healthAlerts)) state.healthAlerts = previous.healthAlerts.slice(-20);
+  } catch { /* A missing prior display snapshot is not execution evidence. */ }
   const persist = () => atomic(stateFile, { ...state, updatedAt: new Date().toISOString() });
   let rpc, server, stopping;
+  let refreshing;
+  const readJobs = async (jobId, timeoutMs = 1500) => {
+    const requestId = randomBytes(16).toString('hex');
+    const event = rpc.waitFor(event => {
+      if (event.type !== 'extension_ui_request' || event.method !== 'setStatus' || event.statusKey !== 'schedule_host_status' || typeof event.statusText !== 'string') return false;
+      try { return JSON.parse(event.statusText).requestId === requestId; } catch { return false; }
+    }, timeoutMs);
+    const disposition = await rpc.request('prompt', { message: '/schedule-host-status ' + requestId + (jobId ? ' ' + jobId : '') }, timeoutMs);
+    if (disposition.disposition !== 'handled') throw new Error('Native status command was not handled locally');
+    const details = JSON.parse((await event).statusText);
+    if (details.pid !== rpc.child.pid || details.sessionId !== config.sessionId) throw new Error('Native status identity mismatch');
+    return details;
+  };
+  const refreshJobs = () => {
+    if (refreshing) return refreshing;
+    refreshing = (async () => {
+      try {
+        const details = await readJobs();
+        state.jobs = details.jobs; state.jobCounts = details.counts;
+        state.jobSummary = details.jobSummary; state.jobSummaryTruncated = details.jobSummaryTruncated;
+        state.jobStatusFresh = true; state.jobStatusObservedAt = new Date().toISOString();
+        for (const job of details.jobSummary ?? []) {
+          if (job.operationalState !== 'disabled-unknown' && !(job.enabled === false && job.lastStatus === 'error')) continue;
+          const key = sha(JSON.stringify([job.id, job.claim?.id, job.claim?.outcome, job.lastStatus]));
+          if (state.healthAlerts.some(alert => alert.key === key)) continue;
+          const alert = { key, jobId: job.id, ...(job.claim ? { claimId: job.claim.id } : {}), reason: job.operationalState === 'disabled-unknown' ? 'disabled-unknown' : 'disabled-error', observedAt: state.jobStatusObservedAt };
+          state.healthAlerts = [...state.healthAlerts, alert].slice(-20);
+          console.error('Scheduling attention required: ' + JSON.stringify(alert));
+        }
+      } catch {
+        state.jobStatusFresh = false;
+      }
+      if (owned) persist();
+    })().finally(() => { refreshing = undefined; });
+    return refreshing;
+  };
   const shutdown = (reason = 'requested') => {
     if (stopping) return stopping;
     stopping = (async () => {
-      state.state = 'stopping'; state.ready = false; if (owned) persist();
+      state.state = 'stopping'; state.ready = false; state.jobStatusFresh = false; if (owned) persist();
       if (rpc && !rpc.dead) {
         // Only own native queue/session, never an Intercom peer or detached Subagents handle.
         try { await rpc.request('clear_queue', {}, 2000); } catch { /* EOF still disposes runtime. */ }
@@ -113,9 +153,19 @@ export async function run(config) {
         if (!buffer.includes('\n')) return;
         let request;
         try { request = JSON.parse(buffer.split('\n')[0]); } catch { socket.destroy(); return; }
-        if (!owned || typeof request.token !== 'string' || !timingSafeEqual(Buffer.from(sha(request.token)), Buffer.from(sha(token))) || !['status', 'stop'].includes(request.op) || Object.keys(request).some(key => !['token', 'op'].includes(key))) { socket.destroy(); return; }
-        if (request.op === 'status') socket.end(JSON.stringify({ ...state, stderrBytes: rpc?.stderrBytes ?? 0, active: !rpc?.dead }) + '\n');
-        else {
+        if (!owned || typeof request.token !== 'string' || !timingSafeEqual(Buffer.from(sha(request.token)), Buffer.from(sha(token))) || !['status', 'reconcile', 'stop'].includes(request.op) || Object.keys(request).some(key => !['token', 'op', 'jobId'].includes(key)) || (request.op === 'reconcile' ? !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(request.jobId ?? '') : request.jobId !== undefined)) { socket.destroy(); return; }
+        if (request.op === 'status' || request.op === 'reconcile') {
+          const respond = async () => {
+            if (request.op === 'reconcile') {
+              const details = await readJobs(request.jobId);
+              socket.end(JSON.stringify({ readOnly: true, jobId: request.jobId, found: details.jobSummary?.length === 1, job: details.jobSummary?.[0], receiptScope: 'owning-native-session', automaticReplay: false, modified: false, businessCompletion: 'not-verified' }) + '\n');
+            } else {
+              if (state.ready && !stopping) await refreshJobs();
+              socket.end(JSON.stringify({ ...state, stderrBytes: rpc?.stderrBytes ?? 0, active: !!rpc && !rpc.dead }) + '\n');
+            }
+          };
+          void respond().catch(() => socket.end(JSON.stringify({ state: 'metadata-unavailable', readOnly: true, modified: false, automaticReplay: false }) + '\n'));
+        } else {
           // Close this request before server.close(), then await actual child exit before acknowledgement.
           socket.end(JSON.stringify({ state: 'stop-requested', confirmedStopped: false }) + '\n');
           void shutdown().catch(() => { process.exitCode = 1; });
@@ -142,8 +192,8 @@ export async function run(config) {
     record = { ...record, childPid: rpc.child.pid }; atomic(recordFile, record);
     state.childPid = rpc.child.pid; persist();
     rpc.onEvent(event => {
-      if (event.type === 'agent_start') { state.state = 'running'; persist(); }
-      if (event.type === 'agent_settled') { state.state = 'idle-ready'; persist(); }
+      if (event.type === 'agent_start') { state.state = 'running'; state.jobStatusFresh = false; persist(); }
+      if (event.type === 'agent_settled') { state.state = 'idle-ready'; persist(); if (state.ready && !stopping) void refreshJobs(); }
       if (event.type === 'extension_ui_request') {
         if (['confirm', 'select', 'input', 'editor'].includes(event.method)) {
           state.uiDenied += 1; persist();
@@ -160,14 +210,11 @@ export async function run(config) {
     state.step = 'verify-loaded-package'; persist();
     if (!commands.some(command => command.name === 'schedule-host-status' && command.sourceInfo?.path === path.join(config.packageRoot, 'src/index.ts'))) throw new Error('Pinned scheduler command not loaded');
     state.step = 'readiness-handshake'; persist();
-    const requestId = randomBytes(16).toString('hex');
-    const readyEvent = rpc.waitFor(event => event.type === 'message_end' && event.message?.customType === 'schedule_host_status' && event.message.details?.requestId === requestId);
-    const disposition = await rpc.request('prompt', { message: '/schedule-host-status ' + requestId });
-    if (disposition.disposition !== 'handled') throw new Error('Native readiness command was not handled locally');
-    const ready = (await readyEvent).message.details;
-    if (!ready.ready || ready.pid !== rpc.child.pid || ready.sessionId !== config.sessionId) throw new Error('Scheduler not ready in the owned native process');
+    const ready = await readJobs(undefined, 30000);
+    if (!ready.ready) throw new Error('Scheduler not ready in the owned native process');
     const current = await rpc.request('get_state');
-    state.state = current.isStreaming ? 'running' : 'idle-ready'; state.ready = true; state.jobs = ready.jobs; persist();
+    state.state = current.isStreaming ? 'running' : 'idle-ready'; state.ready = true; persist();
+    await refreshJobs();
     await rpc.exited;
     await shutdown('native-exited');
   } catch {
@@ -186,12 +233,12 @@ export function plist(config, configFile) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [op, file] = process.argv.slice(2);
-    if (!['run', 'status', 'stop', 'plist'].includes(op) || !file || process.argv.length !== 4) throw new Error('Usage: supervisor.mjs run|status|stop|plist /private/config.json');
+    const [op, file, jobId] = process.argv.slice(2);
+    if (!['run', 'status', 'reconcile', 'stop', 'plist'].includes(op) || !file || (op === 'reconcile' ? process.argv.length !== 5 || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(jobId ?? '') : process.argv.length !== 4)) throw new Error('Usage: supervisor.mjs run|status|stop|plist /private/config.json OR reconcile /private/config.json <jobId>');
     const config = readConfig(path.resolve(file));
     if (op === 'run') await run(config);
     else if (op === 'plist') process.stdout.write(plist(config, file));
-    else if (op === 'status') console.log(JSON.stringify(await control(config, op)));
+    else if (op === 'status' || op === 'reconcile') console.log(JSON.stringify(await control(config, op, jobId)));
     else {
       const accepted = await control(config, 'stop');
       if (accepted.state !== 'stop-requested') throw new Error('Stop was not accepted');

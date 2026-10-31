@@ -21,6 +21,11 @@ const faux = fauxProvider({ provider: 'durable-fixture', models: [{ id: 'fixture
 faux.setResponses([async () => {
   fs.appendFileSync(path.join(cwd, 'inference-started'), 'synthetic\n');
   if (process.env.SCHEDULE_FIXTURE_DELAY === '1') await new Promise(resolve => setTimeout(resolve, 1500));
+  if (process.env.SCHEDULE_FIXTURE_BLOCK === '1') {
+    const deadline = Date.now() + 10000;
+    while (!fs.existsSync(path.join(cwd, 'inference-release')) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    if (!fs.existsSync(path.join(cwd, 'inference-release'))) throw new Error('Synthetic inference gate was not released');
+  }
   return fauxAssistantMessage('DURABLE_RPC_OK');
 }]);
 const createRuntime = async ({ sessionManager, sessionStartEvent }) => {

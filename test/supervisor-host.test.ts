@@ -49,9 +49,9 @@ function start(file: string, env: NodeJS.ProcessEnv = {}) {
   let stderr = ""; child.stderr!.on("data", chunk => { stderr += chunk; });
   return { child, stderr: () => stderr };
 }
-function command(op: string, file: string) {
+function command(op: string, file: string, jobId?: string) {
   return new Promise<{ code: number | null; data: string; error: string }>(resolve => {
-    const child = spawn(process.execPath, [hostScript, op, file], { stdio: ["ignore", "pipe", "pipe"] }); children.push(child);
+    const child = spawn(process.execPath, [hostScript, op, file, ...(jobId ? [jobId] : [])], { stdio: ["ignore", "pipe", "pipe"] }); children.push(child);
     let data = "", error = ""; child.stdout!.on("data", chunk => { data += chunk; }); child.stderr!.on("data", chunk => { error += chunk; }); child.on("exit", code => resolve({ code, data, error }));
   });
 }
@@ -84,7 +84,7 @@ describe("dedicated native RPC supervisor service", () => {
     await vi.waitFor(() => expect(fs.readFileSync(path.join(h.cwd, "ui-denied"), "utf8")).toBe("true"));
     expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(false);
     const status = await command("status", h.file); expect(status.code).toBe(0);
-    expect(JSON.parse(status.data)).toMatchObject({ ready: true, active: true, jobs: 0, uiDenied: 1 });
+    expect(JSON.parse(status.data)).toMatchObject({ ready: true, active: true, jobs: 0, uiDenied: 1, jobStatusFresh: true, jobCounts: { enabled: 0, disabled: 0, disabledUnknown: 0 }, jobSummary: [] });
     const duplicate = start(h.file); await vi.waitFor(() => expect(duplicate.child.exitCode).not.toBeNull(), { timeout: 10000 });
     expect(duplicate.child.exitCode).toBe(1);
     expect(JSON.parse((await command("status", h.file)).data).ready).toBe(true);
@@ -92,6 +92,22 @@ describe("dedicated native RPC supervisor service", () => {
     await vi.waitFor(() => expect(running.child.exitCode).toBe(0), { timeout: 12000 });
     expect(JSON.parse((await command("status", h.file)).data)).toMatchObject({ active: false, state: "stopped" });
     expect(running.stderr()).not.toContain("synthetic consent");
+  }, 40000);
+  it("reads health metadata during a live turn without steering or extending the turn", async () => {
+    const h = await fixture(); h.storage.addJob({ id: "live", name: "live", type: "once", schedule: new Date(Date.now() + 3000).toISOString(), prompt: "synthetic live status check", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, durable: true, catchUp: "latest", maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
+    const running = start(h.file, { SCHEDULE_FIXTURE_BLOCK: "1" }); await ready(h, running);
+    await vi.waitFor(() => expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(true), { timeout: 10000 });
+    const status = await command("status", h.file);
+    expect(status.code, status.error).toBe(0);
+    expect(JSON.parse(status.data)).toMatchObject({ ready: true, active: true, jobStatusFresh: true, jobSummary: [{ id: "live", claim: { phase: "started", ownerAlive: true }, reconciliation: "owner-live" }] });
+    expect(fs.readFileSync(path.join(h.cwd, "inference-started"), "utf8").trim().split("\n")).toHaveLength(1);
+    fs.writeFileSync(path.join(h.cwd, "inference-release"), "ok");
+    await vi.waitFor(() => expect(h.storage.getJob("live")?.claim?.outcome).toBe("success"), { timeout: 12000 });
+    await command("stop", h.file); await vi.waitFor(() => expect(running.child.exitCode).toBe(0), { timeout: 12000 });
+    const sessionFile = fs.readdirSync(path.join(h.stateDir, "sessions")).find(name => name.endsWith(".jsonl"))!;
+    const entries = fs.readFileSync(path.join(h.stateDir, "sessions", sessionFile), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(entries.filter(entry => entry.type === "message" && entry.message?.role === "assistant")).toHaveLength(1);
+    expect(entries.some(entry => entry.type === "message" && entry.message?.customType === "schedule_host_status")).toBe(false);
   }, 40000);
   it("executes one durable custom turn with a persisted exact native receipt", async () => {
     const h = await fixture(); h.storage.addJob({ id: "once", name: "once", type: "once", schedule: new Date(Date.now() + 4000).toISOString(), prompt: "synthetic bounded check", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, durable: true, catchUp: "latest", maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
@@ -128,6 +144,15 @@ describe("dedicated native RPC supervisor service", () => {
     }, { timeout: 12000 });
     const recovered = start(h.file); await ready(h, recovered);
     expect(h.storage.getJob("crash")).toMatchObject({ enabled: false, attemptCount: 1, claim: { phase: "settled", outcome: "unknown" } });
+    const before = fs.readFileSync(h.storage.getStorePath(), "utf8");
+    const status = JSON.parse((await command("status", h.file)).data);
+    expect(status).toMatchObject({ ready: true, active: true, jobStatusFresh: true, jobCounts: { enabled: 0, disabled: 1, disabledUnknown: 1 }, jobSummary: [{ id: "crash", enabled: false, operationalState: "disabled-unknown" }], healthAlerts: [{ jobId: "crash", reason: "disabled-unknown" }] });
+    const reconciled = await command("reconcile", h.file, "crash");
+    expect(reconciled.code, reconciled.error).toBe(0);
+    expect(JSON.parse(reconciled.data)).toMatchObject({ readOnly: true, found: true, modified: false, automaticReplay: false, businessCompletion: "not-verified", job: { id: "crash", reconciliation: "unknown-needs-external-reconciliation" } });
+    expect(fs.readFileSync(h.storage.getStorePath(), "utf8")).toBe(before);
+    expect(JSON.parse((await command("status", h.file)).data).healthAlerts).toHaveLength(1);
+    expect(recovered.stderr().match(/Scheduling attention required/g)).toHaveLength(1);
     expect(fs.readFileSync(path.join(h.cwd, "inference-started"), "utf8").trim().split("\n")).toHaveLength(1);
     expect(JSON.parse((await command("stop", h.file)).data)).toMatchObject({ confirmedStopped: true });
     await vi.waitFor(() => expect(recovered.child.exitCode).toBe(0), { timeout: 12000 });
