@@ -107,6 +107,9 @@ export class CronScheduler {
   recordProgress(progress: { jobId: string; claimId: string; progress: "advanced" | "unchanged" | "unknown"; evidenceFingerprint: string; waitingReason?: string }): boolean {
     return this.durable.recordProgress(progress);
   }
+  recordScheduledInputRequired(toolCallId: string): boolean {
+    return this.durable.deferInput(toolCallId);
+  }
   onMessageEnd(message: { role: string; stopReason?: string }): void { this.durable.messageEnd(message); }
 
   stop(): void {

@@ -188,6 +188,7 @@ export class CronStorage {
       job.attemptCount = (job.attemptCount ?? job.runCount) + 1;
       job.pendingIntent = undefined;
       job.pendingEvent = undefined;
+      if (job.waitingReason === "user_input_required") job.waitingReason = undefined;
       job.claim = { id: randomUUID(), ownerId, ownerPid: process.pid, sessionId, binding: eventBinding(job), phase: "claimed", claimedAt: new Date().toISOString(), deadlineAt: new Date(Date.now() + (job.deadlineMs ?? 600000)).toISOString() };
       job.lastStatus = "unknown";
       return structuredClone(job);
@@ -233,12 +234,12 @@ export class CronStorage {
   }
 
   private applyProgress(job: CronJob, progress: ProgressOutcome | undefined, evidenceFingerprint: string | undefined, waitingReason: string | undefined): void {
+    if (waitingReason !== undefined) job.waitingReason = waitingReason;
     if (progress === undefined) return;
     if (evidenceFingerprint === undefined || !validEvidenceFingerprint(evidenceFingerprint)) return;
     if (progress === "advanced") job.noChangeCount = 0;
     if (progress === "unchanged") job.noChangeCount = (job.noChangeCount ?? 0) + 1;
     job.lastEvidenceFingerprint = evidenceFingerprint;
-    if (waitingReason !== undefined) job.waitingReason = waitingReason;
     if (job.quietOnNoChange && progress === "unchanged" && (job.noChangeCount ?? 0) >= (job.noChangeThreshold ?? 2)) {
       job.quietUntil = new Date(Date.now() + (job.quietForMs ?? 3600000)).toISOString();
       job.lastStatus = "quiet";

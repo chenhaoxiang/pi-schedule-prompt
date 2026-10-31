@@ -79,6 +79,56 @@ describe("durable intent/claim recovery", () => {
 });
 
 describe("native execution envelope", () => {
+  it("records an unattended input blocker in the exact native receipt", () => {
+    const h = fixture();
+    const scheduler = new CronScheduler(h.storage, h.pi as any, h.ctx as any);
+    h.storage.queueTime("one", "owner");
+    const job = (scheduler as any).durable.begin("one");
+    expect(job?.claim?.id).toBeDefined();
+    expect(scheduler.recordScheduledInputRequired("before-start")).toBe(false);
+    (scheduler as any).durable.started(job.claim.id);
+    expect(scheduler.recordScheduledInputRequired("question")).toBe(true);
+    (scheduler as any).durable.messageEnd({ role: "assistant", stopReason: "stop" });
+    scheduler.onAgentSettled(false);
+    expect(h.receipts[0]).toMatchObject({ outcome: "success", waitingReason: "user_input_required" });
+    expect(h.storage.getJob("one")).toMatchObject({ lastStatus: "success", waitingReason: "user_input_required" });
+  });
+
+  it("does not turn a real deadline expiry into success after an input blocker", async () => {
+    const h = fixture({ deadlineMs: 1000 });
+    h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!; h.durable.started(job.claim!.id);
+    expect(h.durable.deferInput("question")).toBe(true);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(h.ctx.abort).toHaveBeenCalledOnce();
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: false, waitingReason: "user_input_required", claim: { outcome: "unknown" } });
+    expect(h.receipts).toHaveLength(1);
+    h.durable.settled(true);
+  });
+
+  it("keeps earlier progress evidence, deduplicates input metadata and clears only the next claim input marker", () => {
+    const h = fixture({ maxRuns: 168, expiresAt: new Date(Date.now() + 86400000).toISOString() });
+    h.storage.queueTime("one", "owner"); const first = h.durable.begin("one")!; h.durable.started(first.claim!.id);
+    h.durable.recordProgress({ jobId: "one", claimId: first.claim!.id, progress: "advanced", evidenceFingerprint: "b".repeat(64) });
+    h.durable.deferInput("first-question"); h.durable.deferInput("repeated-question");
+    h.durable.messageEnd({ role: "assistant", stopReason: "stop" }); h.durable.settled(false);
+    expect(h.receipts[0]).toMatchObject({ progress: "advanced", evidenceFingerprint: "b".repeat(64), waitingReason: "user_input_required" });
+    expect(h.pi.appendEntry.mock.calls.filter(([type]) => type === "schedule_input_required")).toHaveLength(1);
+    h.storage.queueTime("one", "owner"); const second = h.durable.begin("one")!;
+    expect(second.claim?.id).not.toBe(first.claim?.id);
+    expect(second.waitingReason).toBeUndefined();
+    h.durable.started(second.claim!.id); h.durable.messageEnd({ role: "assistant", stopReason: "stop" }); h.durable.settled(false);
+    expect(h.receipts[1].waitingReason).toBeUndefined();
+    expect(h.storage.getJob("one")).toMatchObject({ attemptCount: 2, runCount: 2, maxRuns: 168, expiresAt: first.expiresAt });
+  });
+
+  it("does not use an input marker as a terminal receipt after owner loss", () => {
+    const h = fixture(); h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!; h.durable.started(job.claim!.id);
+    h.durable.deferInput("question");
+    h.storage.reconcileJob("one", "owner", "new-owner", [], () => false);
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: false, lastStatus: "unknown", attemptCount: 1, claim: { outcome: "unknown" } });
+    h.durable.stop(); h.durable.settled(true);
+  });
+
   it("persists progress metadata in the native receipt without claiming business completion", () => {
     const h = fixture({ quietOnNoChange: true, noChangeThreshold: 2, quietForMs: 60_000 });
     h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!;

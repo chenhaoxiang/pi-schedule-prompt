@@ -16,6 +16,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { startEventApi } from "./event-api.js";
 import { EVENT_REQUEST, PROGRESS_REQUEST, validEventId, validEvidenceFingerprint, validProgressOutcome } from "./events.js";
 import { classifyFollowupReply, FOLLOWUP_CANCEL_TRANSPORT_EVENT, FOLLOWUP_OBSERVED_EVENT, FOLLOWUP_SCHEDULE_EVENT, type FollowupObservation, type FollowupRecord, type FollowupScheduleRequest, followupName, followupPrompt, validateFollowupBinding, validateFollowupOptions } from "./followup.js";
+import { scheduledToolCallBlock } from "./input-guard.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
 import { CronStorage } from "./storage.js";
@@ -173,6 +174,12 @@ export default async function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event) => {
     scheduler?.setScheduledTurn(event.messageType === "custom" && event.message.customType === "scheduled_prompt");
     scheduler?.onScheduledStart(event.messageType === "custom" && event.message.customType === "scheduled_prompt" ? (event.message.details as { claimId?: string } | undefined)?.claimId : undefined);
+  });
+  pi.on("tool_call", event => {
+    const blocked = scheduledToolCallBlock(scheduler?.isScheduledTurn() ?? false, event.toolName);
+    if (!blocked) return;
+    scheduler?.recordScheduledInputRequired(event.toolCallId);
+    return blocked;
   });
   pi.on("message_end", event => { scheduler?.onMessageEnd(event.message); });
   pi.on("agent_settled", event => {
