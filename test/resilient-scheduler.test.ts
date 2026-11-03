@@ -1,0 +1,207 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { NativeCapability, NativeRunHandle, NativeRunSnapshot } from "../src/native.js";
+import { resilientDefinition } from "../src/resilient-policy.js";
+import { CronScheduler } from "../src/scheduler.js";
+import { CronStorage } from "../src/storage.js";
+import type { CronJob, NativeExecutionProof, ResilientJob, ResilientPolicy } from "../src/types.js";
+
+const directories: string[] = [];
+const schedulers: CronScheduler[] = [];
+const minute = 60_000;
+const beginning = Date.parse("2026-11-03T00:00:00.000Z");
+function seed(extra: Partial<CronJob> = {}, policy: Partial<ResilientPolicy> = {}) {
+  return resilientDefinition({ id: "job", name: "job", type: "interval", schedule: "1h", intervalMs: 60 * minute, prompt: "authorized synthetic goal", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: "owner", maxRuns: 20, expiresAt: new Date(Date.now() + 3 * 86_400_000).toISOString(), deadlineMs: 180 * minute, ...extra }, { intervalMode: "fixed-delay", workBudgetMs: 150 * minute, latenessMs: 40 * minute, ...policy });
+}
+function fixture(extra: Partial<CronJob> = {}, policy: Partial<ResilientPolicy> = {}, supported = true) {
+  const root = path.resolve("tmp/resilient-scheduler-fixtures"); fs.mkdirSync(root, { recursive: true });
+  const cwd = fs.mkdtempSync(path.join(root, "case-")); directories.push(cwd);
+  const storage = new CronStorage(cwd); const job = seed(extra, policy);
+  fs.mkdirSync(path.dirname(storage.getStorePath()), { mode: 0o700 });
+  fs.writeFileSync(storage.getStorePath(), JSON.stringify({ version: 4, jobs: [job] }), { mode: 0o600 });
+  const entries = new Map<string, any>();
+  const runs: Array<{ request: Parameters<NativeCapability["start"]>[0]; handle: NativeRunHandle; state: NativeRunSnapshot; close: (execution?: NativeExecutionProof["execution"], effectStatus?: NativeExecutionProof["effectStatus"], reason?: string, retryNotBefore?: string) => void }> = [];
+  let active: NativeRunHandle | undefined;
+  let userBusy = false;
+  let refusal: "busy" | "disposed" | "throw" | undefined;
+  const capability: NativeCapability = {
+    version: 1, get active() { return active; },
+    start: vi.fn(request => {
+      if (refusal === "throw") throw new Error("synthetic ambiguous start");
+      if (refusal) return { accepted: false, reason: refusal };
+      if (active) return { accepted: false, reason: "busy" };
+      const runId = "run-" + runs.length;
+      let resolve!: (proof: NativeExecutionProof & { reason?: string }) => void;
+      const settled = new Promise<NativeExecutionProof & { reason?: string }>(done => { resolve = done; });
+      const state: NativeRunSnapshot = { runId, binding: { ...request.binding }, phase: "running", startedAt: new Date().toISOString(), softDeadlineAt: new Date(Date.now() + request.policy.softDeadlineMs).toISOString(), hardDeadlineAt: new Date(Date.now() + request.policy.hardDeadlineMs).toISOString(), nativeClosed: false, ownedHandles: [], requestCount: 1, retryCount: 0, failedRecoveryMs: 0, providerPhase: "unknown" };
+      const handle: NativeRunHandle = {
+        runId, settled, snapshot: () => structuredClone(state),
+        checkpoint: vi.fn(declaration => {
+          const id = "checkpoint-" + runId;
+          entries.set(id, { id, type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId, binding: { ...request.binding }, declarations: declaration ?? {} } });
+          state.checkpointEntryId = id; return id;
+        }),
+        requestDrain: vi.fn(reason => { state.phase = "draining"; state.reason = reason; return true; }),
+        requestCancel: vi.fn(reason => { state.phase = "cancelling"; state.reason = reason; return true; }),
+        own: vi.fn(),
+      };
+      active = handle;
+      const close = (execution: NativeExecutionProof["execution"] = "completed", effectStatus: NativeExecutionProof["effectStatus"] = "none-observed", reason?: string, retryNotBefore?: string) => {
+        const checkpointEntryId = state.checkpointEntryId ?? handle.checkpoint();
+        const receipt: NativeExecutionProof & { reason?: string } = { version: 1, runId, binding: { ...request.binding }, finishedAt: new Date().toISOString(), execution, effectStatus, checkpointEntryId, businessOutcome: "unverified", failedRecoveryMs: 0, ...(reason ? { reason } : {}), ...(retryNotBefore ? { retryNotBefore } : {}) };
+        entries.set("receipt-" + runId, { type: "custom", customType: "pi.scheduled-receipt.v1", data: receipt });
+        state.nativeClosed = true; state.phase = "settled"; active = undefined; resolve(receipt);
+      };
+      runs.push({ request, handle, state, close });
+      return { accepted: true, handle };
+    }),
+  };
+  const ctx = { cwd, isIdle: () => !active && !userBusy, hasPendingMessages: () => false, abort: vi.fn(), hasUI: false, modelRegistry: { getAvailable: () => [] }, sessionManager: { getSessionId: () => "owner", getEntries: () => [...entries.values()], getEntry: (id: string) => entries.get(id), getSessionFile: () => path.join(cwd, "native-session.jsonl") }, ...(supported ? { scheduledExecution: capability } : {}) };
+  const pi = { sendMessage: vi.fn(), events: { emit: vi.fn() }, appendEntry: vi.fn() };
+  function newScheduler() { const scheduler = new CronScheduler(storage, pi as any, ctx as any); schedulers.push(scheduler); return scheduler; }
+  return { storage, ctx, pi, runs, capability, newScheduler, row: () => storage.getJob("job") as ResilientJob, busy: (value: boolean) => { userBusy = value; }, refuse: (value?: typeof refusal) => { refusal = value; } };
+}
+const advance = (duration: number) => vi.advanceTimersByTimeAsync(duration);
+async function flush() { for (let i = 0; i < 6; i++) await Promise.resolve(); }
+beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(beginning); });
+afterEach(() => { for (const scheduler of schedulers.splice(0)) scheduler.stop(); vi.useRealTimers(); for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
+
+describe("resilient native timer composition", () => {
+  it("refuses a missing capability before admission without disabling user intent", async () => {
+    const h = fixture({}, {}, false); h.newScheduler().start(); await advance(2 * 60 * minute);
+    expect(h.row()).toMatchObject({ enabled: true, attemptCount: 0, runtime: { slot: { kind: "idle", phase: "attention-required", reason: "runtime_unavailable" } } });
+    expect(h.pi.sendMessage).not.toHaveBeenCalled(); expect(h.runs).toHaveLength(0);
+  });
+
+  it("arms completion+interval after an eighty-minute run on a sixty-minute cadence", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start();
+    await advance(60 * minute + 1000); expect(h.runs).toHaveLength(1);
+    await advance(80 * minute); expect(h.runs).toHaveLength(1); expect(scheduler.getNextRun("job")).toBeNull();
+    h.runs[0].close(); await flush();
+    expect(scheduler.getNextRun("job")?.getTime()).toBe(Date.now() + 60 * minute);
+    await advance(60 * minute + 1000); expect(h.runs).toHaveLength(2);
+    expect(h.ctx.abort).not.toHaveBeenCalled(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("fixed-rate skips busy ticks but retains its original anchored future tick", async () => {
+    const h = fixture({}, { intervalMode: "fixed-rate" }); const scheduler = h.newScheduler(); scheduler.start();
+    await advance(60 * minute + 1000); await advance(80 * minute);
+    expect(h.runs).toHaveLength(1); expect(h.row().runtime.missedCount).toBe(1);
+    h.runs[0].close(); await flush();
+    expect(scheduler.getNextRun("job")?.getTime()).toBe(beginning + 180 * minute);
+    await advance(40 * minute); expect(h.runs).toHaveLength(2);
+  });
+
+  it("buffer-one retains the first waiting occurrence and admits only after exact closure", async () => {
+    const h = fixture({}, { intervalMode: "fixed-rate", overlapPolicy: "buffer-one" }); h.newScheduler().start();
+    await advance(60 * minute + 1000); await advance(80 * minute);
+    expect(h.row().runtime.pending?.dueAt).toBe(new Date(beginning + 120 * minute).toISOString());
+    expect(h.row().attemptCount).toBe(1); h.runs[0].close(); await flush();
+    expect(h.runs).toHaveLength(2); expect(h.row().attemptCount).toBe(2);
+  });
+
+  it("expires the first buffered intent rather than replacing it with a later busy tick", async () => {
+    const h = fixture({}, { intervalMode: "fixed-rate", overlapPolicy: "buffer-one", latenessMs: 30 * minute }); h.newScheduler().start();
+    await advance(60 * minute + 1000); await advance(140 * minute);
+    expect(h.row().runtime.pending?.dueAt).toBe(new Date(beginning + 120 * minute).toISOString());
+    h.runs[0].close(); await flush();
+    expect(h.runs).toHaveLength(1); expect(h.row().attemptCount).toBe(1); expect(h.row().runtime.pending).toBeUndefined();
+  });
+
+  it("keeps a completed unknown effect reconciling and never uses normal rearming as replay evidence", async () => {
+    const h = fixture(); h.newScheduler().start(); await advance(60 * minute + 1000);
+    h.runs[0].close("completed", "unknown"); await flush(); await advance(6 * 60 * minute);
+    expect(h.runs).toHaveLength(1); expect(h.row()).toMatchObject({ enabled: true, lastStatus: "unknown", attemptCount: 1, runtime: { slot: { kind: "idle", phase: "reconciling" } } });
+  });
+
+  it("uses persisted cooldown and Retry-After only after a proven pre-effect native deferral", async () => {
+    const h = fixture({ intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { intervalMode: "fixed-rate", workBudgetMs: 5 * minute }); const scheduler = h.newScheduler(); scheduler.start();
+    await advance(minute + 1000); const allowed = new Date(Date.now() + 3 * minute).toISOString();
+    h.runs[0].close("deferred", "none-observed", "recovery_budget_exhausted", allowed); await flush();
+    expect(h.row()).toMatchObject({ enabled: true, runtime: { slot: { phase: "backoff" }, notBefore: allowed, cooldownStep: 1 } });
+    expect(scheduler.getNextRun("job")?.getTime()).toBe(beginning + 5 * minute);
+    await advance(4 * minute); expect(h.runs).toHaveLength(2); expect(h.runs[1].request.content).toContain("Consume retained checkpoint");
+  });
+
+  it("does not postpone a persisted fixed-delay target on repeated restarts", async () => {
+    const h = fixture(); const first = h.newScheduler(); first.start(); await advance(10 * minute); const due = first.getNextRun("job")?.getTime(); first.stop();
+    const second = h.newScheduler(); second.start(); expect(second.getNextRun("job")?.getTime()).toBe(due); await advance(10 * minute); second.stop();
+    const third = h.newScheduler(); third.start(); expect(third.getNextRun("job")?.getTime()).toBe(due); await advance(40 * minute + 1000); expect(h.runs).toHaveLength(1);
+  });
+
+  it("retains cancelling ownership until native settlement, never using ctx.abort", async () => {
+    const h = fixture({}, { intervalMode: "fixed-rate" }); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    h.runs[0].handle.requestCancel("hard_deadline"); await advance(2 * 60 * minute);
+    expect(h.runs).toHaveLength(1); expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "cancelling" });
+    expect(h.ctx.abort).not.toHaveBeenCalled(); scheduler.stop(); expect(h.runs[0].handle.requestCancel).toHaveBeenCalledWith("scheduler_stopped");
+    h.runs[0].close("cancelled", "unknown", "hard_deadline"); await flush(); expect(h.row().runtime.slot).toMatchObject({ kind: "idle", phase: "reconciling" });
+  });
+
+  it("native accepted:false refunds once while an ambiguous start remains charged and owned", async () => {
+    const h = fixture(); h.refuse("busy"); h.newScheduler().start(); await advance(60 * minute + 1000);
+    expect(h.row()).toMatchObject({ attemptCount: 0, attemptHistory: [{ outcome: "not-started", charged: false }] });
+    h.refuse("throw"); await advance(1000);
+    expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { slot: { kind: "owned", phase: "attention-required", reason: "native_start_failed" } } });
+    expect(h.runs).toHaveLength(0); expect(h.ctx.abort).not.toHaveBeenCalled();
+  });
+
+  it("recovers only an exact persisted native receipt when the final store mutation was lost", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    vi.spyOn(h.storage, "settleResilient").mockImplementationOnce(() => { throw new Error("synthetic final write loss"); });
+    h.runs[0].close(); await flush(); expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required" });
+    scheduler.stop(); h.newScheduler().start(); await flush();
+    expect(h.row()).toMatchObject({ attemptCount: 1, attemptHistory: [{ outcome: "completed" }], runtime: { slot: { kind: "idle", phase: "waiting" } } });
+    expect(h.runs).toHaveLength(1);
+  });
+
+  it("does not infer execution closure from a missing native owner after reload", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000); scheduler.stop();
+    const ctx = { ...h.ctx, scheduledExecution: { ...h.capability, active: undefined } };
+    const other = new CronScheduler(h.storage, h.pi as any, ctx as any); schedulers.push(other); other.start();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed" });
+    expect(h.row().attemptCount).toBe(1); expect(h.runs).toHaveLength(1);
+  });
+
+  it("records an input wait through native checkpoint/drain without another model request", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    expect(scheduler.recordScheduledInputRequired("challenge")).toBe(true);
+    expect(h.runs[0].handle.requestDrain).toHaveBeenCalledWith("user_input_required");
+    h.runs[0].close("deferred", "none-observed", "user_input_required"); await flush();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "idle", phase: "waiting-input", reason: "user_input_required" }); expect(h.runs).toHaveLength(1);
+  });
+
+  it("updates future cadence and prompt without changing the currently accepted native policy", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    const accepted = structuredClone(h.runs[0].request);
+    h.storage.updateJob("job", { schedule: "30m", intervalMs: 30 * minute, prompt: "future synthetic goal" }, "owner");
+    scheduler.updateJob("job", h.row());
+    expect(h.runs[0].request).toEqual(accepted); expect(h.runs[0].handle.requestCancel).not.toHaveBeenCalled();
+    h.runs[0].close(); await flush();
+    expect(scheduler.getNextRun("job")?.getTime()).toBe(Date.now() + 30 * minute);
+    await advance(30 * minute + 1000); expect(h.runs).toHaveLength(2); expect(h.runs[1].request.content).toBe("future synthetic goal");
+  });
+
+  it("runs persisted timezone cron through the native capability rather than a process-local croner", async () => {
+    const h = fixture({ type: "cron", schedule: "0 0 9 * * *", intervalMs: undefined }, { intervalMode: undefined, timezone: "Asia/Shanghai" });
+    const scheduler = h.newScheduler(); scheduler.start();
+    expect(scheduler.getNextRun("job")?.toISOString()).toBe("2026-11-03T01:00:00.000Z");
+    await advance(60 * minute + 1000); expect(h.runs).toHaveLength(1); h.runs[0].close(); await flush();
+    expect(scheduler.getNextRun("job")?.toISOString()).toBe("2026-11-04T01:00:00.000Z");
+  });
+
+  it("restores at most one latest occurrence and never charges an unbounded missed backlog", async () => {
+    const h = fixture({}, { intervalMode: "fixed-rate", misfirePolicy: "latest", latenessMs: 10 * minute });
+    h.storage.setResilientEligibility("job", "owner", 1, new Date(beginning + 60 * minute).toISOString());
+    vi.setSystemTime(beginning + 5 * 60 * minute + 5 * minute); const scheduler = h.newScheduler(); scheduler.start(); await advance(1000);
+    expect(h.runs).toHaveLength(1); expect(h.row().attemptCount).toBe(1);
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", attempt: { occurrence: { source: "misfire", dueAt: new Date(beginning + 5 * 60 * minute).toISOString() } } });
+    expect(scheduler.getNextRun("job")?.getTime()).toBe(beginning + 6 * 60 * minute);
+  });
+
+  it("preserves a user stop and original bounds through exact native completion", async () => {
+    const h = fixture({ maxRuns: 1 }); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    h.storage.updateJob("job", { enabled: false }, "owner"); h.runs[0].close(); await flush(); await advance(3 * 60 * minute);
+    expect(h.row()).toMatchObject({ enabled: false, maxRuns: 1, attemptCount: 1, runtime: { slot: { kind: "idle", phase: "finished" } } }); expect(h.runs).toHaveLength(1);
+  });
+});

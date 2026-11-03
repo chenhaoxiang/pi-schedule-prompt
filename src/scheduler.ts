@@ -5,6 +5,8 @@ import { budgetPrompt, DurableExecution } from "./durable.js";
 import { dailyLimited, eventBinding, eventNames } from "./events.js";
 import { FOLLOWUP_DUE_EVENT, type FollowupDueRequest } from "./followup.js";
 import { githubFingerprint } from "./github-events.js";
+import { isResilient } from "./resilient-policy.js";
+import { ResilientScheduling } from "./resilient-scheduler.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { resolveModelRoute, runSubagentOnce } from "./subagent.js";
 import type { CronChangeEvent, CronJob, CronJobType, EventResult } from "./types.js";
@@ -37,16 +39,26 @@ export class CronScheduler {
   private generations = new Map<string, number>();
   private scheduledTurn = false;
   private durable: DurableExecution;
+  private resilient: ResilientScheduling;
 
   constructor(
     private readonly storage: CronStorage,
     private readonly pi: ExtensionAPI,
     private readonly ctx: ExtensionContext,
-  ) { this.durable = new DurableExecution(storage, pi, ctx); }
+  ) {
+    this.durable = new DurableExecution(storage, pi, ctx);
+    this.resilient = new ResilientScheduling(storage, ctx, {
+      onQueued: id => { this.pending.add(id); this.emitChange({ type: "fire", job: this.storage.getJob(id) }); this.armDrain(); },
+      onSettled: id => { this.resilient.scheduleAfterSettlement(id); this.drain(); },
+      onChange: job => this.emitChange({ type: "update", job }),
+      onError: (id, error) => this.failResilient(id, error),
+    });
+  }
 
   start(): void {
     this.stop();
     this.stopped = false;
+    this.resilient.start();
     const session = this.ctx.sessionManager.getSessionId();
     this.durable.restore();
     for (const rawJob of this.storage.getAllJobs()) {
@@ -60,6 +72,10 @@ export class CronScheduler {
         }
       }
       if (job.github && job.catchUp !== "latest") this.storage.updateJob(job.id, { sourceFingerprint: undefined });
+      if (isResilient(job)) {
+        this.resilient.schedule(job);
+        continue;
+      }
       if (job.type === "event" && job.pendingEvent) {
         if (job.enabled && job.catchUp === "latest" && job.pendingEvent.revision === (job.revision ?? 0)) this.pending.add(job.id);
         else this.storage.updateJob(job.id, { pendingEvent: undefined, lastStatus: "skipped" });
@@ -111,7 +127,7 @@ export class CronScheduler {
     return this.durable.recordProgress(progress);
   }
   recordScheduledInputRequired(toolCallId: string): boolean {
-    return this.durable.deferInput(toolCallId);
+    return this.resilient.deferInput(toolCallId) || this.durable.deferInput(toolCallId);
   }
   blockScheduledTool(toolName: string): { block: true; reason: string } | undefined {
     return this.durable.blockTool(toolName);
@@ -120,6 +136,7 @@ export class CronScheduler {
 
   stop(): void {
     this.stopped = true;
+    this.resilient.stop();
     this.durable.stop();
     for (const cron of this.jobs.values()) cron.stop();
     for (const timer of this.intervals.values()) clearTimeout(timer);
@@ -201,10 +218,11 @@ export class CronScheduler {
   }
 
   getNextRun(id: string): Date | null {
-    return this.jobs.get(id)?.nextRun() || this.nextRuns.get(id) || null;
+    return this.jobs.get(id)?.nextRun() || this.nextRuns.get(id) || this.resilient.nextRun(id) || null;
   }
 
   private scheduleJob(job: CronJob): void {
+    if (isResilient(job)) { this.resilient.schedule(job); return; }
     try {
       if (job.type === "event") {
         eventNames(job.schedule);
@@ -311,6 +329,7 @@ export class CronScheduler {
     const timer = this.intervals.get(id);
     if (timer) clearTimeout(timer);
     this.intervals.delete(id);
+    this.resilient.stopJob(id);
     this.nextRuns.delete(id);
     this.pending.delete(id);
     this.generations.set(id, (this.generations.get(id) ?? 0) + 1);
@@ -321,6 +340,7 @@ export class CronScheduler {
   }
 
   private prepareModel(job: CronJob): CronJob | undefined {
+    if (isResilient(job)) return job;
     if (!job.model || !job.enabled || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) return job;
     const resolution = resolveModelRoute(this.ctx.modelRegistry, job.model);
     if (!resolution.ok) {
@@ -343,6 +363,10 @@ export class CronScheduler {
     if (!stored?.enabled || !CronScheduler.isLoadedFor(stored, this.ctx.sessionManager.getSessionId())) return;
     const job = this.prepareModel(stored);
     if (!job) return;
+    if (isResilient(job)) {
+      if (job.runtime.slot.kind !== "idle" || !["waiting", "backoff"].includes(job.runtime.slot.phase)) return;
+      return job;
+    }
     if (job.quietOnNoChange && job.quietUntil) {
       const quietUntil = Date.parse(job.quietUntil);
       if (Number.isFinite(quietUntil) && quietUntil > Date.now()) return;
@@ -408,12 +432,19 @@ export class CronScheduler {
       return;
     }
     if (this.durable.busy()) { this.armDrain(); return; }
-    const id = [...this.pending].find(candidate => !this.activeJobs.has(candidate));
+    const id = [...this.pending].find(candidate => !this.activeJobs.has(candidate) && !this.resilient.isOwned(candidate));
     if (!id) { this.armDrain(); return; }
     this.pending.delete(id);
     let admitted = false;
+    let selected: CronJob | undefined;
     try {
       const eligible = this.eligible(id);
+      selected = eligible;
+      if (eligible && isResilient(eligible)) {
+        this.resilient.execute(id);
+        this.armDrain();
+        return;
+      }
       if (eligible?.durable && eligible.type !== "event" && !eligible.pendingIntent) this.storage.queueTime(id, this.ctx.sessionManager.getSessionId(), this.getNextRun(id)?.toISOString());
       if (eligible?.model) {
         this.executeJobInSubagent(eligible);
@@ -446,7 +477,10 @@ export class CronScheduler {
       }
     } catch (error) {
       if (!admitted && error instanceof ScheduleStoreBusyError) this.deferContention(id);
-      else { this.durable.finish("unknown"); this.fail(id, error); }
+      else {
+        if (selected && !isResilient(selected)) this.durable.finish("unknown");
+        this.fail(id, error);
+      }
     }
     this.armDrain();
   }
@@ -565,7 +599,18 @@ export class CronScheduler {
     this.pending.add(id); this.armDrain();
   }
 
+  private failResilient(id: string, error: unknown): void {
+    // Native/state failure is a disposition, not a user disable or a replay instruction.
+    this.unscheduleJob(id);
+    const text = error instanceof Error ? error.message : String(error);
+    console.error("Resilient job " + id + " held:", text);
+    this.emitChange({ type: "error", jobId: id, error: text });
+  }
+
   private fail(id: string, error: unknown): void {
+    let current: CronJob | undefined;
+    try { current = this.storage.getJob(id); } catch { /* Corrupt bytes remain untouched and visible on explicit read. */ }
+    if (current && isResilient(current)) { this.failResilient(id, error); return; }
     this.unscheduleJob(id);
     // A failed send can already have been accepted. Pause instead of blind replay.
     try { this.storage.updateJob(id, { enabled: false, lastStatus: "unknown" }); } catch { /* Preserve corrupt bytes or the other writer. */ }

@@ -257,6 +257,18 @@ export class CronStorage {
     });
   }
 
+  /** Persist timing only; no phase, admission, owner or authorization is inferred from a clock. */
+  setResilientEligibility(id: string, sessionId: string, revision: number, nextEligibleAt: string | undefined, discardPending = false): boolean {
+    if (nextEligibleAt !== undefined && !instant(nextEligibleAt)) throw new Error("Invalid resilient timing target");
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job || !isResilient(job) || job.session !== sessionId || job.revision !== revision) return false;
+      job.runtime.nextEligibleAt = nextEligibleAt;
+      if (discardPending && job.runtime.pending) { job.runtime.pending = undefined; job.runtime.missedCount++; }
+      return true;
+    });
+  }
+
   /** Atomic provisional admission. Only an explicit native refusal can uncharge this reservation. */
   reserveResilient(id: string, sessionId: string, instanceId: string, revision: number, occurrenceId: string, now = Date.now()): ResilientJob | undefined {
     if (!validEventId(instanceId)) throw new Error("Invalid native owner instance");
