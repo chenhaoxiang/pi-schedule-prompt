@@ -234,6 +234,7 @@ export class CronStorage {
       const job = store.jobs.find(item => item.id === id);
       if (!job || !isResilient(job) || job.session !== sessionId || !job.enabled || occurrence.revision !== job.revision) return { status: "ignored", reason: "disabled-or-changed" };
       const runtime = job.runtime;
+      if ((runtime.pending?.id === occurrence.id && runtime.pending.revision === occurrence.revision) || (runtime.slot.kind === "owned" && runtime.slot.attempt.occurrence.id === occurrence.id && runtime.slot.attempt.occurrence.revision === occurrence.revision) || job.attemptHistory.some(record => record.charged && record.occurrence.id === occurrence.id && record.occurrence.revision === occurrence.revision)) return { status: "duplicate" };
       if (runtime.slot.kind === "idle" && !["waiting", "backoff"].includes(runtime.slot.phase)) return { status: "ignored", reason: runtime.slot.phase };
       if ((job.expiresAt && Date.parse(job.expiresAt) <= now) || job.attemptCount! >= job.maxRuns!) {
         runtime.pending = undefined; runtime.nextEligibleAt = undefined;
@@ -265,6 +266,7 @@ export class CronStorage {
       if (requiresReconciliation(job)) return;
       const runtime = job.runtime; const pending = runtime.pending;
       if (!pending || pending.id !== occurrenceId || pending.revision !== revision || Date.parse(pending.dueAt) > now) return;
+      if (job.attemptHistory.some(record => record.charged && record.occurrence.id === pending.id && record.occurrence.revision === pending.revision)) { runtime.pending = undefined; return; }
       if (now - Date.parse(pending.dueAt) > job.policy.latenessMs) { runtime.pending = undefined; runtime.missedCount++; return; }
       const day = new Date(now).toISOString().slice(0, 10);
       if ((runtime.notBefore && Date.parse(runtime.notBefore) > now) || (job.dailyUsage && day < job.dailyUsage.day) || (job.maxRunsPerDay !== undefined && spentOnUtcDay(job, day) >= job.maxRunsPerDay)) return;
@@ -352,6 +354,10 @@ export class CronStorage {
       if (proof.binding.jobId !== id || proof.binding.attemptId !== attemptId || proof.binding.ownerEpoch !== owner.epoch || proof.binding.revision !== attempt.revision || (attempt.nativeRunId && proof.runId !== attempt.nativeRunId) || proof.binding.ownerSessionId !== (attempt.nativeSessionId ?? owner.sessionId)) return false;
       if (disposition.phase === "waiting" && proof.execution !== "completed") throw new Error("Interrupted work cannot be silently rearmed as a fresh occurrence");
       if (disposition.phase === "backoff" && (proof.execution !== "deferred" || proof.effectStatus !== "none-observed" || !disposition.notBefore)) throw new Error("Only known pre-effect deferral can automatically back off");
+      const effectUnknown = proof.effectStatus === "unknown";
+      const effectivePhase: ResilientIdlePhase = effectUnknown && ["waiting", "backoff", "finished"].includes(disposition.phase) ? "reconciling" : disposition.phase;
+      const effectiveReason = effectUnknown && effectivePhase === "reconciling" ? "effect_unknown" : disposition.reason;
+      if (effectUnknown && disposition.phase === "backoff") throw new Error("Unknown effect cannot use automatic cooldown before reconciliation");
       const record: AttemptRecord = {
         charged: true, id: attempt.id, revision: attempt.revision, owner: { ...attempt.owner }, occurrence: { ...attempt.occurrence },
         admittedAt: attempt.admittedAt, closedAt: proof.finishedAt, outcome: proof.execution,
@@ -360,15 +366,45 @@ export class CronStorage {
       };
       job.attemptHistory.push(record);
       job.runtime.lastFinishedAt = proof.finishedAt;
-      job.runtime.slot = { kind: "idle", phase: disposition.phase, ...(disposition.reason ? { reason: disposition.reason } : {}) };
-      job.runtime.notBefore = disposition.notBefore; job.runtime.nextEligibleAt = disposition.nextEligibleAt;
-      if (proof.execution !== "completed" || ["reconciling", "waiting-input", "attention-required"].includes(disposition.phase)) {
+      job.runtime.slot = { kind: "idle", phase: effectivePhase, ...(effectiveReason ? { reason: effectiveReason } : {}) };
+      job.runtime.notBefore = effectivePhase === "reconciling" ? undefined : disposition.notBefore; job.runtime.nextEligibleAt = effectivePhase === "reconciling" ? undefined : disposition.nextEligibleAt;
+      if (proof.execution !== "completed" || effectUnknown || ["reconciling", "waiting-input", "attention-required"].includes(effectivePhase)) {
         job.runtime.pending = undefined;
         job.runtime.continuation = { attemptId, checkpoint: structuredClone(checkpoint) };
       } else { job.runtime.continuation = undefined; job.runtime.cooldownStep = 0; }
-      if (disposition.phase === "backoff") job.runtime.cooldownStep = Math.min(5, job.runtime.cooldownStep + 1);
+      if (effectivePhase === "backoff") job.runtime.cooldownStep = Math.min(5, job.runtime.cooldownStep + 1);
       job.runCount += proof.execution === "completed" ? 1 : 0;
-      job.lastStatus = proof.execution === "completed" ? "success" : proof.execution === "failed" ? "error" : "unknown";
+      job.lastStatus = effectUnknown ? "unknown" : proof.execution === "completed" ? "success" : proof.execution === "failed" ? "error" : "unknown";
+      return true;
+    });
+  }
+
+  /** Exact owner evidence is the only transition out of an unknown-effect barrier. */
+  reconcileResilientAttempt(id: string, sessionId: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): boolean {
+    if (!validEvidenceFingerprint(evidenceFingerprint) || !Array.isArray(safeScopes) || safeScopes.length > 32 || !safeScopes.every(scope => validEventId(scope))) throw new Error("Reconciliation requires bounded SHA-256 evidence and safe scopes");
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind === "owned") return false;
+      const record = job.attemptHistory.find(item => item.id === attemptId);
+      if (record?.effectStatus !== "unknown" || !record.checkpoint || !record.nativeProof || !record.charged) return false;
+      const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint);
+      if (prior) {
+        if (prior.disposition !== disposition || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution");
+        return false;
+      }
+      const resolution = { attemptId, evidenceFingerprint, at: new Date().toISOString(), disposition, checkpoint: structuredClone(record.checkpoint), ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}) };
+      job.attemptResolutions.push(resolution);
+      if (disposition === "continue") {
+        job.runtime.continuation = { attemptId, checkpoint: structuredClone(record.checkpoint), evidenceFingerprint };
+        const blocked = requiresReconciliation(job);
+        const exhausted = !job.enabled || Date.parse(job.expiresAt!) <= Date.now() || job.attemptCount! >= job.maxRuns!;
+        job.runtime.slot = { kind: "idle", phase: blocked ? "reconciling" : exhausted ? "finished" : "waiting", reason: blocked ? "scope_or_effect_unresolved" : exhausted ? "authorization_bound" : "reconciled" };
+        job.runtime.nextEligibleAt = undefined; job.runtime.notBefore = undefined;
+      } else if (disposition === "waiting-input") {
+        job.runtime.slot = { kind: "idle", phase: "waiting-input", reason: "reconciled_waiting_input" };
+      } else {
+        job.runtime.slot = { kind: "idle", phase: "reconciling", reason: "effect_unknown" };
+      }
       return true;
     });
   }

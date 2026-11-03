@@ -97,6 +97,7 @@ export interface AttemptResolution {
   evidenceFingerprint: string;
   at: string;
   disposition: "continue" | "waiting-input" | "unknown" | "native-closure";
+  checkpoint?: NativeCheckpointReference;
   safeScopes?: string[];
 }
 export interface StoreMigration {

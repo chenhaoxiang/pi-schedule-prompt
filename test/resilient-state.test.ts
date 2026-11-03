@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { inheritLegacyBudget } from "../src/legacy-lineage.js";
-import { resilientDefinition, validateResilientJob } from "../src/resilient-policy.js";
+import { requiresReconciliation, resilientDefinition, validateResilientJob } from "../src/resilient-policy.js";
 import { CronStorage } from "../src/storage.js";
 import type { CronJob, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, ResilientPolicy, TimedOccurrence } from "../src/types.js";
 
@@ -103,6 +103,68 @@ describe("versioned resilient store and exact ownership", () => {
     expect(() => h.storage.setResilientDisposition("job", "owner", { phase: "waiting" })).toThrow(/Reconciliation/);
     expect(h.storage.queueResilient("job", "owner", occurrence(original, "next")).status).toBe("ignored");
     expect(h.storage.getJob("job")?.attemptHistory).toEqual(original.attemptHistory);
+  });
+
+  it("does not serially replay an already charged occurrence after its native owner closes", () => {
+    const h = fixture(); const first = reserve(h.storage); const completed = evidence(h.storage, first.attempt);
+    h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, completed.proof, completed.checkpoint, { phase: "waiting" });
+    expect(h.storage.queueResilient("job", "owner", first.attempt.occurrence).status).toBe("duplicate");
+    expect(h.storage.reserveResilient("job", "owner", "stale-timer", 1, first.attempt.occurrence.id)).toBeUndefined();
+    expect(h.storage.getJob("job")?.attemptCount).toBe(1);
+  });
+
+  it("keeps a completed native proof with unknown effects in reconciling until exact evidence resolves it", () => {
+    const h = fixture(); const { attempt } = reserve(h.storage); const unknown = evidence(h.storage, attempt, "completed", "unknown");
+    expect(h.storage.settleResilient("job", attempt.id, attempt.owner, unknown.proof, unknown.checkpoint, { phase: "waiting" })).toBe(true);
+    let row = h.storage.getJob("job") as ResilientJob;
+    expect(row).toMatchObject({ lastStatus: "unknown", runtime: { slot: { kind: "idle", phase: "reconciling", reason: "effect_unknown" }, continuation: { attemptId: attempt.id } }, attemptHistory: [{ outcome: "completed", effectStatus: "unknown" }] });
+    const next = { ...occurrence(row, "next"), dueAt: new Date().toISOString() };
+    expect(h.storage.queueResilient("job", "owner", next).status).toBe("ignored");
+    const erasedPointer = structuredClone(row); erasedPointer.runtime.continuation = undefined;
+    expect(requiresReconciliation(erasedPointer)).toBe(true);
+    expect(h.storage.reconcileResilientAttempt("job", "owner", attempt.id, "a".repeat(64), "continue", ["read-only-scope"])).toBe(true);
+    row = h.storage.getJob("job") as ResilientJob;
+    expect(row.runtime.slot.phase).toBe("reconciling"); expect(requiresReconciliation(row)).toBe(true);
+    expect(h.storage.queueResilient("job", "owner", next).status).toBe("ignored");
+    expect(h.storage.reconcileResilientAttempt("job", "owner", attempt.id, "b".repeat(64), "continue")).toBe(true);
+    row = h.storage.getJob("job") as ResilientJob;
+    expect(row.runtime.continuation).toMatchObject({ attemptId: attempt.id, checkpoint: unknown.checkpoint, evidenceFingerprint: "b".repeat(64) });
+    expect(row.runtime.slot).toMatchObject({ kind: "idle", phase: "waiting" }); expect(requiresReconciliation(row)).toBe(false);
+    expect(h.storage.queueResilient("job", "owner", next).status).toBe("queued");
+  });
+
+  it("does not use evidence for an older attempt to release a currently owned attempt or restore older good evidence", () => {
+    const h = fixture(); const first = reserve(h.storage); const unknown = evidence(h.storage, first.attempt, "completed", "unknown");
+    h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, unknown.proof, unknown.checkpoint, { phase: "waiting" });
+    h.storage.reconcileResilientAttempt("job", "owner", first.attempt.id, "a".repeat(64), "continue");
+    h.storage.reconcileResilientAttempt("job", "owner", first.attempt.id, "b".repeat(64), "unknown");
+    let row = h.storage.getJob("job") as ResilientJob;
+    expect(requiresReconciliation(row)).toBe(true); expect(row.runtime.slot.phase).toBe("reconciling");
+    h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, unknown.proof, unknown.checkpoint, { phase: "waiting" });
+    row = h.storage.getJob("job") as ResilientJob; expect(requiresReconciliation(row)).toBe(true);
+    h.storage.reconcileResilientAttempt("job", "owner", first.attempt.id, "c".repeat(64), "continue");
+    const second = reserve(h.storage, "job", "new-instance");
+    expect(h.storage.reconcileResilientAttempt("job", "owner", first.attempt.id, "d".repeat(64), "unknown")).toBe(false);
+    expect((h.storage.getJob("job") as ResilientJob).runtime.slot).toMatchObject({ kind: "owned", attempt: { id: second.attempt.id } });
+  });
+
+  it("effect resolution preserves a user stop and the immutable unknown record", () => {
+    const h = fixture(); const first = reserve(h.storage); const unknown = evidence(h.storage, first.attempt, "completed", "unknown");
+    h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, unknown.proof, unknown.checkpoint, { phase: "waiting" });
+    const history = h.storage.getJob("job")!.attemptHistory;
+    h.storage.updateJob("job", { enabled: false }, "owner");
+    h.storage.reconcileResilientAttempt("job", "owner", first.attempt.id, "a".repeat(64), "continue");
+    const row = h.storage.getJob("job") as ResilientJob;
+    expect(row.enabled).toBe(false); expect(row.runtime.slot.phase).toBe("finished"); expect(row.attemptHistory).toEqual(history);
+    expect(h.storage.queueResilient("job", "owner", occurrence(row, "next")).status).toBe("ignored");
+  });
+
+  it("allows a completed native proof with no observed effects to rearm normally", () => {
+    const h = fixture(); const { attempt } = reserve(h.storage); const clean = evidence(h.storage, attempt, "completed", "none-observed");
+    expect(h.storage.settleResilient("job", attempt.id, attempt.owner, clean.proof, clean.checkpoint, { phase: "waiting" })).toBe(true);
+    const row = h.storage.getJob("job") as ResilientJob;
+    expect(row.runtime.continuation).toBeUndefined(); expect(row.runtime.slot).toMatchObject({ kind: "idle", phase: "waiting" });
+    expect(h.storage.queueResilient("job", "owner", { ...occurrence(row, "next"), dueAt: new Date().toISOString() }).status).toBe("queued");
   });
 
   it("accepts exact closure once, retains late evidence and cannot settle a newer epoch", () => {

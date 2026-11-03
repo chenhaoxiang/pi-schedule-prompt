@@ -1,6 +1,6 @@
 import { Cron } from "croner";
 import { validEventId, validEvidenceFingerprint } from "./events.js";
-import type { AttemptOwner, AttemptRecord, CronJob, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, ResilientPolicy, TimedOccurrence } from "./types.js";
+import type { AttemptOwner, AttemptRecord, AttemptResolution, CronJob, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, ResilientPolicy, TimedOccurrence } from "./types.js";
 
 const idlePhases = new Set(["waiting", "backoff", "reconciling", "waiting-input", "attention-required", "finished"]);
 const ownedPhases = new Set(["running", "draining", "cancelling", "attention-required"]);
@@ -56,15 +56,36 @@ export function spentOnUtcDay(job: ResilientJob, day: string): number {
   return (job.runtime.baselineDailyUsage?.day === day ? job.runtime.baselineDailyUsage.attempts : 0) + job.attemptHistory.filter(record => record.charged && record.admittedAt.slice(0, 10) === day).length + (active?.admittedAt.slice(0, 10) === day ? 1 : 0);
 }
 
-/** Execution closure is not effect reconciliation; only known pre-effect deferral or exact owner evidence can continue. */
+export function sameCheckpointReference(a: NativeCheckpointReference | undefined, b: NativeCheckpointReference | undefined): boolean {
+  return !!a && !!b && a.sessionId === b.sessionId && a.entryId === b.entryId && a.runId === b.runId && a.sessionFile === b.sessionFile;
+}
+
+function latestEffectResolution(job: ResilientJob, attemptId: string | undefined): AttemptResolution | undefined {
+  for (let index = job.attemptResolutions.length - 1; index >= 0; index--) {
+    const item = job.attemptResolutions[index];
+    if (item.attemptId === attemptId && item.disposition !== "native-closure") return item;
+  }
+  return undefined;
+}
+
+/** Execution closure is not effect reconciliation; immutable UNKNOWN, not a caller's waiting projection, owns the barrier. */
 export function requiresReconciliation(job: ResilientJob): boolean {
   const old = job.runtime.legacyUncertainty;
-  if (old && (!old.claimId || !job.attemptResolutions.some(item => item.attemptId === old.claimId && item.disposition === "continue"))) return true;
+  if (old) {
+    const latest = latestEffectResolution(job, old.claimId);
+    if (!old.claimId || latest?.disposition !== "continue" || latest.safeScopes?.length) return true;
+  }
+  for (const record of job.attemptHistory) {
+    if (record.effectStatus !== "unknown") continue;
+    const latest = latestEffectResolution(job, record.id);
+    if (latest?.disposition !== "continue" || latest.safeScopes?.length || !sameCheckpointReference(latest.checkpoint, record.checkpoint)) return true;
+  }
   const continuation = job.runtime.continuation;
   if (!continuation) return false;
   const record = job.attemptHistory.find(item => item.id === continuation.attemptId);
   if (record?.outcome === "deferred" && record.effectStatus === "none-observed") return false;
-  return !job.attemptResolutions.some(item => item.attemptId === continuation.attemptId && item.disposition === "continue" && item.evidenceFingerprint === continuation.evidenceFingerprint);
+  const latest = latestEffectResolution(job, continuation.attemptId);
+  return latest?.disposition !== "continue" || !!latest.safeScopes?.length || latest.evidenceFingerprint !== continuation.evidenceFingerprint || !sameCheckpointReference(latest.checkpoint, continuation.checkpoint);
 }
 
 function validateOwner(owner: AttemptOwner): void {
@@ -157,6 +178,9 @@ export function validateResilientJob(job: CronJob, storeVersion: number): void {
   for (const resolution of value.attemptResolutions) {
     const legacy = value.claim?.phase === "settled" && value.claim.id === resolution.attemptId;
     if ((!ids.has(resolution.attemptId) && !legacy) || !validEvidenceFingerprint(resolution.evidenceFingerprint) || !instant(resolution.at) || !["continue", "waiting-input", "unknown", "native-closure"].includes(resolution.disposition) || (resolution.safeScopes !== undefined && (!Array.isArray(resolution.safeScopes) || resolution.safeScopes.length > 32 || !resolution.safeScopes.every(scope => validEventId(scope))))) throw new Error("Invalid exact-attempt reconciliation");
+    const resolvedRecord = value.attemptHistory.find(item => item.id === resolution.attemptId);
+    if (resolvedRecord && resolution.disposition === "continue" && !sameCheckpointReference(resolution.checkpoint, resolvedRecord.checkpoint)) throw new Error("Resolution must bind the exact retained native checkpoint");
+    if (resolution.checkpoint !== undefined && (!resolvedRecord?.checkpoint || !sameCheckpointReference(resolution.checkpoint, resolvedRecord.checkpoint))) throw new Error("Reconciliation evidence references a different checkpoint");
     const key = resolution.attemptId + ":" + resolution.evidenceFingerprint;
     if (resolutionKeys.has(key)) throw new Error("Duplicate reconciliation evidence"); resolutionKeys.add(key);
   }
