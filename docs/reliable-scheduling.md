@@ -28,6 +28,20 @@ The foundation used a version-1 local store. Stage C reads version1/2 and writes
 
 This is a cooperating same-user local process boundary. It does not promise NFS safety, adversarial symlink isolation, crash-atomic external effects or exactly-once inference. Shared/unbound schedules retain explicit broadcast behavior; session-bound is the safe default. Paused definitions survive reload and shutdown; explicit cleanup remains available.
 
+## Schema4 resilient state and ownership
+
+The successor `resilient-serial-scheduling` source contract adds an explicit `policy.mode: "resilient"` for finite, session-bound recurring timed jobs. Missing policy or `mode: "legacy"` keeps the preceding behavior. Reading legacy state never invents completion-delay defaults, enables an UNKNOWN job or upgrades the file format. Normal legacy writes remain schema3; an already upgraded schema4 file is never downgraded. One-shot/event/broadcast/reply-follow-up records keep their declared legacy contracts.
+
+For a resilient job, `enabled` is the user's intent. `runtime.slot` separately distinguishes idle waiting/backoff/reconciling/waiting-input/attention/finished from owned running/draining/cancelling/attention. An owned slot contains the unique attempt, owning session/instance/epoch, accepted revision/occurrence and frozen execution budgets. A config update affects future work, not that attempt. No expiry, PID absence, cancellation request, status refresh or older-epoch receipt releases the owned slot. Two real local processes race the same existing exclusive store lock; other logical jobs are not globally excluded by that storage claim.
+
+`attemptHistory` finalizes only against exact native closure metadata and keeps actual result/checkpoint references plus `businessOutcome: "unverified"`. Later closure/reconciliation evidence is appended to `attemptResolutions`, never used to rewrite an old UNKNOWN record or settle a newer owner. Generic updates cannot overwrite histories, spending or owner state. Removal disables future work while retaining live ownership and execution evidence.
+
+Lifetime and UTC-day spending are the preserved legacy baseline plus charged new attempts/current ownership. Skipped ticks, model-request retries and read-only probes are not additional admitted attempts. Only an explicit native pre-execution refusal can refund its one provisional reservation; timeout/throw/UNKNOWN cannot. Proven legacy resume chains are mapped by their exact predecessor/claim/recovery marker and inherited limits. Their original rows stay intact, daily counters are not summed twice, and a changed/cyclic/ambiguous lineage fails instead of replenishing budget.
+
+Uncertain legacy import is sticky `runtime.legacyUncertainty`, independent of display status. A missing native capability, an enable toggle or a stop/finished projection cannot clear it. A retained exact checkpoint is required for continuation; unknown effects remain reconciling until owner evidence permits continuation. Native runtime completion is still not business acceptance or a generic external exactly-once guarantee.
+
+These are source/fixture semantics within the single owner Change, not proof of installation, loaded capabilities or live migration. Timer/native-consumer/UI integration and packed/runtime acceptance must satisfy that Change before activating resilient work.
+
 ## Composition
 
 Intercom owns peer messaging and explicit wake requests. Subagents owns independent delegated workflow execution, schedules and mission recovery. Messenger owns Crew dependencies where already adopted. This fork does not clone their records or interpret observations as permission. Future event/daemon work must earn its scope and use these existing public interfaces. No raw prompt is sent to Vista; cron:change is a local observational event, not a public sanitized protocol.

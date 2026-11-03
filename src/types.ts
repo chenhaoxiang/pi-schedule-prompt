@@ -8,6 +8,105 @@ const StringEnum = <T extends string>(values: T[], options?: { description?: str
  */
 export type CronJobType = "cron" | "once" | "interval" | "event";
 
+export type IntervalMode = "fixed-delay" | "fixed-rate";
+export type ResilientPolicy = {
+  mode: "resilient";
+  version: 1;
+  intervalMode?: IntervalMode;
+  timezone?: string;
+  anchorAt: string;
+  overlapPolicy: "skip" | "buffer-one";
+  misfirePolicy: "skip" | "latest";
+  latenessMs: number;
+  workBudgetMs: number;
+};
+export type ExecutionPolicy = { mode: "legacy" } | ResilientPolicy;
+export interface TimedOccurrence { id: string; dueAt: string; revision: number; source: "timer" | "overlap" | "misfire" | "continuation"; }
+export interface AttemptOwner { sessionId: string; instanceId: string; epoch: number; }
+export interface NativeCheckpointReference { sessionId: string; entryId: string; runId: string; sessionFile?: string; }
+export interface OwnedAttempt {
+  id: string;
+  revision: number;
+  owner: AttemptOwner;
+  occurrence: TimedOccurrence;
+  admittedAt: string;
+  deadlineMs: number;
+  workBudgetMs: number;
+  /** Accepted explicit-model route, if any; later definition edits do not change this attempt. */
+  model?: string;
+  nativeSessionId?: string;
+  nativeRunId?: string;
+  nativeStartedAt?: string;
+  nativeDeadlineAt?: string;
+  checkpoint?: NativeCheckpointReference;
+}
+export type ResilientIdlePhase = "waiting" | "backoff" | "reconciling" | "waiting-input" | "attention-required" | "finished";
+export type ResilientSlot =
+  | { kind: "idle"; phase: ResilientIdlePhase; reason?: string }
+  | { kind: "owned"; phase: "running" | "draining" | "cancelling" | "attention-required"; attempt: OwnedAttempt; reason?: string };
+export interface ResilientRuntime {
+  /** Preserved pre-schema4 spending, never replenished by recovery or ownership transfer. */
+  baselineAttempts: number;
+  baselineDailyUsage?: { day: string; attempts: number };
+  /** Preserved uncertainty is not cleared by a status/UI/enable update. */
+  legacyUncertainty?: { status: "unknown" | "aborted"; claimId?: string };
+  slot: ResilientSlot;
+  ownerEpoch: number;
+  missedCount: number;
+  cooldownStep: number;
+  pending?: TimedOccurrence;
+  lastFinishedAt?: string;
+  nextEligibleAt?: string;
+  notBefore?: string;
+  continuation?: { attemptId: string; checkpoint: NativeCheckpointReference; evidenceFingerprint?: string };
+}
+export type NativeExecutionOutcome = "completed" | "failed" | "deferred" | "cancelled" | "interrupted";
+/** Forward-typed public Pi v1 metadata; never a model-supplied settlement or a second protocol. */
+export interface NativeExecutionProof {
+  version: 1;
+  runId: string;
+  binding: { jobId: string; attemptId: string; ownerSessionId: string; ownerEpoch: number; revision: number };
+  finishedAt: string;
+  execution: NativeExecutionOutcome;
+  checkpointEntryId: string;
+  effectStatus: "none-observed" | "unknown";
+  businessOutcome: "unverified";
+  failedRecoveryMs: number;
+  retryNotBefore?: string;
+}
+/** Final records are immutable; later evidence is appended to attemptResolutions instead. */
+export interface AttemptRecord {
+  /** False only for a proven native refusal before execution, or an imported legacy record already counted in the baseline. */
+  charged: boolean;
+  id: string;
+  revision: number;
+  owner: AttemptOwner;
+  occurrence: TimedOccurrence;
+  admittedAt: string;
+  closedAt: string;
+  outcome: NativeExecutionOutcome | "unknown" | "not-started";
+  model?: string;
+  reason?: string;
+  nativeProof?: NativeExecutionProof;
+  checkpoint?: NativeCheckpointReference;
+  effectStatus: "none-observed" | "unknown";
+  businessOutcome: "unverified";
+}
+export interface AttemptResolution {
+  attemptId: string;
+  evidenceFingerprint: string;
+  at: string;
+  disposition: "continue" | "waiting-input" | "unknown" | "native-closure";
+  safeScopes?: string[];
+}
+export interface StoreMigration {
+  fromVersion: 1 | 2 | 3;
+  at: string;
+  originalSha256: string;
+  backupRef: string;
+}
+
+
 export interface GithubTrigger { repo: string; kind: "pull-request" | "workflow"; number?: number; branch?: string; pollSeconds?: number; }
 export interface PendingEvent { revision: number; binding: string; keys: string[]; acceptedAt: string; evidenceFingerprint?: string; }
 export type EventResult = { status: "queued" | "duplicate" | "ignored"; reason?: string };
@@ -81,8 +180,15 @@ export interface CronJob {
   schedule: string;
   /** The prompt to execute */
   prompt: string;
-  /** Whether the job is enabled */
+  /** User enablement intent for resilient jobs; legacy jobs retain their historical automatic-disable behavior. */
   enabled: boolean;
+  /** Absence means legacy behavior. Incompatible resilient state is schema4 only. */
+  policy?: ExecutionPolicy;
+  runtime?: ResilientRuntime;
+  attemptHistory?: AttemptRecord[];
+  attemptResolutions?: AttemptResolution[];
+  /** Proven legacy predecessor identities; original jobs/UNKNOWN claims remain retained. */
+  legacyLineage?: string[];
   /** Type of job */
   type: CronJobType;
   /** Interval in milliseconds (for interval type) */
@@ -157,7 +263,10 @@ export interface CronJob {
 export interface CronStore {
   jobs: CronJob[];
   version: number;
+  migration?: StoreMigration;
 }
+
+export type ResilientJob = CronJob & { policy: ResilientPolicy; runtime: ResilientRuntime; attemptHistory: AttemptRecord[]; attemptResolutions: AttemptResolution[] };
 
 /**
  * Tool result details for LLM context
