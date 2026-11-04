@@ -90,7 +90,7 @@ export function createCronTool(
         switch (action) {
           case "preview": {
             const preview = storage.previewSchema4Migration();
-            return { content: [{ type: "text", text: "Read-only schema4 preview. This is not runtime quiescence, effect reconciliation or execution authorization.\n" + JSON.stringify(preview) }], details };
+            return { content: [{ type: "text", text: "Read-only schema4 preview. This is not runtime quiescence, effect reconciliation or execution authorization.\n" + JSON.stringify({ ...preview, legacyReaderRollback: storage.assessSchemaRollback([1, 2, 3]) }) }], details };
           }
           case "status": {
             const all = storage.getAllJobs().filter(job => CronScheduler.isLoadedFor(job, ctx.sessionManager.getSessionId()));

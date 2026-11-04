@@ -105,6 +105,19 @@ export interface Schema4MigrationRequest {
   inspectRuntime: (jobId?: string) => MigrationRuntimeReadback;
 }
 export interface Schema4MigrationResult { job: ResilientJob; changed: boolean; backupPath?: string; preview: Schema4MigrationPreview; }
+export interface SchemaRollbackAssessment {
+  currentVersion: number;
+  acceptedVersions: number[];
+  currentSha256: string;
+  formatCompatible: boolean;
+  action: "retain-current-bytes" | "hold-incompatible-software-rollback";
+  backupRestorationAllowed: false;
+  runtimeQuiescence: "not-verified";
+  ownedResources: number;
+  retainedNativeAttempts: number;
+  retainedUnknown: number;
+  reason: string;
+}
 
 export class ScheduleStoreBusyError extends Error {
   constructor() { super("Schedule store is busy (lock exists); retry after the owning writer finishes"); }
@@ -142,6 +155,22 @@ export class CronStorage {
       sourceVersion: store.version as 1 | 2 | 3 | 4, targetVersion: 4,
       originalSha256: createHash("sha256").update(raw).digest("hex"), storePath: this.storePath,
       jobs: store.jobs.map(job => ({ id: job.id, name: job.name, eligible: ["cron", "interval"].includes(job.type), ...(job.type === "cron" || job.type === "interval" ? {} : { reason: "only recurring timed jobs migrate" }), enabled: job.enabled, unknown: ["unknown", "running", "dispatched"].includes(job.lastStatus ?? "") || ["unknown", "aborted"].includes(job.claim?.outcome ?? ""), attempts: job.attemptCount ?? job.runCount })),
+    };
+  }
+
+  /** Pure rollback/reader-format assessment. It never treats an old backup as the current state. */
+  assessSchemaRollback(acceptedVersions: readonly number[] = [1, 2, 3]): SchemaRollbackAssessment {
+    if (!acceptedVersions.length || acceptedVersions.some(version => ![1, 2, 3, 4].includes(version)) || new Set(acceptedVersions).size !== acceptedVersions.length) throw new Error("Rollback requires an explicit supported reader schema set");
+    const bytes = fs.existsSync(this.storePath) ? fs.readFileSync(this.storePath) : Buffer.from(JSON.stringify({ version: 1, jobs: [] }));
+    const store: unknown = JSON.parse(bytes.toString("utf8")); validate(store);
+    const formatCompatible = acceptedVersions.includes(store.version);
+    return {
+      currentVersion: store.version, acceptedVersions: [...acceptedVersions], currentSha256: createHash("sha256").update(bytes).digest("hex"), formatCompatible,
+      action: formatCompatible ? "retain-current-bytes" : "hold-incompatible-software-rollback", backupRestorationAllowed: false, runtimeQuiescence: "not-verified",
+      ownedResources: store.jobs.filter(job => (job.claim && job.claim.phase !== "settled") || (isResilient(job) && job.runtime.slot.kind === "owned")).length,
+      retainedNativeAttempts: store.jobs.reduce((count, job) => count + (isResilient(job) ? job.attemptHistory.length : 0), 0),
+      retainedUnknown: store.jobs.filter(job => job.lastStatus === "unknown" || ["unknown", "aborted"].includes(job.claim?.outcome ?? "") || (isResilient(job) && requiresReconciliation(job))).length,
+      reason: formatCompatible ? "Reader format is supported; retain current bytes and verify actual loaded capability/writer quiescence separately. This is not software/runtime or business acceptance." : "Target reader rejects the current schema. Keep the schema4-capable runtime (or a separately verified conversion preserving every new attempt/ACK/intent); do not restore an older backup over current activity. Format age, PID absence and backup existence are not closure evidence.",
     };
   }
 

@@ -95,6 +95,22 @@ describe("pure preview and explicit private schema4 migration", () => {
     expect(h.storage.getJob("live")?.attemptCount).toBe(1);
   });
 
+  it("assesses pre-migration reader compatibility without rewriting original bytes or claiming runtime quiescence", () => {
+    const h = fixture(); const bytes = fs.readFileSync(h.storage.getStorePath());
+    expect(h.storage.assessSchemaRollback([1, 2, 3])).toMatchObject({ currentVersion: 3, formatCompatible: true, action: "retain-current-bytes", backupRestorationAllowed: false, runtimeQuiescence: "not-verified", retainedUnknown: 1 });
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(bytes); expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toEqual(["schedule-prompts.json"]);
+  });
+
+  it("holds an incompatible rollback after migration/activity instead of restoring a stale backup over ownership or UNKNOWN", () => {
+    const h = fixture([legacy({ enabled: true, lastStatus: undefined, attemptCount: 0, runCount: 0, dailyUsage: undefined })]); const migrated = h.storage.migrateJobToSchema4("legacy", "owner", request(h.storage)); const backup = fs.readFileSync(migrated.backupPath!);
+    h.storage.queueResilient("legacy", "owner", { id: "post-migration-tick", revision: migrated.job.revision!, dueAt: new Date().toISOString(), source: "timer" });
+    const active = h.storage.reserveResilient("legacy", "owner", "new-owner", migrated.job.revision!, "post-migration-tick")!; const bytes = fs.readFileSync(h.storage.getStorePath());
+    expect(h.storage.assessSchemaRollback([1, 2, 3])).toMatchObject({ currentVersion: 4, formatCompatible: false, action: "hold-incompatible-software-rollback", backupRestorationAllowed: false, ownedResources: 1 });
+    expect(h.storage.assessSchemaRollback([4])).toMatchObject({ formatCompatible: true, action: "retain-current-bytes", runtimeQuiescence: "not-verified" });
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(bytes); expect(fs.readFileSync(migrated.backupPath!)).toEqual(backup); expect((h.storage.getJob("legacy") as ResilientJob).runtime.slot).toEqual(active.runtime.slot);
+    expect(() => h.storage.assessSchemaRollback([3, 3])).toThrow(/explicit supported/); expect(fs.readFileSync(h.storage.getStorePath())).toEqual(bytes);
+  });
+
   it("a conflicting writer, malformed input or changed policy never overwrites retained bytes", () => {
     const h = fixture(); const req = request(h.storage); fs.writeFileSync(h.storage.getStorePath() + ".lock", "owned by another writer");
     const bytes = fs.readFileSync(h.storage.getStorePath());
