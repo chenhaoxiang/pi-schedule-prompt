@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.13 (2026-11-04)
+- Declare the imported Pi SDK packages and typebox as wildcard host peers; keep exact typebox only in development dependencies, not the fixed runtime payload.
+- Bind fixed installations to the selected host's actual resolved typebox package (hoisted or nested), validate its declared name/version and exact path, and reject independent replacement copies or changed reuse bindings.
+- Remove the host-provided dependency warning without suppressing diagnostics or changing scheduling/runtime behavior; preserve canonical Pi1.3/1.4/1.5 support and existing immutable installations.
+
 ### Maintained fork 0.4.1-fork.12 (2026-11-04; source candidate, release/install acceptance separate)
 - Add explicit resilient recurrence with native v1 capability negotiation, exact serial attempt ownership and run-scoped work/recovery/hard budgets; preserve legacy scheduling when no resilient mode is selected.
 - Separate fixed-delay/fixed-rate cadence, cron timezone, overlap and misfire policies from execution deadlines, with bounded pending work and preserved lifetime/daily/expiry limits.
