@@ -4,7 +4,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
-import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -17,9 +16,10 @@ const home = path.join(root, 'home'); const agentDir = path.join(root, 'agent');
 fs.mkdirSync(home, { mode: 0o700 }); fs.mkdirSync(agentDir, { mode: 0o700 });
 process.env.HOME = home; process.env.PI_CODING_AGENT_DIR = agentDir;
 fs.writeFileSync(path.join(agentDir, 'settings.json'), JSON.stringify({ packages: [], compaction: { enabled: false }, retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } }), { mode: 0o600 });
-const requireCandidate = createRequire(path.join(packageRoot, 'package.json'));
-const sdk = await import(pathToFileURL(requireCandidate.resolve('@earendil-works/pi-coding-agent')).href);
-const ai = await import(pathToFileURL(requireCandidate.resolve('@earendil-works/pi-ai')).href);
+// Pi's packages are ESM-only. Resolve their documented dist/index.js import entries in this fixture,
+// rather than using CJS require.resolve (which cannot satisfy an import-only exports condition).
+const sdk = await import(pathToFileURL(path.join(packageRoot, 'node_modules/@earendil-works/pi-coding-agent/dist/index.js')).href);
+const ai = await import(pathToFileURL(path.join(packageRoot, 'node_modules/@earendil-works/pi-ai/dist/index.js')).href);
 const schedule = (await import(pathToFileURL(path.join(packageRoot, 'dist/index.js')).href)).default;
 const { CronStorage } = await import(pathToFileURL(path.join(packageRoot, 'dist/storage.js')).href);
 const { resilientDefinition } = await import(pathToFileURL(path.join(packageRoot, 'dist/resilient-policy.js')).href);

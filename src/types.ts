@@ -1,4 +1,4 @@
-import { type Static, Type } from "@earendil-works/pi-ai";
+import { type Static, Type } from "typebox";
 
 const StringEnum = <T extends string>(values: T[], options?: { description?: string }) =>
   Type.Union(values.map((value) => Type.Literal(value)), options);
