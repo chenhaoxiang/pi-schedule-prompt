@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import { homedir } from 'node:os';
+import { createRequire } from 'node:module';
 import * as path from 'node:path';
 
 const [archiveArg, provenanceArg, expectedSha, rootArg] = process.argv.slice(2);
@@ -30,6 +31,18 @@ if (!host || !path.isAbsolute(host)) throw new Error('Set PI_SCHEDULE_HOST_PACKA
 const hostRoot = fs.realpathSync(host);
 const hostPackage = JSON.parse(fs.readFileSync(path.join(hostRoot, 'package.json'), 'utf8'));
 if (hostPackage.name !== '@earendil-works/pi-coding-agent' || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(hostPackage.version)) throw new Error('Expected a recognized stable Pi 1.3/1.4/1.5 host; native capability is negotiated at runtime');
+// Resolve the host's actual module, including a nested dependency, rather than assuming hoisting.
+const hostTypeboxEntry = fs.realpathSync(createRequire(path.join(hostRoot, 'package.json')).resolve('typebox'));
+let hostTypeboxPath = path.dirname(hostTypeboxEntry);
+while (!fs.existsSync(path.join(hostTypeboxPath, 'package.json'))) {
+  const parent = path.dirname(hostTypeboxPath);
+  if (parent === hostTypeboxPath) throw new Error('Host typebox package identity unavailable');
+  hostTypeboxPath = parent;
+}
+const hostTypeboxRoots = [path.join(hostRoot, 'node_modules/typebox'), path.join(path.dirname(path.dirname(hostRoot)), 'typebox')].filter(target => fs.existsSync(target)).map(target => fs.realpathSync(target));
+if (!hostTypeboxRoots.includes(hostTypeboxPath)) throw new Error('Host typebox must resolve inside the selected host installation');
+const hostTypebox = JSON.parse(fs.readFileSync(path.join(hostTypeboxPath, 'package.json'), 'utf8'));
+if (hostTypebox.name !== 'typebox' || !/^\d+\.\d+\.\d+$/.test(hostTypebox.version) || hostTypebox.version !== hostPackage.dependencies?.typebox) throw new Error('Host typebox identity/version mismatch');
 const root = path.resolve(rootArg || path.join(homedir(), '.pi/agent/packages/pi-schedule-prompt'));
 fs.mkdirSync(root, { recursive: true, mode: 0o700 });
 if (!fs.lstatSync(root).isDirectory() || fs.lstatSync(root).isSymbolicLink()) throw new Error('Install root must be an owned real directory');
@@ -46,6 +59,7 @@ const verifyRuntime = directory => {
     const peer = JSON.parse(fs.readFileSync(path.join(actual, 'package.json'), 'utf8'));
     if (peer.version !== hostPackage.version) throw new Error('Host peer version mismatch: ' + name);
   }
+  if (fs.realpathSync(path.join(directory, 'node_modules/typebox')) !== hostTypeboxPath || fs.realpathSync(createRequire(path.join(directory, 'package.json')).resolve('typebox')) !== hostTypeboxEntry) throw new Error('Host typebox binding mismatch');
 };
 const verify = directory => {
   for (const file of metadata.files) {
@@ -59,7 +73,7 @@ if (fs.existsSync(destination)) {
   verify(destination);
   verifyRuntime(destination);
   const receipt = JSON.parse(fs.readFileSync(path.join(destination, '.install-receipt.json'), 'utf8'));
-  if (receipt.sourceSha !== expectedSha || receipt.archiveSha256 !== metadata.archiveSha256 || receipt.hostVersion !== hostPackage.version || receipt.hostPath !== hostRoot) throw new Error('Existing installation has a different source/host binding');
+  if (receipt.sourceSha !== expectedSha || receipt.archiveSha256 !== metadata.archiveSha256 || receipt.hostVersion !== hostPackage.version || receipt.hostPath !== hostRoot || receipt.hostTypeboxPath !== hostTypeboxPath || receipt.hostTypeboxVersion !== hostTypebox.version) throw new Error('Existing installation has a different source/host binding');
   console.log(JSON.stringify({ installed: destination, verified: true, runtimeReady: true, reused: true, sourceSha: expectedSha, hostPath: hostRoot, hostVersion: hostPackage.version, globalSettingsChanged: false }));
 } else {
   const temporaryRoot = path.join(root, 'tmp');
@@ -84,8 +98,9 @@ if (fs.existsSync(destination)) {
       if (JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8')).version !== hostPackage.version) throw new Error('Host peer versions differ');
       fs.symlinkSync(target, path.join(modules, '@earendil-works', name), 'dir');
     }
+    fs.symlinkSync(hostTypeboxPath, path.join(modules, 'typebox'), 'dir');
     fs.symlinkSync(path.join('.runtime', 'node_modules'), path.join(unpacked, 'node_modules'), 'dir');
-    fs.writeFileSync(path.join(unpacked, '.install-receipt.json'), JSON.stringify({ sourceSha: expectedSha, archiveSha256: metadata.archiveSha256, version: metadata.version, hostVersion: hostPackage.version, hostPath: hostRoot }) + '\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(unpacked, '.install-receipt.json'), JSON.stringify({ sourceSha: expectedSha, archiveSha256: metadata.archiveSha256, version: metadata.version, hostVersion: hostPackage.version, hostPath: hostRoot, hostTypeboxPath, hostTypeboxVersion: hostTypebox.version }) + '\n', { mode: 0o600 });
     fs.renameSync(unpacked, destination);
     verify(destination);
     verifyRuntime(destination);

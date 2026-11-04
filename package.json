@@ -1,6 +1,6 @@
 {
   "name": "pi-schedule-prompt",
-  "version": "0.4.1-fork.12",
+  "version": "0.4.1-fork.13",
   "private": true,
   "type": "module",
   "engines": {
@@ -42,20 +42,20 @@
     "remind"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=1.3.0 <2",
-    "@earendil-works/pi-coding-agent": ">=1.3.0 <2",
-    "@earendil-works/pi-tui": ">=1.3.0 <2"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "dependencies": {
     "croner": "10.0.1",
-    "nanoid": "5.1.11",
-    "typebox": "1.3.27"
+    "nanoid": "5.1.11"
   },
   "scripts": {
     "build": "tsc",
     "test": "vitest run --maxWorkers=2",
     "check": "npm run lint && npm run typecheck && npm run check:scripts && npm test && npm run build",
-    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/install-fixed.mjs && node --check test/online-smoke.mjs && node --check scripts/supervisor.mjs && node --check scripts/supervisor-rpc.mjs && node --check test/supervisor-native.mjs && node --check test/installed-native-cli.mjs && node --check test/resilient-native.mjs",
+    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/install-fixed.mjs && node --check test/online-smoke.mjs && node --check scripts/supervisor.mjs && node --check scripts/supervisor-rpc.mjs && node --check test/supervisor-native.mjs && node --check test/installed-native-cli.mjs && node --check test/resilient-native.mjs && node --check test/installed-host-peers.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",
@@ -70,6 +70,7 @@
     "@types/node": "25.9.1",
     "pi-intercom": "https://codeload.github.com/chenhaoxiang/pi-intercom/tar.gz/073b0b2d6c015826d1fdb0f43d503f6585ceffa3",
     "tsx": "4.23.15",
+    "typebox": "1.3.27",
     "typescript": "6.0.3",
     "vitest": "4.1.7"
   },
