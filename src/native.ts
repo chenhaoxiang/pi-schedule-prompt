@@ -1,4 +1,7 @@
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { NativeExecutionProof } from "./types.js";
+
+export type NativeSessionReader = Pick<ExtensionContext["sessionManager"], "getSessionId" | "getSessionFile" | "getEntry" | "getEntries">;
 
 /** Forward structural typing for Pi's additive public v1 API; this is not a fallback runner/protocol. */
 export interface NativeRunSnapshot {
@@ -23,6 +26,18 @@ export interface NativeCheckpointDeclaration {
   effects?: Array<{ id: string; scope: string; evidenceRefs: string[] }>;
   nextAction?: string;
   waitingReason?: string;
+}
+export interface NativeRunCheckpoint {
+  version: 1;
+  runId: string;
+  binding: NativeExecutionProof["binding"];
+  createdAt: string;
+  completedResults: Array<{ entryId: string; toolCallId: string; toolName: string; isError: boolean }>;
+  completedResultCount: number;
+  lastResultEntryId?: string;
+  declarations: NativeCheckpointDeclaration;
+  effectStatus: "none-observed" | "unknown";
+  businessOutcome: "unverified";
 }
 export interface NativeRunHandle {
   readonly runId: string;

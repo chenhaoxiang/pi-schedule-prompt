@@ -35,6 +35,8 @@ export interface OwnedAttempt {
   /** Accepted explicit-model route, if any; later definition edits do not change this attempt. */
   model?: string;
   nativeSessionId?: string;
+  /** Exact persistent child transcript reserved before native start; absent for inline work. */
+  nativeSessionFile?: string;
   nativeRunId?: string;
   nativeStartedAt?: string;
   nativeDeadlineAt?: string;

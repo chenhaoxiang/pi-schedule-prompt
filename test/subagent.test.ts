@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   describeAvailableModels,
   getLastAssistantText,
+  prepareModelSession,
   resolveModel,
   resolveModelRoute,
   runSubagentOnce,
@@ -278,6 +279,25 @@ describe("runSubagentOnce", () => {
 
     // bindExtensions should NOT have been called
     expect(fakeSession.bindExtensions).not.toHaveBeenCalled();
+  });
+
+  it("scheduled extension loadouts retain a native input guard without permitting a question or fallback prompt", async () => {
+    const fakeSession = { ...makeFakeSession(), model: MODELS[0], scheduledExecution: { version: 1, active: undefined, start: vi.fn() } }; mockCreateAgentSession.mockResolvedValue({ session: fakeSession });
+    await prepareModelSession(makeCtx(), MODELS[0].id, { extensions: ["allowed-fixture"] }, {} as any, true);
+    const options = mockDefaultResourceLoader.mock.calls[0][0];
+    const factory = options.extensionFactories![0] as any;
+    expect(factory.name).toBe("schedule-native-input-guard");
+    const handlers = new Map<string, any>(); factory.factory({ on: (event: string, handler: any) => handlers.set(event, handler) });
+    const active = { checkpoint: vi.fn(), requestDrain: vi.fn() };
+    const child = { scheduledExecution: { version: 1, start: vi.fn(), active } };
+    expect(handlers.get("tool_call")({ toolName: "read" }, child)).toBeUndefined();
+    expect(handlers.get("tool_call")({ toolName: "ask_user_question" }, child)).toMatchObject({ block: true });
+    expect(active.checkpoint).toHaveBeenCalledWith(expect.objectContaining({ waitingReason: "user_input_required" }));
+    expect(active.requestDrain).toHaveBeenCalledWith("user_input_required"); expect(fakeSession.prompt).not.toHaveBeenCalled();
+    const guard = { path: "<inline:schedule-native-input-guard>" };
+    const unrelated = { path: "/other-extension.ts" };
+    const allowed = { path: "/allowed-fixture/entry.ts" };
+    expect(options.extensionsOverride!({ extensions: [guard, unrelated, allowed] } as any).extensions).toEqual([guard, allowed]);
   });
 
   it("extensions:true: sets noExtensions=false, noSkills=true, tools=undefined, calls bindExtensions", async () => {

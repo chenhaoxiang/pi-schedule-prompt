@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
-import { instant, isResilient, requiresReconciliation, resilientDefinition, spentOnUtcDay, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
+import { instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
 import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
 
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
@@ -270,12 +270,14 @@ export class CronStorage {
   }
 
   /** Atomic provisional admission. Only an explicit native refusal can uncharge this reservation. */
-  reserveResilient(id: string, sessionId: string, instanceId: string, revision: number, occurrenceId: string, now = Date.now()): ResilientJob | undefined {
+  reserveResilient(id: string, sessionId: string, instanceId: string, revision: number, occurrenceId: string, now = Date.now(), preparedNative?: { model: string; route: string; checkpoint?: NativeCheckpointReference }): ResilientJob | undefined {
     if (!validEventId(instanceId)) throw new Error("Invalid native owner instance");
+    if (preparedNative && (!preparedNative.model?.trim() || !preparedNative.route?.trim())) throw new Error("Invalid prepared native model route");
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job || !isResilient(job) || !job.enabled || job.session !== sessionId || job.revision !== revision || job.runtime.slot.kind !== "idle" || !["waiting", "backoff"].includes(job.runtime.slot.phase)) return;
       if (requiresReconciliation(job)) return;
+      if (preparedNative && (job.model !== preparedNative.model || (job.runtime.continuation || preparedNative.checkpoint) && !sameCheckpointReference(job.runtime.continuation?.checkpoint, preparedNative.checkpoint))) return;
       const runtime = job.runtime; const pending = runtime.pending;
       if (!pending || pending.id !== occurrenceId || pending.revision !== revision || Date.parse(pending.dueAt) > now) return;
       if (job.attemptHistory.some(record => record.charged && record.occurrence.id === pending.id && record.occurrence.revision === pending.revision)) { runtime.pending = undefined; return; }
@@ -292,7 +294,7 @@ export class CronStorage {
       runtime.slot = { kind: "owned", phase: "running", attempt: {
         id: attemptId, revision, owner: { sessionId, instanceId, epoch: runtime.ownerEpoch },
         occurrence: { ...pending }, admittedAt: new Date(now).toISOString(), deadlineMs: job.deadlineMs!, workBudgetMs: job.policy.workBudgetMs,
-        ...(job.model ? { model: job.model, nativeSessionId: runtime.continuation?.checkpoint.sessionId ?? ("schedule-" + attemptId) } : {}),
+        ...(job.model ? { model: preparedNative?.route ?? job.model, nativeSessionId: runtime.continuation?.checkpoint.sessionId ?? ("schedule-" + attemptId), ...(runtime.continuation?.checkpoint.sessionFile ? { nativeSessionFile: runtime.continuation.checkpoint.sessionFile } : {}) } : {}),
       } };
       runtime.pending = undefined; runtime.notBefore = undefined;
       if (job.policy.intervalMode === "fixed-delay") runtime.nextEligibleAt = undefined;
@@ -301,13 +303,27 @@ export class CronStorage {
     });
   }
 
-  bindResilientNative(id: string, attemptId: string, owner: AttemptOwner, native: { runId: string; sessionId: string; startedAt: string; deadlineAt: string }): boolean {
+  /** Bind the reserved model transcript before SDK construction can append any entries. No execution is claimed. */
+  bindResilientModelFile(id: string, attemptId: string, owner: AttemptOwner, sessionFile: string): boolean {
+    if (typeof sessionFile !== "string" || !sessionFile || sessionFile.length > 2048 || /[\u0000-\u001f\u007f]/.test(sessionFile)) throw new Error("Invalid reserved native transcript file");
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id); const attempt = this.owned(job, attemptId, owner);
+      if (!attempt?.model || attempt.nativeRunId || (attempt.nativeSessionFile && attempt.nativeSessionFile !== sessionFile)) return false;
+      if (store.jobs.some(item => item.id !== id && isResilient(item) && item.runtime.slot.kind === "owned" && item.runtime.slot.attempt.nativeSessionFile === sessionFile)) return false;
+      attempt.nativeSessionFile = sessionFile;
+      return true;
+    });
+  }
+
+  bindResilientNative(id: string, attemptId: string, owner: AttemptOwner, native: { runId: string; sessionId: string; sessionFile?: string; startedAt: string; deadlineAt: string }): boolean {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id); const attempt = this.owned(job, attemptId, owner);
       if (!attempt) return false;
       if (attempt.nativeRunId !== undefined) return attempt.nativeRunId === native.runId && attempt.nativeSessionId === native.sessionId;
       if (attempt.nativeSessionId !== undefined && attempt.nativeSessionId !== native.sessionId) return false;
+      if (attempt.nativeSessionFile !== undefined && native.sessionFile !== undefined && attempt.nativeSessionFile !== native.sessionFile) return false;
       attempt.nativeRunId = native.runId; attempt.nativeSessionId = native.sessionId;
+      if (native.sessionFile !== undefined) attempt.nativeSessionFile = native.sessionFile;
       attempt.nativeStartedAt = native.startedAt; attempt.nativeDeadlineAt = native.deadlineAt;
       return true;
     });
@@ -439,7 +455,7 @@ export class CronStorage {
       if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind !== "idle") return false;
       const before = job.runtime.slot;
       if (["waiting", "backoff"].includes(disposition.phase) && requiresReconciliation(job)) throw new Error("Reconciliation evidence is required before continuation");
-      if (["reconciling", "waiting-input", "attention-required"].includes(before.phase) && ["waiting", "backoff"].includes(disposition.phase) && !["runtime_unavailable", "native_disposed"].includes(before.reason ?? "")) throw new Error("Reconciliation evidence is required before continuation");
+      if (["reconciling", "waiting-input", "attention-required"].includes(before.phase) && ["waiting", "backoff"].includes(disposition.phase) && !["runtime_unavailable", "native_disposed", "native_model_route_unsupported"].includes(before.reason ?? "")) throw new Error("Reconciliation evidence is required before continuation");
       job.runtime.slot = { kind: "idle", phase: disposition.phase, ...(disposition.reason ? { reason: disposition.reason } : {}) };
       job.runtime.notBefore = disposition.notBefore; job.runtime.nextEligibleAt = disposition.nextEligibleAt;
       return true;

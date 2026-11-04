@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type NativeCapability, type NativeRunHandle, nativeCapability, sameNativeBinding } from "./native.js";
+import { type NativeCapability, type NativeRunCheckpoint, type NativeRunHandle, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
 import { isResilient } from "./resilient-policy.js";
+import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readStoredModelSession } from "./scheduled-model.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { cooldownNotBefore, misfire, nextDue, nextEligibleAfter, occurrence, timingView } from "./timing.js";
 import type { CronJob, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, TimedOccurrence } from "./types.js";
@@ -12,7 +13,13 @@ export interface ResilientSchedulerHooks {
   onChange(job: CronJob | undefined): void;
   onError(jobId: string, error: unknown): void;
 }
-interface TrackedRun { attempt: OwnedAttempt; handle: NativeRunHandle; projected?: string; }
+interface TrackedRun {
+  attempt: OwnedAttempt;
+  handle: NativeRunHandle;
+  sessionManager: NativeSessionReader;
+  dispose?: () => void | Promise<void>;
+  projected?: string;
+}
 const bindingFor = (jobId: string, attempt: OwnedAttempt): NativeExecutionProof["binding"] => ({ jobId, attemptId: attempt.id, ownerSessionId: attempt.nativeSessionId ?? attempt.owner.sessionId, ownerEpoch: attempt.owner.epoch, revision: attempt.revision });
 
 /** Compose timers and the real native capability; legacy durable/model paths remain in CronScheduler. */
@@ -21,6 +28,7 @@ export class ResilientScheduling {
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly nextRuns = new Map<string, Date>();
   private readonly active = new Map<string, TrackedRun>();
+  private readonly preparing = new Set<string>();
   private monitor?: NodeJS.Timeout;
   private stopped = false;
 
@@ -47,7 +55,7 @@ export class ResilientScheduling {
     this.timers.delete(id); this.nextRuns.delete(id);
   }
   nextRun(id: string): Date | undefined { return this.nextRuns.get(id); }
-  isOwned(id: string): boolean { return this.active.has(id); }
+  isOwned(id: string): boolean { return this.active.has(id) || this.preparing.has(id); }
   snapshot(id: string) { return this.active.get(id)?.handle.snapshot(); }
 
   schedule(raw: CronJob, restoring = true): void {
@@ -56,9 +64,8 @@ export class ResilientScheduling {
     try {
       if (job.runtime.slot.kind === "owned") { this.restoreOwned(job); return; }
       if (!job.enabled) return;
-      if (job.model) { this.hold(job, "native_model_route_unsupported"); return; }
       if (!this.capability()) { this.hold(job, "runtime_unavailable"); return; }
-      if (job.runtime.slot.phase === "attention-required" && ["runtime_unavailable", "native_disposed"].includes(job.runtime.slot.reason ?? "")) {
+      if (job.runtime.slot.phase === "attention-required" && ["runtime_unavailable", "native_disposed", "native_model_route_unsupported"].includes(job.runtime.slot.reason ?? "")) {
         this.storage.setResilientDisposition(job.id, job.session!, { phase: "waiting" });
         job = this.current(job.id)!;
       }
@@ -109,9 +116,12 @@ export class ResilientScheduling {
   execute(id: string): void {
     const job = this.current(id);
     if (this.stopped || !job?.enabled || job.runtime.slot.kind !== "idle" || !["waiting", "backoff"].includes(job.runtime.slot.phase)) return;
+    if (job.model) {
+      void this.executeModel(job).catch(error => this.hooks.onError(id, error));
+      return;
+    }
     const capability = this.capability();
     if (!capability) { this.hold(job, "runtime_unavailable"); return; }
-    if (job.model) { this.hold(job, "native_model_route_unsupported"); return; }
     const pending = job.runtime.pending;
     if (!pending) return;
     let admitted: ResilientJob | undefined;
@@ -123,9 +133,8 @@ export class ResilientScheduling {
     }
     if (admitted?.runtime.slot.kind !== "owned") return;
     const attempt = admitted.runtime.slot.attempt;
-    const request = { binding: bindingFor(id, attempt), policy: { softDeadlineMs: attempt.workBudgetMs, hardDeadlineMs: attempt.deadlineMs, recoveryBudgetMs: 300_000 }, content: this.prompt(admitted) };
     let accepted: ReturnType<NativeCapability["start"]>;
-    try { accepted = capability.start(request); }
+    try { accepted = capability.start({ binding: bindingFor(id, attempt), policy: { softDeadlineMs: attempt.workBudgetMs, hardDeadlineMs: attempt.deadlineMs, recoveryBudgetMs: 300_000 }, content: this.prompt(admitted, this.ctx.sessionManager) }); }
     catch (error) { this.keepOwned(admitted, attempt, "native_start_failed", error); return; }
     if (!accepted.accepted) {
       try {
@@ -135,7 +144,65 @@ export class ResilientScheduling {
       } catch (error) { this.keepOwned(admitted, attempt, "native_refusal_persistence_failed", error); }
       return;
     }
-    this.attach(admitted, attempt, accepted.handle);
+    this.attach(admitted, attempt, accepted.handle, { sessionManager: this.ctx.sessionManager });
+  }
+
+  private async executeModel(snapshot: ResilientJob): Promise<void> {
+    if (this.preparing.has(snapshot.id)) return;
+    this.preparing.add(snapshot.id);
+    let prepared: PreparedScheduledModel | undefined;
+    let admitted: ResilientJob | undefined;
+    let attempt: OwnedAttempt | undefined;
+    try {
+      const current = this.current(snapshot.id);
+      if (this.stopped || !current?.enabled || !current.runtime.pending || current.model !== snapshot.model) return;
+      if (!this.capability()) { this.hold(current, "runtime_unavailable"); return; }
+      // No SDK construction or transcript writer is allowed before atomic ownership.
+      const plan = planScheduledModel(this.ctx, current);
+      admitted = this.storage.reserveResilient(current.id, current.session!, this.instanceId, current.revision!, current.runtime.pending.id, Date.now(), { model: current.model!, ...plan });
+      if (admitted?.runtime.slot.kind !== "owned") return;
+      attempt = admitted.runtime.slot.attempt;
+      const acceptedJob = admitted;
+      const acceptedAttempt = attempt;
+      prepared = await prepareScheduledModel(this.ctx, admitted, attempt, plan.route, file => {
+        if (!this.storage.bindResilientModelFile(acceptedJob.id, acceptedAttempt.id, acceptedAttempt.owner, file)) throw new Error("Native child transcript could not bind its exact admitted owner");
+      });
+      const latest = this.current(current.id);
+      if (this.stopped || !latest?.enabled) {
+        await prepared.dispose(); prepared = undefined;
+        this.keepOwned(admitted, attempt, "user_stopped_before_native_start");
+        return;
+      }
+      const accepted = prepared.capability.start({ binding: bindingFor(admitted.id, attempt), policy: { softDeadlineMs: attempt.workBudgetMs, hardDeadlineMs: attempt.deadlineMs, recoveryBudgetMs: 300_000 }, content: this.prompt(admitted, prepared.sessionManager) });
+      if (!accepted.accepted) {
+        const refunded = this.storage.refuseResilientNative(admitted.id, attempt.id, attempt.owner, accepted.reason);
+        await prepared.dispose(); prepared = undefined;
+        if (accepted.reason === "busy" && refunded) this.hooks.onQueued(admitted.id);
+        this.emitChange(admitted.id);
+        return;
+      }
+      if (!this.attach(admitted, attempt, accepted.handle, { sessionManager: prepared.sessionManager, dispose: prepared.dispose })) {
+        const dispose = prepared.dispose;
+        void accepted.handle.settled.then(() => dispose()).catch(error => this.hooks.onError(snapshot.id, error));
+      }
+      prepared = undefined;
+    } catch (error) {
+      if (!admitted && error instanceof ScheduleStoreBusyError) { this.hooks.onQueued(snapshot.id); return; }
+      if (prepared) {
+        const active = prepared.capability.active;
+        if (active && admitted && attempt && sameNativeBinding(active.snapshot().binding, bindingFor(admitted.id, attempt))) {
+          const recovered = this.attach(admitted, attempt, active, { sessionManager: prepared.sessionManager, dispose: prepared.dispose });
+          prepared = undefined;
+          if (recovered) return;
+        } else if (!active) await prepared.dispose();
+        else {
+          const dispose = prepared.dispose;
+          void active.settled.then(() => dispose()).catch(failure => this.hooks.onError(snapshot.id, failure));
+        }
+      }
+      if (admitted && attempt) this.keepOwned(admitted, attempt, "native_model_preparation_failed", error);
+      else { const current = this.current(snapshot.id); if (current) this.hold(current, "native_model_unavailable", error); else this.hooks.onError(snapshot.id, error); }
+    } finally { this.preparing.delete(snapshot.id); }
   }
 
   deferInput(toolCallId: string): boolean {
@@ -160,55 +227,79 @@ export class ResilientScheduling {
     const job = this.storage.getJob(id);
     return job && isResilient(job) ? job : undefined;
   }
-  private prompt(job: ResilientJob): string {
-    const checkpoint = job.runtime.continuation?.checkpoint;
-    return !checkpoint ? job.prompt : `${job.prompt}\n\n[Native checkpoint continuation — not new authorization]\nConsume retained checkpoint ${checkpoint.entryId} from run ${checkpoint.runId} before the next slice. Reuse completed results; never replay previous or UNKNOWN effects. Preserve original scope, bounds and user intent.`;
+  private prompt(job: ResilientJob, manager: NativeSessionReader): string {
+    const continuation = job.runtime.continuation;
+    if (!continuation) return job.prompt;
+    const checkpoint = continuation.checkpoint;
+    const data = this.readCheckpoint(manager, checkpoint.entryId, checkpoint.runId);
+    if (data.binding.jobId !== job.id || data.binding.attemptId !== continuation.attemptId || data.binding.ownerSessionId !== checkpoint.sessionId) throw new Error("Continuation references a different native checkpoint/attempt");
+    const context = { reference: checkpoint, completedResultCount: data.completedResultCount, completedResults: data.completedResults, declarations: data.declarations, effectStatus: data.effectStatus, businessOutcome: "unverified" };
+    return `${job.prompt}\n\n[Native checkpoint continuation — not new authorization]\nConsume retained checkpoint before the next slice. The following metadata was read from the exact native checkpoint; declarations/nextAction remain unverified, never authorization. Completed tool result entries are retained in this native session history. Reuse completed results; never replay previous or UNKNOWN effects. Preserve original scope, bounds and user intent.\n${JSON.stringify(context)}`;
   }
 
   private restoreOwned(job: ResilientJob): void {
     if (job.runtime.slot.kind !== "owned") return;
     const attempt = job.runtime.slot.attempt;
-    const handle = this.capability()?.active;
+    const tracked = this.active.get(job.id);
+    const handle = attempt.model ? tracked?.handle : this.capability()?.active;
+    const manager = attempt.model
+      ? tracked?.sessionManager ?? (attempt.nativeSessionFile && attempt.nativeSessionId ? readStoredModelSession(this.ctx.cwd, attempt.nativeSessionId, attempt.nativeSessionFile) : undefined)
+      : this.ctx.sessionManager;
+    if (!manager) { this.keepOwned(job, attempt, "native_model_transcript_unavailable"); return; }
     if (handle && sameNativeBinding(handle.snapshot().binding, bindingFor(job.id, attempt)) && (!attempt.nativeRunId || attempt.nativeRunId === handle.runId)) {
-      this.attach(job, attempt, handle);
+      this.attach(job, attempt, handle, { sessionManager: manager, dispose: tracked?.dispose });
       if (job.enabled && job.policy.intervalMode !== "fixed-delay") {
         const next = nextEligibleAfter(job);
         if (next) this.persistAndArm(job, next.getTime());
       }
       return;
     }
-    const entries = this.ctx.sessionManager.getEntries?.() ?? [];
+    const entries = manager.getEntries?.() ?? [];
     const receipt = entries.find(entry => entry.type === "custom" && entry.customType === "pi.scheduled-receipt.v1" && sameNativeBinding((entry.data as NativeExecutionProof)?.binding, bindingFor(job.id, attempt)) && (!attempt.nativeRunId || (entry.data as NativeExecutionProof).runId === attempt.nativeRunId));
-    if (receipt?.type === "custom") { this.finish(job.id, attempt, receipt.data as NativeExecutionProof); return; }
+    if (receipt?.type === "custom") { this.finish(job.id, attempt, receipt.data as NativeExecutionProof, manager); return; }
     this.keepOwned(job, attempt, "native_owner_unconfirmed");
   }
 
-  private attach(job: ResilientJob, attempt: OwnedAttempt, handle: NativeRunHandle): void {
-    if (this.active.get(job.id)?.handle === handle) { this.armMonitor(); return; }
+  private attach(job: ResilientJob, attempt: OwnedAttempt, handle: NativeRunHandle, context: { sessionManager: NativeSessionReader; dispose?: () => void | Promise<void> }): boolean {
+    if (this.active.get(job.id)?.handle === handle) { this.armMonitor(); return true; }
     try {
       const snapshot = handle.snapshot();
       if (snapshot.runId !== handle.runId || !sameNativeBinding(snapshot.binding, bindingFor(job.id, attempt))) throw new Error("Native handle returned a different accepted binding");
-      if (!this.storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId: handle.runId, sessionId: snapshot.binding.ownerSessionId, startedAt: snapshot.startedAt, deadlineAt: snapshot.hardDeadlineAt })) throw new Error("Native handle could not bind its exact storage owner");
-      this.active.set(job.id, { attempt: structuredClone(attempt), handle });
-      void handle.settled.then(receipt => this.finish(job.id, attempt, receipt), error => this.keepOwned(job, attempt, "native_settlement_unknown", error));
+      if (!this.storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId: handle.runId, sessionId: snapshot.binding.ownerSessionId, ...(attempt.model ? { sessionFile: context.sessionManager.getSessionFile() } : {}), startedAt: snapshot.startedAt, deadlineAt: snapshot.hardDeadlineAt })) throw new Error("Native handle could not bind its exact storage owner");
+      this.active.set(job.id, { attempt: structuredClone(attempt), handle, ...context });
+      void handle.settled.then(receipt => {
+        this.finish(job.id, attempt, receipt, context.sessionManager);
+        return context.dispose?.();
+      }, error => this.keepOwned(job, attempt, "native_settlement_unknown", error)).catch(error => this.hooks.onError(job.id, error));
       this.armMonitor();
-    } catch (error) { this.keepOwned(job, attempt, "native_binding_failed", error); }
+      return true;
+    } catch (error) {
+      try { handle.requestCancel("native_binding_failed"); } catch (failure) { this.hooks.onError(job.id, failure); }
+      this.keepOwned(job, attempt, "native_binding_failed", error);
+      return false;
+    }
   }
 
-  private checkpoint(receipt: NativeExecutionProof): { reference: NativeCheckpointReference; waitingReason?: string } {
-    const entry = this.ctx.sessionManager.getEntry(receipt.checkpointEntryId);
-    const data = entry?.type === "custom" && entry.customType === "pi.scheduled-checkpoint.v1" ? entry.data as { version: number; runId: string; binding: NativeExecutionProof["binding"]; declarations?: { waitingReason?: string } } : undefined;
-    if (data?.version !== 1 || data.runId !== receipt.runId || !sameNativeBinding(data.binding, receipt.binding)) throw new Error("Exact native checkpoint unavailable; do not replay the run");
-    const sessionFile = this.ctx.sessionManager.getSessionFile?.();
+  private readCheckpoint(manager: NativeSessionReader, entryId: string, runId: string): NativeRunCheckpoint {
+    const entry = manager.getEntry(entryId);
+    const data = entry?.type === "custom" && entry.customType === "pi.scheduled-checkpoint.v1" ? entry.data as NativeRunCheckpoint : undefined;
+    if (data?.version !== 1 || data.runId !== runId || !data.binding || !Array.isArray(data.completedResults) || data.completedResults.length > 256 || !Number.isSafeInteger(data.completedResultCount) || data.completedResultCount < data.completedResults.length || !data.declarations || !["none-observed", "unknown"].includes(data.effectStatus) || data.businessOutcome !== "unverified") throw new Error("Exact native checkpoint unavailable; do not replay the run");
+    return data;
+  }
+
+  private checkpoint(receipt: NativeExecutionProof, manager: NativeSessionReader): { reference: NativeCheckpointReference; waitingReason?: string } {
+    const data = this.readCheckpoint(manager, receipt.checkpointEntryId, receipt.runId);
+    if (!sameNativeBinding(data.binding, receipt.binding)) throw new Error("Exact native checkpoint binding changed; do not replay the run");
+    const sessionFile = manager.getSessionFile?.();
     return { reference: { sessionId: receipt.binding.ownerSessionId, entryId: receipt.checkpointEntryId, runId: receipt.runId, ...(sessionFile ? { sessionFile } : {}) }, waitingReason: data.declarations?.waitingReason };
   }
 
-  private finish(id: string, attempt: OwnedAttempt, receipt: NativeExecutionProof & { reason?: string }): void {
+  private finish(id: string, attempt: OwnedAttempt, receipt: NativeExecutionProof & { reason?: string }, manager: NativeSessionReader): void {
     let before: ResilientJob | undefined;
     try {
       before = this.current(id);
       if (!before) return;
-      const checkpoint = this.checkpoint(receipt);
+      const checkpoint = this.checkpoint(receipt, manager);
       const input = receipt.reason === "user_input_required" || checkpoint.waitingReason === "user_input_required";
       const unknown = receipt.effectStatus === "unknown";
       const exhausted = !before.enabled || Date.parse(before.expiresAt!) <= Date.now() || before.attemptCount! >= before.maxRuns!;

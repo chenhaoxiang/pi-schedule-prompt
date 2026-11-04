@@ -3,9 +3,12 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NativeCapability, NativeRunHandle, NativeRunSnapshot } from "../src/native.js";
 import { resilientDefinition } from "../src/resilient-policy.js";
+import { planScheduledModel, prepareScheduledModel, readStoredModelSession } from "../src/scheduled-model.js";
 import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
 import type { CronJob, NativeExecutionProof, ResilientJob, ResilientPolicy } from "../src/types.js";
+
+vi.mock("../src/scheduled-model.js", () => ({ planScheduledModel: vi.fn(), prepareScheduledModel: vi.fn(), readStoredModelSession: vi.fn() }));
 
 const directories: string[] = [];
 const schedulers: CronScheduler[] = [];
@@ -39,7 +42,8 @@ function fixture(extra: Partial<CronJob> = {}, policy: Partial<ResilientPolicy> 
         runId, settled, snapshot: () => structuredClone(state),
         checkpoint: vi.fn(declaration => {
           const id = "checkpoint-" + runId;
-          entries.set(id, { id, type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId, binding: { ...request.binding }, declarations: declaration ?? {} } });
+          const previous = entries.get(id)?.data;
+          entries.set(id, { id, type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId, binding: { ...request.binding }, createdAt: new Date().toISOString(), completedResults: previous?.completedResults ?? [], completedResultCount: previous?.completedResultCount ?? 0, declarations: { ...previous?.declarations, ...declaration }, effectStatus: "none-observed", businessOutcome: "unverified" } });
           state.checkpointEntryId = id; return id;
         }),
         requestDrain: vi.fn(reason => { state.phase = "draining"; state.reason = reason; return true; }),
@@ -48,7 +52,8 @@ function fixture(extra: Partial<CronJob> = {}, policy: Partial<ResilientPolicy> 
       };
       active = handle;
       const close = (execution: NativeExecutionProof["execution"] = "completed", effectStatus: NativeExecutionProof["effectStatus"] = "none-observed", reason?: string, retryNotBefore?: string) => {
-        const checkpointEntryId = state.checkpointEntryId ?? handle.checkpoint();
+        const checkpointEntryId = handle.checkpoint();
+        entries.get(checkpointEntryId).data.effectStatus = effectStatus;
         const receipt: NativeExecutionProof & { reason?: string } = { version: 1, runId, binding: { ...request.binding }, finishedAt: new Date().toISOString(), execution, effectStatus, checkpointEntryId, businessOutcome: "unverified", failedRecoveryMs: 0, ...(reason ? { reason } : {}), ...(retryNotBefore ? { retryNotBefore } : {}) };
         entries.set("receipt-" + runId, { type: "custom", customType: "pi.scheduled-receipt.v1", data: receipt });
         state.nativeClosed = true; state.phase = "settled"; active = undefined; resolve(receipt);
@@ -62,9 +67,27 @@ function fixture(extra: Partial<CronJob> = {}, policy: Partial<ResilientPolicy> 
   function newScheduler() { const scheduler = new CronScheduler(storage, pi as any, ctx as any); schedulers.push(scheduler); return scheduler; }
   return { storage, ctx, pi, runs, capability, newScheduler, row: () => storage.getJob("job") as ResilientJob, busy: (value: boolean) => { userBusy = value; }, refuse: (value?: typeof refusal) => { refusal = value; } };
 }
+function modelPreparation(h: ReturnType<typeof fixture>) {
+  const dispose = vi.fn(async () => undefined);
+  const child = h.capability;
+  h.ctx.scheduledExecution = { version: 1, active: undefined, start: vi.fn(() => { throw new Error("must not dispatch explicit model inline"); }) };
+  const readers = new Map<string, any>();
+  vi.mocked(planScheduledModel).mockImplementation((_ctx, job) => ({ route: job.model!, ...(job.runtime.continuation ? { checkpoint: structuredClone(job.runtime.continuation.checkpoint) } : {}) }));
+  vi.mocked(prepareScheduledModel).mockImplementation(async (_ctx, _job, attempt, _route, bindFile) => {
+    expect(h.row().attemptCount).toBeGreaterThan(0);
+    const sessionId = attempt.nativeSessionId!;
+    const sessionFile = attempt.nativeSessionFile ?? path.join(h.ctx.cwd, ".pi/schedule-native/", sessionId + ".jsonl");
+    bindFile(sessionFile);
+    const manager = readers.get(sessionId) ?? { ...h.ctx.sessionManager, getSessionId: () => sessionId, getSessionFile: () => sessionFile };
+    readers.set(sessionId, manager);
+    return { capability: child, sessionManager: manager, dispose };
+  });
+  vi.mocked(readStoredModelSession).mockImplementation((_cwd, sessionId) => readers.get(sessionId));
+  return { dispose, child, readers };
+}
 const advance = (duration: number) => vi.advanceTimersByTimeAsync(duration);
 async function flush() { for (let i = 0; i < 6; i++) await Promise.resolve(); }
-beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(beginning); });
+beforeEach(() => { vi.mocked(planScheduledModel).mockReset(); vi.mocked(prepareScheduledModel).mockReset(); vi.mocked(readStoredModelSession).mockReset(); vi.useFakeTimers(); vi.setSystemTime(beginning); });
 afterEach(() => { for (const scheduler of schedulers.splice(0)) scheduler.stop(); vi.useRealTimers(); for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
 
 describe("resilient native timer composition", () => {
@@ -197,6 +220,44 @@ describe("resilient native timer composition", () => {
     expect(h.runs).toHaveLength(1); expect(h.row().attemptCount).toBe(1);
     expect(h.row().runtime.slot).toMatchObject({ kind: "owned", attempt: { occurrence: { source: "misfire", dueAt: new Date(beginning + 5 * 60 * minute).toISOString() } } });
     expect(scheduler.getNextRun("job")?.getTime()).toBe(beginning + 6 * 60 * minute);
+  });
+
+  it("prepares explicit-model capability before charging and binds its persistent child session without inline fallback", async () => {
+    const h = fixture({ model: "fixture/model" }); const prepared = modelPreparation(h); h.newScheduler().start();
+    await advance(60 * minute + 1000); await flush();
+    expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(h.runs).toHaveLength(1);
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", attempt: { model: "fixture/model", nativeSessionId: expect.stringMatching(/^schedule-/), nativeSessionFile: expect.stringContaining(".pi/schedule-native/") } });
+    expect(h.runs[0].request.binding.ownerSessionId).not.toBe("owner"); expect(h.ctx.scheduledExecution!.start).not.toHaveBeenCalled(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
+    expect(prepared.dispose).not.toHaveBeenCalled(); h.runs[0].close(); await flush();
+    expect(prepared.dispose).toHaveBeenCalledOnce(); expect(h.row().attemptHistory[0].checkpoint?.sessionId).toBe(h.runs[0].request.binding.ownerSessionId);
+  });
+
+  it("does not charge or use the old model runner when a prepared child lacks the native capability", async () => {
+    const h = fixture({ model: "fixture/model" }); modelPreparation(h);
+    vi.mocked(planScheduledModel).mockImplementationOnce(() => { throw new Error("Scheduled model SDK lacks native capability v1"); });
+    h.newScheduler().start(); await advance(60 * minute + 1000); await flush();
+    expect(h.row()).toMatchObject({ enabled: true, attemptCount: 0, runtime: { slot: { kind: "idle", phase: "attention-required", reason: "native_model_unavailable" } } }); expect(h.runs).toHaveLength(0); expect(h.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("continues a model deferral in its exact persistent checkpoint session, and sends actual declarations not only a pointer", async () => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute }); const prepared = modelPreparation(h); h.newScheduler().start(); await advance(minute + 1000); await flush();
+    const first = h.runs[0]; first.handle.checkpoint({ nextAction: "use-the-saved-synthetic-result", artifacts: [{ ref: "tmp/result.txt", sha256: "a".repeat(64) }] }); first.close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    expect(h.row().runtime.slot.phase).toBe("backoff"); await advance(minute + 1000); await flush();
+    expect(h.runs).toHaveLength(2); expect(h.runs[1].request.binding.ownerSessionId).toBe(first.request.binding.ownerSessionId);
+    expect(h.runs[1].request.content).toContain("use-the-saved-synthetic-result"); expect(h.runs[1].request.content).toContain('"completedResultCount":0'); expect(h.runs[1].request.content).toContain('"artifacts"'); expect(prepared.readers.size).toBe(1);
+  });
+
+  it("does not construct a second child SDK writer when another scheduler already owns the logical job", async () => {
+    const h = fixture({ model: "fixture/model" }); modelPreparation(h); const first = h.newScheduler(); first.start(); await advance(60 * minute + 1000); await flush();
+    const before = h.row().attemptCount; const second = h.newScheduler(); second.start(); await flush();
+    expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(h.row().attemptCount).toBe(before); expect(h.runs).toHaveLength(1);
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed" });
+  });
+
+  it("keeps a model's live native child until acknowledged settlement, including during scheduler stop", async () => {
+    const h = fixture({ model: "fixture/model" }); const prepared = modelPreparation(h); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000); await flush();
+    scheduler.stop(); expect(prepared.dispose).not.toHaveBeenCalled(); expect(h.runs[0].handle.requestCancel).toHaveBeenCalledWith("scheduler_stopped"); expect(h.row().runtime.slot.kind).toBe("owned");
+    h.runs[0].close("cancelled", "unknown"); await flush(); expect(prepared.dispose).toHaveBeenCalledOnce(); expect(h.row().runtime.slot.phase).toBe("reconciling");
   });
 
   it("preserves a user stop and original bounds through exact native completion", async () => {
