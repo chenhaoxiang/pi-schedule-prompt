@@ -39,7 +39,7 @@ export function readConfig(file) {
 function validatePins(config) {
   if (sha(fs.readFileSync(config.piCli)) !== config.piCliSha256) throw new Error('Pi CLI pin mismatch');
   const receipt = JSON.parse(fs.readFileSync(path.join(config.packageRoot, '.install-receipt.json'), 'utf8'));
-  if (receipt.sourceSha !== config.sourceCommit || !/^1\.3\.\d+(?:-fork\.\d+)?$/.test(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
+  if (receipt.sourceSha !== config.sourceCommit || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
   if (typeof receipt.hostPath !== 'string' || fs.realpathSync(path.join(path.dirname(config.piCli), 'node_modules/@earendil-works/pi-coding-agent')) !== receipt.hostPath || JSON.parse(fs.readFileSync(path.join(receipt.hostPath, 'package.json'), 'utf8')).version !== receipt.hostVersion) throw new Error('CLI and fixed installer host bindings differ');
   if (fs.realpathSync(config.packageRoot) !== config.packageRoot || fs.realpathSync(config.cwd) !== config.cwd) throw new Error('Use canonical cwd/package paths');
   const storePath = path.join(config.cwd, '.pi/schedule-prompts.json');
