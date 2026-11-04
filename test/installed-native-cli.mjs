@@ -10,14 +10,21 @@ import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 const exec = promisify(execFile);
 const root = process.env.PI_SCHEDULE_PACKAGE_ROOT;
-const cli = process.env.PI_SCHEDULE_REAL_CLI;
+const realCli = process.env.PI_SCHEDULE_REAL_CLI;
 const ai = process.env.PI_SCHEDULE_AI_ENTRY;
-if (!root || !cli || !ai) throw new Error('Set fixed package root, real native CLI and host AI entry');
+if (!root || !realCli || !ai) throw new Error('Set fixed package root, real native CLI and host AI entry');
 const base = path.resolve('tmp/installed-native-cli'); fs.mkdirSync(base, { recursive: true });
 const cwd = fs.mkdtempSync(path.join(base, 'case-')); const agentDir = path.join(cwd, 'agent');
 fs.mkdirSync(path.join(agentDir, 'extensions'), { recursive: true, mode: 0o700 });
 fs.writeFileSync(path.join(agentDir, 'settings.json'), JSON.stringify({ packages: [], compaction: { enabled: false }, retry: { enabled: false } }), { mode: 0o600 });
-fs.writeFileSync(path.join(agentDir, 'extensions/faux.ts'), `import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(ai)};export default pi=>{const faux=fauxProvider({provider:'fixed-cli-fixture',models:[{id:'fixture'}]});faux.setResponses([fauxAssistantMessage('FIXED_NATIVE_CLI_OK')]);pi.registerProvider(faux.provider);};`);
+const fauxExtension = path.join(agentDir, 'extensions/faux.ts');
+fs.writeFileSync(fauxExtension, `import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(ai)};export default pi=>{const faux=fauxProvider({provider:'fixed-cli-fixture',models:[{id:'fixture'}]});faux.setResponses([fauxAssistantMessage('FIXED_NATIVE_CLI_OK')]);pi.registerProvider(faux.provider);};`);
+// The real supervisor intentionally disables extension discovery. Inject only this owned faux provider
+// explicitly into the real CLI in the SAME process, retaining exact RPC pid/EOF/stop semantics.
+const fixtureBin = path.join(cwd, 'bin'); fs.mkdirSync(fixtureBin);
+const cli = path.join(fixtureBin, 'pi');
+fs.writeFileSync(cli, `#!/usr/bin/env node\nprocess.argv.push('--extension', ${JSON.stringify(fauxExtension)}); import(${JSON.stringify(pathToFileURL(fs.realpathSync(realCli)).href)}).catch(error => { console.error(error); process.exitCode = 1; });\n`, { mode: 0o700 });
+fs.symlinkSync(path.join(path.dirname(realCli), 'node_modules'), path.join(fixtureBin, 'node_modules'), 'dir');
 const stateDir = path.join(cwd, 'state'); fs.mkdirSync(stateDir, { mode: 0o700 });
 let port;
 for (let attempt = 0; attempt < 20; attempt++) {
@@ -59,7 +66,7 @@ try {
   const entries = fs.readFileSync(path.join(stateDir, 'sessions', session), 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.equal(entries.filter(entry => entry.type === 'custom' && entry.customType === 'schedule_execution').length, 1);
   assert.equal(entries.some(entry => entry.type === 'message' && entry.message?.role === 'user'), false);
-  console.log(JSON.stringify({ sourceCommit: receipt.sourceSha, hostVersion: receipt.hostVersion, nativeCli: true, manifestExtension: true, nativeReceipt: true, confirmedStop: true, inference: 'synthetic-faux-only', globalSettingsChanged: false }));
+  console.log(JSON.stringify({ sourceCommit: receipt.sourceSha, hostVersion: receipt.hostVersion, nativeCli: true, nativeCliEntry: fs.realpathSync(realCli), explicitFixtureProvider: true, manifestExtension: true, nativeReceipt: true, confirmedStop: true, inference: 'synthetic-faux-only', globalSettingsChanged: false }));
 } finally {
   if (child.exitCode === null && child.signalCode === null) {
     child.kill('SIGTERM');
