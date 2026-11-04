@@ -36,7 +36,7 @@ async function nativeCase(mode) {
   const artifact = path.join(cwd, 'saved-result.txt'); const saved = 'NATIVE_SAVED_RESULT_' + mode;
   fs.writeFileSync(artifact, saved, { mode: 0o600 });
   const nextAction = 'USE_THE_EXACT_SAVED_NATIVE_RESULT_' + mode;
-  fs.writeFileSync(path.join(cwd, '.pi', 'extensions', 'checkpoint-declaration.mjs'), `export default (pi) => { pi.on('before_agent_start', (_event, ctx) => { ctx.scheduledExecution?.active?.checkpoint({ nextAction: ${JSON.stringify(nextAction)}, artifacts: [{ ref: ${JSON.stringify(artifact)}, sha256: ${JSON.stringify(createHash('sha256').update(saved).digest('hex'))} }] }); }); };\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(cwd, '.pi', 'extensions', 'checkpoint-declaration.js'), `export default (pi) => { pi.on('before_agent_start', (_event, ctx) => { ctx.scheduledExecution?.active?.checkpoint({ nextAction: ${JSON.stringify(nextAction)}, artifacts: [{ ref: ${JSON.stringify(artifact)}, sha256: ${JSON.stringify(createHash('sha256').update(saved).digest('hex'))} }] }); }); };\n`, { mode: 0o600 });
   const faux = ai.fauxProvider({ provider: 'resilient-native-' + mode });
   const runtime = await sdk.ModelRuntime.create({ credentials: new ai.InMemoryCredentialStore(), modelsStore: new ai.InMemoryModelsStore(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
   runtime.registerNativeProvider(faux.provider);
