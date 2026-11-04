@@ -34,6 +34,7 @@ export function summarizeResilient(job: ResilientJob, options: JobStatusOptions)
       ownerEpoch: job.runtime.ownerEpoch, revision: job.revision!, missedCount: job.runtime.missedCount, cooldownStep: job.runtime.cooldownStep,
       ...(attempt ? { attemptId: attempt.id, acceptedRevision: attempt.revision, ownerSessionId: attempt.owner.sessionId, workBudgetMs: attempt.workBudgetMs, deadlineMs: attempt.deadlineMs, ...(attempt.nativeSessionId ? { nativeSessionId: attempt.nativeSessionId } : {}), ...(attempt.nativeRunId ? { nativeRunId: attempt.nativeRunId } : {}), ...(attempt.nativeDeadlineAt ? { nativeDeadlineAt: attempt.nativeDeadlineAt } : {}) } : {}),
       ...(last ? { lastAttempt: { id: last.id, execution: last.outcome, effectStatus: last.effectStatus, businessOutcome: "unverified" as const }, ...(last.modelSdkClose ? { sdkCloseAt: last.modelSdkClose.closedAt } : {}) } : {}),
+      ...(job.runtime.legacyUncertainty?.claimId && job.claim ? { legacyClaim: { id: job.runtime.legacyUncertainty.claimId, binding: job.claim.binding, outcome: job.runtime.legacyUncertainty.status, ...(job.runtime.legacyFutureAfter ? { futureAfter: job.runtime.legacyFutureAfter } : {}) } } : {}),
       ...(snapshot ? { native: { phase: snapshot.phase, nativeClosed: snapshot.nativeClosed, ownedHandles: snapshot.ownedHandles.slice(0, 16).map(id => id.slice(0, 128)), requestCount: snapshot.requestCount, retryCount: snapshot.retryCount, failedRecoveryMs: snapshot.failedRecoveryMs, providerPhase: snapshot.providerPhase } } : {}),
       businessOutcome: "unverified",
     },

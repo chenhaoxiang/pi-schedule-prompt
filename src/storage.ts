@@ -4,7 +4,8 @@ import * as path from "node:path";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
 import { instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
-import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
+import { nextDue, timingView } from "./timing.js";
+import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type LegacyOwnerHandover, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
 
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
 
@@ -86,7 +87,14 @@ function validate(store: unknown): asserts store is CronStore {
     ids.add(job.id);
     names.add(job.name);
   }
-  for (const job of data.jobs) if (isResilient(job) && job.legacyLineage?.some(id => !ids.has(id))) throw new Error("Proven legacy lineage must retain its original job rows");
+  for (const job of data.jobs) {
+    if (isResilient(job) && job.legacyLineage?.some(id => !ids.has(id))) throw new Error("Proven legacy lineage must retain its original job rows");
+    for (const proof of job.legacyHandovers ?? []) {
+      const parent = data.jobs.find(item => item.id === proof.predecessorJobId);
+      const child = data.jobs.find(item => item.id === proof.successorJobId);
+      if (parent?.claim?.id !== proof.claimId || parent.claim.binding !== proof.claimBinding || parent.claim.sessionId !== proof.fromSessionId || parent.recovery?.successorJobId !== proof.successorJobId || parent.recovery.evidenceFingerprint !== proof.recoveryEvidenceFingerprint || !child || (child.claim ? child.claim.sessionId !== proof.toSessionId : !isResilient(child) && child.session !== proof.toSessionId)) throw new Error("Retained handover no longer matches its original legacy claim/recovery");
+    }
+  }
   if (data.migration !== undefined && (!data.migration || typeof data.migration !== "object" || data.version !== 4 || ![1, 2, 3].includes(data.migration.fromVersion) || !instant(data.migration.at) || !validEvidenceFingerprint(data.migration.originalSha256) || typeof data.migration.backupRef !== "string" || !/^[A-Za-z0-9._-]{1,200}$/.test(data.migration.backupRef) || [".", ".."].includes(data.migration.backupRef))) throw new Error("Invalid schema4 migration reference");
 }
 
@@ -101,6 +109,8 @@ export type MigrationRuntimeReadback = { status: "verified"; activeRunIds: strin
 export interface Schema4MigrationRequest {
   expectedSha256: string;
   policy?: Partial<ResilientPolicy>;
+  /** Exact, externally evidenced owner takeovers; omission never infers cross-session lineage. */
+  legacyHandovers?: LegacyOwnerHandover[];
   /** Read the affected native handles/loaded writers, never infer quiescence from age, PID absence or a settled JSON field. */
   inspectRuntime: (jobId?: string) => MigrationRuntimeReadback;
 }
@@ -181,6 +191,7 @@ export class CronStorage {
     const existing = this.getJob(id);
     if (!existing || existing.session !== sessionId) throw new Error("Migration requires the owning session");
     if (isResilient(existing)) {
+      if (request.legacyHandovers && JSON.stringify(request.legacyHandovers) !== JSON.stringify(existing.legacyHandovers ?? [])) throw new Error("Already resilient with different retained handover evidence");
       const desired = resilientDefinition(existing, request.policy).policy;
       if (Object.keys(desired).some(key => desired[key as keyof ResilientPolicy] !== existing.policy[key as keyof ResilientPolicy])) throw new Error("Already resilient with a different policy; use an explicit definition update");
       return { job: structuredClone(existing), changed: false, preview };
@@ -198,7 +209,7 @@ export class CronStorage {
       if (!job.maxRuns || !job.expiresAt) throw new Error("Migration requires finite maxRuns and expiresAt; expiry is preserved, not extended");
       if (job.type === "interval" && request.policy?.intervalMode === undefined) throw new Error("Existing intervals require an explicit fixed-delay/fixed-rate selection");
       if (job.type === "cron" && request.policy?.timezone === undefined) throw new Error("Legacy cron migration requires its observed effective timezone");
-      const rebased = inheritLegacyBudget(store.jobs, id);
+      const rebased = inheritLegacyBudget(store.jobs, id, request.legacyHandovers);
       const promoted = resilientDefinition({ ...rebased, revision: (rebased.revision ?? 0) + 1 }, request.policy);
       // Legacy pending ticks are not replay evidence. Their original bytes remain in the private backup.
       promoted.pendingIntent = undefined; promoted.pendingEvent = undefined;
@@ -315,6 +326,7 @@ export class CronStorage {
       if (preparedNative && (job.model !== preparedNative.model || (job.runtime.continuation || preparedNative.checkpoint) && !sameCheckpointReference(job.runtime.continuation?.checkpoint, preparedNative.checkpoint))) return;
       const runtime = job.runtime; const pending = runtime.pending;
       if (!pending || pending.id !== occurrenceId || pending.revision !== revision || Date.parse(pending.dueAt) > now) return;
+      if (runtime.legacyFutureAfter && Date.parse(pending.dueAt) <= Date.parse(runtime.legacyFutureAfter)) { runtime.pending = undefined; runtime.missedCount++; return; }
       if (job.attemptHistory.some(record => record.charged && record.occurrence.id === pending.id && record.occurrence.revision === pending.revision)) { runtime.pending = undefined; return; }
       if (now - Date.parse(pending.dueAt) > job.policy.latenessMs) { runtime.pending = undefined; runtime.missedCount++; return; }
       const day = new Date(now).toISOString().slice(0, 10);
@@ -476,6 +488,36 @@ export class CronStorage {
       } else {
         job.runtime.slot = { kind: "idle", phase: "reconciling", reason: "effect_unknown" };
       }
+      return true;
+    });
+  }
+
+  /** Exact migrated-legacy claim evidence permits only future occurrences, without inventing native history. */
+  reconcileLegacyClaim(id: string, sessionId: string, claimId: string, claimBinding: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): boolean {
+    if (!validEventId(claimId) || !validEvidenceFingerprint(claimBinding) || !validEvidenceFingerprint(evidenceFingerprint) || !["continue", "waiting-input", "unknown"].includes(disposition) || !Array.isArray(safeScopes) || safeScopes.length > 32 || !safeScopes.every(validEventId)) throw new Error("Legacy reconciliation requires exact claim/binding, SHA-256 effect evidence and bounded scopes");
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind === "owned" || job.runtime.continuation) return false;
+      const claim = job.claim;
+      if (!claim || claim.id !== claimId || claim.binding !== claimBinding || claim.phase !== "settled" || !["unknown", "aborted"].includes(claim.outcome ?? "") || job.runtime.legacyUncertainty?.claimId !== claimId) return false;
+      const prior = job.attemptResolutions.find(item => item.attemptId === claimId && item.evidenceFingerprint === evidenceFingerprint);
+      if (prior) {
+        if (prior.disposition !== disposition || prior.legacyClaimBinding !== claimBinding || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution");
+        return false;
+      }
+      // Once a new native attempt exists, legacy evidence cannot retime it or replace native reconciliation.
+      if (job.attemptHistory.length) return false;
+      const at = new Date().toISOString();
+      job.attemptResolutions.push({ attemptId: claimId, legacyClaimBinding: claimBinding, evidenceFingerprint, at, disposition, ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}) });
+      const blocked = requiresReconciliation(job);
+      if (disposition === "continue" && !blocked) {
+        job.runtime.legacyFutureAfter ??= at;
+        job.runtime.pending = undefined;
+        const next = nextDue(timingView(job), Date.now()).toISOString();
+        job.runtime.nextEligibleAt = next;
+        if (!job.runtime.notBefore || Date.parse(job.runtime.notBefore) < Date.parse(next)) job.runtime.notBefore = next;
+        job.runtime.slot = { kind: "idle", phase: Date.parse(job.expiresAt!) <= Date.now() || job.attemptCount! >= job.maxRuns! ? "finished" : "backoff", reason: "legacy_future_only" };
+      } else job.runtime.slot = { kind: "idle", phase: disposition === "waiting-input" ? "waiting-input" : "reconciling", reason: disposition === "waiting-input" ? "legacy_waiting_input" : "legacy_effect_unresolved" };
       return true;
     });
   }
@@ -942,7 +984,7 @@ export class CronStorage {
       const changed = configKeys.some(key => key in partial && JSON.stringify(job[key as keyof CronJob]) !== JSON.stringify(partial[key as keyof CronJob]));
       if (!isResilient(job) && partial.policy?.mode === "resilient") throw new Error("Use explicit state migration to convert a legacy job; spending cannot be reset");
       if (isResilient(job)) {
-        const protectedKeys = ["id", "runtime", "attemptHistory", "attemptResolutions", "attemptCount", "dailyUsage", "runCount", "claim", "recovery", "legacyLineage", "session"];
+        const protectedKeys = ["id", "runtime", "attemptHistory", "attemptResolutions", "attemptCount", "dailyUsage", "runCount", "claim", "recovery", "legacyLineage", "legacyHandovers", "session"];
         if (protectedKeys.some(key => key in partial)) throw new Error("Use exact-owner resilient transitions; history, spending and owner cannot be overwritten");
         if (changed && sessionId !== job.session) throw new Error("Only the owning session may change a resilient definition");
         if (partial.policy && partial.policy.mode !== "resilient") throw new Error("Resilient state cannot be downgraded by a configuration update");

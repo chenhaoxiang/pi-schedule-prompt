@@ -52,6 +52,7 @@ export interface ScheduleJobStatus {
     nativeSessionId?: string;
     nativeRunId?: string;
     sdkCloseAt?: string;
+    legacyClaim?: { id: string; binding: string; outcome: "unknown" | "aborted"; futureAfter?: string };
     timezone?: string;
     ownerEpoch?: number;
     revision?: number;

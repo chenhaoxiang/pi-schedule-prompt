@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import { budgetPrompt, DurableExecution } from "./durable.js";
 import { dailyLimited, eventBinding, eventNames } from "./events.js";
 import { FOLLOWUP_DUE_EVENT, type FollowupDueRequest } from "./followup.js";
 import { githubFingerprint } from "./github-events.js";
+import { nativeCapability } from "./native.js";
 import { isResilient } from "./resilient-policy.js";
 import { ResilientScheduling } from "./resilient-scheduler.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
@@ -15,6 +17,10 @@ type ValidateScheduleResult =
   | { ok: true; schedule: string; intervalMs?: number }
   | { ok: false; error: string };
 const MAX_DELAY = 2_147_483_647;
+// Captured when this module actually loads, not inferred from a later disk selection.
+const loadedPackage = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
+const receiptUrl = new URL("../.install-receipt.json", import.meta.url);
+const loadedInstall = existsSync(receiptUrl) ? JSON.parse(readFileSync(receiptUrl, "utf8")) as { sourceSha?: string; hostVersion?: string } : undefined;
 const promptFor = (job: CronJob) => {
   const base = job.type === "event"
     ? job.prompt + "\n\nConfigured event context (metadata, not authorization): " + JSON.stringify({ names: job.schedule, github: job.github })
@@ -138,6 +144,23 @@ export class CronScheduler {
     return !!job && isResilient(job) && job.session === this.ctx.sessionManager.getSessionId() && this.resilient.requestDrain(id);
   }
   getNativeRunSnapshot(id: string) { return this.resilient.snapshot(id); }
+  /** Bounded metadata from this live scheduler/context; no claim that unobserved SDK resources closed. */
+  runtimeReadback() {
+    const capability = nativeCapability(this.ctx);
+    let native: { state: "unsupported" | "none" | "unknown" | "owned"; runId?: string; jobId?: string; phase?: string; nativeClosed?: boolean; ownedHandleCount?: number } = { state: capability ? "none" : "unsupported" };
+    try {
+      const snapshot = capability?.active?.snapshot();
+      if (snapshot) native = { state: "owned", runId: snapshot.runId, jobId: snapshot.binding.jobId, phase: snapshot.phase, nativeClosed: snapshot.nativeClosed, ownedHandleCount: snapshot.ownedHandles.length };
+    } catch { native = { state: "unknown" }; }
+    return {
+      version: 1, observedAt: new Date().toISOString(), pid: process.pid, sessionId: this.ctx.sessionManager.getSessionId(), storePath: this.storage.getStorePath(),
+      loadedSchedule: { name: loadedPackage.name, version: loadedPackage.version, sourceSha: loadedInstall?.sourceSha ?? null, boundSdkVersion: loadedInstall?.hostVersion ?? null, moduleUrl: import.meta.url, commandPath: this.pi.getCommands?.().find(command => command.name === "schedule-host-status")?.sourceInfo?.path ?? null, readerSchemas: [1, 2, 3, 4] },
+      actualCoreVersion: "not-exposed", nativeCapabilityVersion: capability?.version ?? null, native,
+      coreIdle: this.ctx.isIdle?.() ?? null, pendingMessages: this.ctx.hasPendingMessages?.() ?? null, effectiveTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      registered: { running: !this.stopped, scheduledTurn: this.scheduledTurn, legacyDurableBusy: this.durable.busy(), activeLegacyJobCount: this.activeJobs.size, activeLegacyModelControllerCount: this.activeSubagents.size, resilientJobIds: this.resilient.registeredJobIds().slice(0, 20), pendingJobCount: this.pending.size },
+      untrackedSdkHandles: "not-observed", closureEvidence: "This is registered scheduler/native metadata only, not proof that unrelated or untracked SDK/delegated handles closed.",
+    };
+  }
   reconcileResilientJob(id: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): { job: CronJob; changed: boolean } {
     const job = this.storage.getJob(id);
     if (!job || !isResilient(job) || job.session !== this.ctx.sessionManager.getSessionId()) throw new Error("Exact resilient reconciliation requires the owning session");
@@ -148,6 +171,17 @@ export class CronScheduler {
     const changed = this.storage.reconcileResilientAttempt(id, job.session!, attemptId, evidenceFingerprint, disposition, safeScopes);
     const updated = this.storage.getJob(id);
     if (!updated || !isResilient(updated) || !updated.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition)) throw new Error("No exact finalized checkpoint resolution was recorded; no old work was replayed");
+    if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated); this.drain(); }
+    return { job: updated, changed };
+  }
+
+  reconcileLegacyJob(id: string, claimId: string, claimBinding: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): { job: CronJob; changed: boolean } {
+    const job = this.storage.getJob(id);
+    if (this.isScheduledTurn() || !job || !isResilient(job) || job.session !== this.ctx.sessionManager.getSessionId()) throw new Error("Legacy effect reconciliation requires the ordinary owning operator context");
+    if (this.durable.busy() || this.activeJobs.size || this.activeSubagents.size || job.runtime.slot.kind === "owned") throw new Error("Wait for exact native/SDK resource closure before legacy reconciliation");
+    const changed = this.storage.reconcileLegacyClaim(id, job.session!, claimId, claimBinding, evidenceFingerprint, disposition, safeScopes);
+    const updated = this.storage.getJob(id);
+    if (!updated || !isResilient(updated) || !updated.attemptResolutions.some(item => item.attemptId === claimId && item.legacyClaimBinding === claimBinding && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && JSON.stringify(item.safeScopes ?? []) === JSON.stringify(safeScopes))) throw new Error("No exact retained legacy claim resolution was recorded");
     if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated); this.drain(); }
     return { job: updated, changed };
   }

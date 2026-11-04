@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
 import { createCronTool } from "../src/tool.js";
-import type { NativeExecutionProof, ResilientJob } from "../src/types.js";
+import type { CronJob, NativeExecutionProof, ResilientJob } from "../src/types.js";
 
 const owned: string[] = [];
 const schedulers: CronScheduler[] = [];
@@ -38,6 +38,14 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-04T00:
 afterEach(() => { for (const scheduler of schedulers.splice(0)) scheduler.stop(); vi.useRealTimers(); for (const cwd of owned.splice(0)) fs.rmSync(cwd, { recursive: true, force: true }); });
 
 describe("canonical resilient management", () => {
+  it("reports bounded loaded schedule/native capability metadata without inferring unrelated SDK closure", () => {
+    const h = fixture(); const readback = h.scheduler.runtimeReadback();
+    expect(readback.loadedSchedule).toMatchObject({ name: "pi-schedule-prompt", version: JSON.parse(fs.readFileSync("package.json", "utf8")).version, readerSchemas: [1, 2, 3, 4] });
+    expect(readback.sessionId).toBe("owner"); expect(readback.pid).toBe(process.pid); expect(readback.nativeCapabilityVersion).toBe(1);
+    expect(readback.registered).toMatchObject({ running: true, legacyDurableBusy: false, activeLegacyJobCount: 0, activeLegacyModelControllerCount: 0, pendingJobCount: 0 });
+    expect(readback.untrackedSdkHandles).toBe("not-observed"); expect(readback.closureEvidence).toContain("not proof");
+  });
+
   it("creates schema4 only for an explicit new resilient store and defaults to completion-delay", async () => {
     const h = fixture(); const result = await h.add(); expect(result.isError).not.toBe(true);
     const job = h.row(result.details!.jobId!);
@@ -101,6 +109,20 @@ describe("canonical resilient management", () => {
     const notBefore = new Date(Date.now() + 3 * 3600000).toISOString(); const first = closedUnknown(h, id, { execution: "deferred", retryNotBefore: notBefore });
     expect((await h.call({ action: "reconcile", jobId: id, attemptId: first.attempt.id, evidenceFingerprint: "a".repeat(64), resolution: "continue" })).isError).not.toBe(true);
     expect(h.row(id).runtime.notBefore).toBe(notBefore); expect(h.scheduler.getNextRun(id)?.toISOString()).toBe("2026-11-05T00:00:00.000Z"); expect(h.row(id).attemptCount).toBe(1); expect(h.ctx.scheduledExecution!.start).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a migrated legacy claim through the official tool without making another job or native proof", async () => {
+    const h = fixture(); const legacy: CronJob = { id: "imported", name: "imported", type: "cron", schedule: "0 0 * * * *", prompt: "private synthetic goal", enabled: false, session: "owner", durable: true, createdAt: new Date().toISOString(), runCount: 4, attemptCount: 4, maxRuns: 126, expiresAt: new Date(Date.now() + 86400000).toISOString(), maxRunsPerDay: 24, deadlineMs: 2700000, lastStatus: "unknown", claim: { id: "legacy-claim", binding: "c".repeat(64), sessionId: "owner", ownerId: "fixture", ownerPid: 1, phase: "settled", outcome: "unknown", claimedAt: new Date().toISOString(), deadlineAt: new Date().toISOString() } };
+    h.storage.addJob(legacy); h.storage.migrateJobToSchema4(legacy.id, "owner", { expectedSha256: h.storage.previewSchema4Migration().originalSha256, policy: { timezone: "UTC" }, inspectRuntime: () => ({ status: "verified", activeRunIds: [], incompatibleWriterIds: [] }) });
+    const params = { action: "reconcile", jobId: legacy.id, claimId: legacy.claim!.id, claimBinding: legacy.claim!.binding, evidenceFingerprint: "e".repeat(64), resolution: "continue" };
+    expect((await h.call({ ...params, claimBinding: undefined })).isError).toBe(true);
+    expect((await h.call({ ...params, attemptId: "other" })).isError).toBe(true);
+    h.scheduler.setScheduledTurn(true); expect((await h.call(params)).isError).toBe(true); h.scheduler.setScheduledTurn(false);
+    expect((await h.call(params)).isError).not.toBe(true); expect((await h.call(params)).isError).not.toBe(true);
+    expect(h.row(legacy.id)).toMatchObject({ enabled: false, attemptCount: 4, maxRuns: 126, claim: legacy.claim, attemptHistory: [] });
+    expect((await h.call({ action: "enable", jobId: legacy.id })).isError).not.toBe(true);
+    expect(h.scheduler.getNextRun(legacy.id)?.toISOString()).toBe("2026-11-04T01:00:00.000Z");
+    expect(h.storage.getAllJobs()).toHaveLength(1); expect(h.ctx.scheduledExecution!.start).not.toHaveBeenCalled();
   });
 
   it("can record/release an exact retained input wait with no observed effects without replaying completed history", async () => {

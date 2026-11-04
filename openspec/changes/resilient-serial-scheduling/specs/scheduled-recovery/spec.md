@@ -46,6 +46,10 @@ Uncertain external effects SHALL retain stable identifiers and UNKNOWN until the
 - **WHEN** an arbitrary tool or wrapper cannot prove whether or where effects occurred
 - **THEN** classification remains unknown and the potentially conflicting business writes remain held
 
+#### Scenario: Migrated legacy uncertainty has no native checkpoint
+- **WHEN** the ordinary owning operator reconciles an exact migrated legacy claim with separate external effect evidence
+- **THEN** the official path appends its exact claim binding without fabricating native history, preserves the original UNKNOWN and disabled intent, and admits only separately enabled future occurrences after whole-claim reconciliation while scope-only evidence remains blocked
+
 ### Requirement: A local blocker does not stop independent work
 After the prior executor verifiably ends, a precisely scoped unresolved effect or missing input SHALL block only conflicting work when its boundary is provable. Independent already-authorized work can continue; an unbounded or ambiguous effect scope SHALL keep that job's business writes held and request attention.
 

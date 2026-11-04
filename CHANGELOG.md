@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.14 (2026-11-04; source candidate, live acceptance separate)
+- Preserve complete legacy recovery spending across an explicitly evidenced cross-session handover; retain disabled predecessors and reject mismatched, duplicate or unused handover tuples without rewriting their original claims.
+- Add exact migrated-legacy claim reconciliation through the existing owning-session tool/API, without fabricated native history, automatic enablement, replacement jobs, replay or new lifetime/daily/expiry allowance.
+- Report bounded loaded Schedule/native/registered-work metadata through existing status paths; distinguish bound SDK from actual Core and leave unobserved SDK resources explicitly unknown.
+- Add provider-free full-ancestry, future-only, negative-evidence and actual SDK installed-package regressions.
+
 ### Maintained fork 0.4.1-fork.13 (2026-11-04)
 - Declare the imported Pi SDK packages and typebox as wildcard host peers; keep exact typebox only in development dependencies, not the fixed runtime payload.
 - Bind fixed installations to the selected host's actual resolved typebox package (hoisted or nested), validate its declared name/version and exact path, and reject independent replacement copies or changed reuse bindings.
