@@ -3,12 +3,12 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NativeCapability, NativeRunHandle, NativeRunSnapshot } from "../src/native.js";
 import { resilientDefinition } from "../src/resilient-policy.js";
-import { planScheduledModel, prepareScheduledModel, readStoredModelSession } from "../src/scheduled-model.js";
+import { MODEL_SDK_CLOSE_ENTRY, planScheduledModel, prepareScheduledModel, readStoredModelSession } from "../src/scheduled-model.js";
 import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
-import type { CronJob, NativeExecutionProof, ResilientJob, ResilientPolicy } from "../src/types.js";
+import type { CronJob, ModelSdkCloseProof, NativeExecutionProof, ResilientJob, ResilientPolicy } from "../src/types.js";
 
-vi.mock("../src/scheduled-model.js", () => ({ planScheduledModel: vi.fn(), prepareScheduledModel: vi.fn(), readStoredModelSession: vi.fn() }));
+vi.mock("../src/scheduled-model.js", async importOriginal => ({ ...await importOriginal<typeof import("../src/scheduled-model.js")>(), planScheduledModel: vi.fn(), prepareScheduledModel: vi.fn(), readStoredModelSession: vi.fn() }));
 
 const directories: string[] = [];
 const schedulers: CronScheduler[] = [];
@@ -65,10 +65,15 @@ function fixture(extra: Partial<CronJob> = {}, policy: Partial<ResilientPolicy> 
   const ctx = { cwd, isIdle: () => !active && !userBusy, hasPendingMessages: () => false, abort: vi.fn(), hasUI: false, modelRegistry: { getAvailable: () => [] }, sessionManager: { getSessionId: () => "owner", getEntries: () => [...entries.values()], getEntry: (id: string) => entries.get(id), getSessionFile: () => path.join(cwd, "native-session.jsonl") }, ...(supported ? { scheduledExecution: capability } : {}) };
   const pi = { sendMessage: vi.fn(), events: { emit: vi.fn() }, appendEntry: vi.fn() };
   function newScheduler() { const scheduler = new CronScheduler(storage, pi as any, ctx as any); schedulers.push(scheduler); return scheduler; }
-  return { storage, ctx, pi, runs, capability, newScheduler, row: () => storage.getJob("job") as ResilientJob, busy: (value: boolean) => { userBusy = value; }, refuse: (value?: typeof refusal) => { refusal = value; } };
+  return { storage, ctx, pi, runs, entries, capability, newScheduler, row: () => storage.getJob("job") as ResilientJob, busy: (value: boolean) => { userBusy = value; }, refuse: (value?: typeof refusal) => { refusal = value; } };
 }
 function modelPreparation(h: ReturnType<typeof fixture>) {
-  const dispose = vi.fn(async () => undefined);
+  const dispose = vi.fn(async (receipt?: NativeExecutionProof): Promise<ModelSdkCloseProof | undefined> => {
+    if (!receipt) return undefined;
+    const proof: ModelSdkCloseProof = { version: 1, runId: receipt.runId, binding: { ...receipt.binding }, checkpointEntryId: receipt.checkpointEntryId, closedAt: new Date().toISOString() };
+    h.entries.set("sdk-close-" + receipt.runId, { id: "sdk-close-" + receipt.runId, type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: proof });
+    return proof;
+  });
   const child = h.capability;
   h.ctx.scheduledExecution = { version: 1, active: undefined, start: vi.fn(() => { throw new Error("must not dispatch explicit model inline"); }) };
   const readers = new Map<string, any>();
@@ -258,6 +263,76 @@ describe("resilient native timer composition", () => {
     const h = fixture({ model: "fixture/model" }); const prepared = modelPreparation(h); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000); await flush();
     scheduler.stop(); expect(prepared.dispose).not.toHaveBeenCalled(); expect(h.runs[0].handle.requestCancel).toHaveBeenCalledWith("scheduler_stopped"); expect(h.row().runtime.slot.kind).toBe("owned");
     h.runs[0].close("cancelled", "unknown"); await flush(); expect(prepared.dispose).toHaveBeenCalledOnce(); expect(h.row().runtime.slot.phase).toBe("reconciling");
+  });
+
+  it("review: retains model ownership until asynchronous SDK shutdown acknowledges closure", async () => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute });
+    const prepared = modelPreparation(h);
+    let release!: () => void;
+    let disposed = false;
+    const shutdown = new Promise<void>(resolve => { release = resolve; });
+    prepared.dispose.mockImplementationOnce(async () => { await shutdown; disposed = true; });
+    h.newScheduler().start(); await advance(minute + 1000); await flush();
+    const firstSession = h.runs[0].request.binding.ownerSessionId;
+    h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    expect(prepared.dispose).toHaveBeenCalledOnce();
+    await advance(minute + 1000); await flush();
+    const observed = { disposed, preparations: vi.mocked(prepareScheduledModel).mock.calls.length, nativeRuns: h.runs.length, samePersistentSession: h.runs[1]?.request.binding.ownerSessionId === firstSession, slot: h.row().runtime.slot.kind, attemptCount: h.row().attemptCount };
+    console.log("REVIEW_MODEL_SHUTDOWN", JSON.stringify(observed));
+    release(); await flush();
+    expect(observed.preparations, "second persistent SDK writer must not be constructed before old SDK shutdown closes").toBe(1);
+    expect(observed.nativeRuns).toBe(1);
+  });
+
+  it("starts completion-delay and cooldown from actual SDK close ACK, not the earlier native receipt", async () => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute });
+    const prepared = modelPreparation(h); const acknowledge = prepared.dispose.getMockImplementation()!;
+    let release!: () => void; const shutdown = new Promise<void>(resolve => { release = resolve; });
+    prepared.dispose.mockImplementationOnce(async receipt => { await shutdown; return acknowledge(receipt); });
+    const scheduler = h.newScheduler(); scheduler.start(); await advance(minute + 1000); await flush();
+    const sessionId = h.runs[0].request.binding.ownerSessionId; const nativeFinishedAt = new Date().toISOString();
+    h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    expect(h.row()).toMatchObject({ attemptCount: 1, attemptHistory: [], runtime: { slot: { kind: "owned", phase: "draining", reason: "awaiting_sdk_shutdown" } } });
+    await advance(3 * minute); expect(h.runs).toHaveLength(1); expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(scheduler.getNextRun("job")).toBeNull();
+    const closedAt = new Date().toISOString(); release(); await flush(); await flush();
+    expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { lastFinishedAt: closedAt, slot: { kind: "idle", phase: "backoff" } }, attemptHistory: [{ closedAt: nativeFinishedAt, modelSdkClose: { closedAt, binding: { ownerSessionId: sessionId } } }] });
+    expect(scheduler.getNextRun("job")?.getTime()).toBe(Date.parse(closedAt) + minute);
+    await advance(minute - 1); expect(h.runs).toHaveLength(1); await advance(1001); await flush();
+    expect(h.runs).toHaveLength(2); expect(h.runs[1].request.binding.ownerSessionId).toBe(sessionId);
+  });
+
+  it.each(["shutdown failure", "SDK close ACK write failure"])("retains charged ownership after %s and refuses raw-receipt restart", async failure => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute }); const prepared = modelPreparation(h);
+    prepared.dispose.mockRejectedValueOnce(new Error("synthetic " + failure));
+    h.newScheduler().start(); await advance(minute + 1000); await flush(); h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush(); await flush();
+    expect(h.row()).toMatchObject({ enabled: true, attemptCount: 1, attemptHistory: [], runtime: { slot: { kind: "owned", phase: "attention-required", reason: "model_sdk_close_failed" } } });
+    const entries = h.entries.size; h.newScheduler().start(); await advance(2 * minute); await flush();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "model_sdk_closure_unconfirmed" });
+    expect(h.entries.size).toBe(entries); expect(h.runs).toHaveLength(1); expect(prepareScheduledModel).toHaveBeenCalledOnce();
+  });
+
+  it("does not let a second scheduler use a raw native receipt or a foreign SDK-close ACK as file-writer exit evidence", async () => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute }); const prepared = modelPreparation(h); const acknowledge = prepared.dispose.getMockImplementation()!;
+    let release!: () => void; const shutdown = new Promise<void>(resolve => { release = resolve; }); prepared.dispose.mockImplementationOnce(async receipt => { await shutdown; return acknowledge(receipt); });
+    h.newScheduler().start(); await advance(minute + 1000); await flush(); h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    const native = h.entries.get("receipt-run-0").data as NativeExecutionProof;
+    h.entries.set("foreign-sdk-close", { type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: { version: 1, runId: native.runId, binding: { ...native.binding, attemptId: "foreign-attempt" }, checkpointEntryId: native.checkpointEntryId, closedAt: new Date().toISOString() } });
+    h.newScheduler().start(); await advance(2 * minute); await flush();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "model_sdk_closure_unconfirmed" }); expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(h.runs).toHaveLength(1);
+    vi.spyOn(h.storage, "settleResilient").mockImplementationOnce(() => { throw new Error("synthetic final store write loss after SDK ACK"); });
+    const closedAt = new Date().toISOString(); release(); await flush(); await flush(); expect(h.row().runtime.slot.kind).toBe("owned");
+    const recovered = h.newScheduler(); recovered.start(); await flush();
+    expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { lastFinishedAt: closedAt, slot: { kind: "idle", phase: "backoff" } }, attemptHistory: [{ modelSdkClose: { closedAt, runId: native.runId } }] });
+    expect(recovered.getNextRun("job")?.getTime()).toBe(Date.parse(closedAt) + minute); expect(prepareScheduledModel).toHaveBeenCalledOnce();
+  });
+
+  it("does not refund a model native refusal until that prepared SDK writer has actually closed", async () => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute }); const prepared = modelPreparation(h);
+    let release!: () => void; const shutdown = new Promise<void>(resolve => { release = resolve; }); prepared.dispose.mockImplementationOnce(async () => { await shutdown; return undefined; });
+    h.refuse("busy"); h.newScheduler().start(); await advance(minute + 1000); await flush();
+    expect(h.row()).toMatchObject({ attemptCount: 1, attemptHistory: [], runtime: { slot: { kind: "owned" } } });
+    await advance(2 * minute); expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(h.runs).toHaveLength(0);
+    release(); await flush(); await flush(); expect(h.row()).toMatchObject({ attemptCount: 0, attemptHistory: [{ charged: false, outcome: "not-started" }] });
   });
 
   it("preserves a user stop and original bounds through exact native completion", async () => {

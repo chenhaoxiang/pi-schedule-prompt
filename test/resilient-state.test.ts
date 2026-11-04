@@ -217,7 +217,9 @@ describe("versioned resilient store and exact ownership", () => {
     expect(attempt.nativeSessionId).toBe("schedule-" + attempt.id);
     const { proof, checkpoint } = evidence(h.storage, attempt);
     expect(proof.binding.ownerSessionId).not.toBe(attempt.owner.sessionId);
-    expect(h.storage.settleResilient("job", attempt.id, attempt.owner, proof, checkpoint, { phase: "waiting" })).toBe(true);
+    expect(() => h.storage.settleResilient("job", attempt.id, attempt.owner, proof, checkpoint, { phase: "waiting" })).toThrow(/SDK\/file writer/);
+    const sdkClosed = { version: 1 as const, runId: proof.runId, binding: { ...proof.binding }, checkpointEntryId: proof.checkpointEntryId, closedAt: new Date().toISOString() };
+    expect(h.storage.settleResilient("job", attempt.id, attempt.owner, proof, checkpoint, { phase: "waiting" }, sdkClosed)).toBe(true);
   });
 
   it("retains the lifetime bound and user intent through skipped ticks and final closure", () => {

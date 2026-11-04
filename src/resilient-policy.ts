@@ -1,6 +1,6 @@
 import { Cron } from "croner";
 import { validEventId, validEvidenceFingerprint } from "./events.js";
-import type { AttemptOwner, AttemptRecord, AttemptResolution, CronJob, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, ResilientPolicy, TimedOccurrence } from "./types.js";
+import type { AttemptOwner, AttemptRecord, AttemptResolution, CronJob, ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, ResilientPolicy, TimedOccurrence } from "./types.js";
 
 const idlePhases = new Set(["waiting", "backoff", "reconciling", "waiting-input", "attention-required", "finished"]);
 const ownedPhases = new Set(["running", "draining", "cancelling", "attention-required"]);
@@ -100,6 +100,10 @@ function validateCheckpoint(value: NativeCheckpointReference, sessionId: string,
   if (!value || value.sessionId !== sessionId || !validEventId(value.entryId) || !validEventId(value.runId) || (runId !== undefined && value.runId !== runId) || (value.sessionFile !== undefined && (typeof value.sessionFile !== "string" || value.sessionFile.length > 2048 || /[\u0000-\u001f\u007f]/.test(value.sessionFile)))) throw new Error("Invalid native checkpoint reference");
 }
 
+export function validateModelSdkClose(proof: ModelSdkCloseProof, native: NativeExecutionProof): void {
+  if (proof?.version !== 1 || proof.runId !== native.runId || proof.checkpointEntryId !== native.checkpointEntryId || !proof.binding || ["jobId", "attemptId", "ownerSessionId", "ownerEpoch", "revision"].some(key => proof.binding[key as keyof typeof proof.binding] !== native.binding[key as keyof typeof native.binding]) || !instant(proof.closedAt)) throw new Error("Model SDK close acknowledgement must bind the exact native attempt/run/checkpoint");
+}
+
 export function validateNativeProof(proof: NativeExecutionProof): void {
   if (proof?.version !== 1 || !validEventId(proof.runId) || !proof.binding || !validEventId(proof.binding.jobId) || !validEventId(proof.binding.attemptId) || !validEventId(proof.binding.ownerSessionId) || !safeInteger(proof.binding.ownerEpoch, 1) || !safeInteger(proof.binding.revision, 1) || !instant(proof.finishedAt) || !nativeOutcomes.has(proof.execution) || !validEventId(proof.checkpointEntryId) || !["none-observed", "unknown"].includes(proof.effectStatus) || proof.businessOutcome !== "unverified" || !Number.isFinite(proof.failedRecoveryMs) || proof.failedRecoveryMs < 0 || (proof.retryNotBefore !== undefined && !instant(proof.retryNotBefore))) throw new Error("Invalid native execution proof");
 }
@@ -124,11 +128,14 @@ function validateRecord(record: AttemptRecord, job: ResilientJob): void {
   if (record.owner.epoch > job.runtime.ownerEpoch || record.revision > (job.revision ?? 1) || record.occurrence.revision !== record.revision) throw new Error("Inconsistent historical resilient identity");
   if (record.nativeProof) {
     validateNativeProof(record.nativeProof);
+    if (record.modelSdkClose) validateModelSdkClose(record.modelSdkClose, record.nativeProof);
     const binding = record.nativeProof.binding;
     if (binding.jobId !== job.id || binding.attemptId !== record.id || (!record.model && binding.ownerSessionId !== record.owner.sessionId) || binding.ownerEpoch !== record.owner.epoch || binding.revision !== record.revision || record.nativeProof.finishedAt !== record.closedAt || record.nativeProof.execution !== record.outcome || record.nativeProof.effectStatus !== record.effectStatus) throw new Error("Receipt cannot settle a different resilient attempt");
   }
   if (record.checkpoint) validateCheckpoint(record.checkpoint, record.nativeProof?.binding.ownerSessionId ?? record.owner.sessionId, record.nativeProof?.runId);
   if (record.nativeProof && record.checkpoint?.entryId !== record.nativeProof.checkpointEntryId) throw new Error("Native history must retain its exact checkpoint");
+  if (record.modelSdkClose && (!record.model || !record.nativeProof)) throw new Error("Model SDK close cannot belong to an inline/unproved attempt");
+  if (record.model && record.charged && !record.modelSdkClose) throw new Error("Finalized model attempts require exact persistent SDK close acknowledgement");
   if (record.outcome === "not-started" && (record.charged || record.nativeProof || record.checkpoint || record.effectStatus !== "none-observed")) throw new Error("A native refusal cannot be charged or claim execution");
   if (record.charged && !record.nativeProof) throw new Error("Finalized admitted attempts require an exact native closure proof");
 }

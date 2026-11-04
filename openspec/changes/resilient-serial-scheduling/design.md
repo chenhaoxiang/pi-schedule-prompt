@@ -60,6 +60,8 @@ Hard deadline requests cancellation for that run only. It enters cancelling firs
 
 Use explicitly owned Subagents handles when the scheduled contract actually waits for a child; mere notification delivery or parent idle cannot stand in for child closure. Preserve existing independent detached-child semantics: do not claim their effects were rolled back.
 
+An explicit-model persistent SDK session is also an owned file writer. Its native run receipt cannot release the job while asynchronous `session_shutdown`/disposal remains outstanding. Keep the slot owned through SDK idle, awaited shutdown, disposal and final idle acknowledgement; persist a Schedule-owned close ACK bound to the exact native attempt/run/checkpoint in the existing native transcript before finalizing the store. Failed/missing/foreign ACKs hold ownership, including on restart with an otherwise valid native receipt. Fixed-delay/cooldown use this actual safe-close timestamp; an earlier native receipt timestamp cannot make a new writer immediately eligible.
+
 ### 6. Native Pi capability, not global setting mutation
 
 Add an additive, capability-versioned native execution seam for an accepted scheduled custom turn: run-scoped retry/execution policy, opaque run identity, metadata-only execution state, drain/yield request, and exact cancellation/settlement result. The concrete API belongs to Pi's session/extension types and documented SDK seam, not a model-provided event payload. Preserve the existing `ctx.abort(): void` compatibility contract; add an acknowledged exact-run operation instead of changing every extension or assuming void means stopped.

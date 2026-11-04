@@ -3,8 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
-import { instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
-import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
+import { instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
+import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
 
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
 
@@ -358,7 +358,7 @@ export class CronStorage {
   }
 
   /** Exact native closure first; final attempt records are append-only and never become business success. */
-  settleResilient(id: string, attemptId: string, owner: AttemptOwner, received: NativeExecutionProof, checkpoint: NativeCheckpointReference, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }): boolean {
+  settleResilient(id: string, attemptId: string, owner: AttemptOwner, received: NativeExecutionProof, checkpoint: NativeCheckpointReference, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }, modelSdkClose?: ModelSdkCloseProof): boolean {
     validateNativeProof(received);
     const proof: NativeExecutionProof = {
       version: 1, runId: received.runId,
@@ -380,6 +380,10 @@ export class CronStorage {
         return false;
       }
       if (proof.binding.jobId !== id || proof.binding.attemptId !== attemptId || proof.binding.ownerEpoch !== owner.epoch || proof.binding.revision !== attempt.revision || (attempt.nativeRunId && proof.runId !== attempt.nativeRunId) || proof.binding.ownerSessionId !== (attempt.nativeSessionId ?? owner.sessionId)) return false;
+      if (attempt.model) {
+        if (!modelSdkClose) throw new Error("A native model receipt cannot release its persistent SDK/file writer without a close acknowledgement");
+        validateModelSdkClose(modelSdkClose, proof);
+      } else if (modelSdkClose) throw new Error("Inline work cannot claim model SDK close acknowledgement");
       if (disposition.phase === "waiting" && proof.execution !== "completed") throw new Error("Interrupted work cannot be silently rearmed as a fresh occurrence");
       if (disposition.phase === "backoff" && (proof.execution !== "deferred" || proof.effectStatus !== "none-observed" || !disposition.notBefore)) throw new Error("Only known pre-effect deferral can automatically back off");
       const effectUnknown = proof.effectStatus === "unknown";
@@ -390,10 +394,10 @@ export class CronStorage {
         charged: true, id: attempt.id, revision: attempt.revision, owner: { ...attempt.owner }, occurrence: { ...attempt.occurrence },
         admittedAt: attempt.admittedAt, closedAt: proof.finishedAt, outcome: proof.execution,
         ...(attempt.model ? { model: attempt.model } : {}), ...(disposition.reason ? { reason: disposition.reason } : {}),
-        nativeProof: proof, checkpoint: structuredClone(checkpoint), effectStatus: proof.effectStatus, businessOutcome: "unverified",
+        nativeProof: proof, ...(modelSdkClose ? { modelSdkClose: structuredClone(modelSdkClose) } : {}), checkpoint: structuredClone(checkpoint), effectStatus: proof.effectStatus, businessOutcome: "unverified",
       };
       job.attemptHistory.push(record);
-      job.runtime.lastFinishedAt = proof.finishedAt;
+      job.runtime.lastFinishedAt = modelSdkClose?.closedAt ?? proof.finishedAt;
       job.runtime.slot = { kind: "idle", phase: effectivePhase, ...(effectiveReason ? { reason: effectiveReason } : {}) };
       job.runtime.notBefore = effectivePhase === "reconciling" ? undefined : disposition.notBefore; job.runtime.nextEligibleAt = effectivePhase === "reconciling" ? undefined : disposition.nextEligibleAt;
       if (proof.execution !== "completed" || effectUnknown || ["reconciling", "waiting-input", "attention-required"].includes(effectivePhase)) {

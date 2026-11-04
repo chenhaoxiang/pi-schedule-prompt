@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeRunCheckpoint, type NativeRunHandle, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
 import { isResilient } from "./resilient-policy.js";
-import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readStoredModelSession } from "./scheduled-model.js";
+import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readModelSdkClose, readStoredModelSession } from "./scheduled-model.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { cooldownNotBefore, misfire, nextDue, nextEligibleAfter, occurrence, timingView } from "./timing.js";
-import type { CronJob, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, TimedOccurrence } from "./types.js";
+import type { CronJob, ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, TimedOccurrence } from "./types.js";
 
 export interface ResilientSchedulerHooks {
   onQueued(jobId: string): void;
@@ -17,7 +17,8 @@ interface TrackedRun {
   attempt: OwnedAttempt;
   handle: NativeRunHandle;
   sessionManager: NativeSessionReader;
-  dispose?: () => void | Promise<void>;
+  dispose?: (receipt?: NativeExecutionProof) => Promise<ModelSdkCloseProof | undefined>;
+  closing?: boolean;
   projected?: string;
 }
 const bindingFor = (jobId: string, attempt: OwnedAttempt): NativeExecutionProof["binding"] => ({ jobId, attemptId: attempt.id, ownerSessionId: attempt.nativeSessionId ?? attempt.owner.sessionId, ownerEpoch: attempt.owner.epoch, revision: attempt.revision });
@@ -175,15 +176,15 @@ export class ResilientScheduling {
       }
       const accepted = prepared.capability.start({ binding: bindingFor(admitted.id, attempt), policy: { softDeadlineMs: attempt.workBudgetMs, hardDeadlineMs: attempt.deadlineMs, recoveryBudgetMs: 300_000 }, content: this.prompt(admitted, prepared.sessionManager) });
       if (!accepted.accepted) {
-        const refunded = this.storage.refuseResilientNative(admitted.id, attempt.id, attempt.owner, accepted.reason);
         await prepared.dispose(); prepared = undefined;
+        const refunded = this.storage.refuseResilientNative(admitted.id, attempt.id, attempt.owner, accepted.reason);
         if (accepted.reason === "busy" && refunded) this.hooks.onQueued(admitted.id);
         this.emitChange(admitted.id);
         return;
       }
       if (!this.attach(admitted, attempt, accepted.handle, { sessionManager: prepared.sessionManager, dispose: prepared.dispose })) {
         const dispose = prepared.dispose;
-        void accepted.handle.settled.then(() => dispose()).catch(error => this.hooks.onError(snapshot.id, error));
+        void accepted.handle.settled.then(receipt => dispose(receipt)).catch(error => this.hooks.onError(snapshot.id, error));
       }
       prepared = undefined;
     } catch (error) {
@@ -192,12 +193,16 @@ export class ResilientScheduling {
         const active = prepared.capability.active;
         if (active && admitted && attempt && sameNativeBinding(active.snapshot().binding, bindingFor(admitted.id, attempt))) {
           const recovered = this.attach(admitted, attempt, active, { sessionManager: prepared.sessionManager, dispose: prepared.dispose });
+          if (!recovered) {
+            const dispose = prepared.dispose;
+            void active.settled.then(receipt => dispose(receipt)).catch(failure => this.hooks.onError(snapshot.id, failure));
+          }
           prepared = undefined;
           if (recovered) return;
         } else if (!active) await prepared.dispose();
         else {
           const dispose = prepared.dispose;
-          void active.settled.then(() => dispose()).catch(failure => this.hooks.onError(snapshot.id, failure));
+          void active.settled.then(receipt => dispose(receipt)).catch(failure => this.hooks.onError(snapshot.id, failure));
         }
       }
       if (admitted && attempt) this.keepOwned(admitted, attempt, "native_model_preparation_failed", error);
@@ -260,17 +265,27 @@ export class ResilientScheduling {
     this.keepOwned(job, attempt, "native_owner_unconfirmed");
   }
 
-  private attach(job: ResilientJob, attempt: OwnedAttempt, handle: NativeRunHandle, context: { sessionManager: NativeSessionReader; dispose?: () => void | Promise<void> }): boolean {
+  private attach(job: ResilientJob, attempt: OwnedAttempt, handle: NativeRunHandle, context: { sessionManager: NativeSessionReader; dispose?: (receipt?: NativeExecutionProof) => Promise<ModelSdkCloseProof | undefined> }): boolean {
     if (this.active.get(job.id)?.handle === handle) { this.armMonitor(); return true; }
     try {
       const snapshot = handle.snapshot();
       if (snapshot.runId !== handle.runId || !sameNativeBinding(snapshot.binding, bindingFor(job.id, attempt))) throw new Error("Native handle returned a different accepted binding");
       if (!this.storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId: handle.runId, sessionId: snapshot.binding.ownerSessionId, ...(attempt.model ? { sessionFile: context.sessionManager.getSessionFile() } : {}), startedAt: snapshot.startedAt, deadlineAt: snapshot.hardDeadlineAt })) throw new Error("Native handle could not bind its exact storage owner");
+      if (attempt.model && !context.dispose) throw new Error("Persistent model SDK closure callback is unavailable");
       this.active.set(job.id, { attempt: structuredClone(attempt), handle, ...context });
-      void handle.settled.then(receipt => {
+      void handle.settled.then(async receipt => {
+        if (attempt.model) {
+          const tracked = this.active.get(job.id);
+          if (tracked?.attempt.id === attempt.id) tracked.closing = true;
+          try {
+            this.storage.markResilientPhase(job.id, attempt.id, attempt.owner, "draining", "awaiting_sdk_shutdown", { sessionId: receipt.binding.ownerSessionId, runId: receipt.runId, entryId: receipt.checkpointEntryId, sessionFile: context.sessionManager.getSessionFile() });
+            this.emitChange(job.id);
+          } catch (error) { this.hooks.onError(job.id, error); }
+          try { await context.dispose!(receipt); }
+          catch (error) { this.keepOwned(job, attempt, "model_sdk_close_failed", error); return; }
+        }
         this.finish(job.id, attempt, receipt, context.sessionManager);
-        return context.dispose?.();
-      }, error => this.keepOwned(job, attempt, "native_settlement_unknown", error)).catch(error => this.hooks.onError(job.id, error));
+      }, error => this.keepOwned(job, attempt, "native_settlement_unknown", error)).catch(error => this.keepOwned(job, attempt, "native_settlement_unknown", error));
       this.armMonitor();
       return true;
     } catch (error) {
@@ -300,12 +315,15 @@ export class ResilientScheduling {
       before = this.current(id);
       if (!before) return;
       const checkpoint = this.checkpoint(receipt, manager);
+      const modelSdkClose = attempt.model ? readModelSdkClose(manager, receipt) : undefined;
+      if (attempt.model && !modelSdkClose) { this.keepOwned(before, attempt, "model_sdk_closure_unconfirmed"); return; }
+      const safelyFinishedAt = modelSdkClose?.closedAt ?? receipt.finishedAt;
       const input = receipt.reason === "user_input_required" || checkpoint.waitingReason === "user_input_required";
       const unknown = receipt.effectStatus === "unknown";
       const exhausted = !before.enabled || Date.parse(before.expiresAt!) <= Date.now() || before.attemptCount! >= before.maxRuns!;
       const phase = input ? "waiting-input" as const : unknown ? "reconciling" as const : exhausted ? "finished" as const : receipt.execution === "completed" ? "waiting" as const : receipt.execution === "deferred" ? "backoff" as const : "attention-required" as const;
-      const notBefore = phase === "backoff" ? new Date(Math.max(Date.parse(cooldownNotBefore(Date.parse(receipt.finishedAt), before.runtime.cooldownStep + 1)), receipt.retryNotBefore ? Date.parse(receipt.retryNotBefore) : 0)).toISOString() : undefined;
-      const committed = this.storage.settleResilient(id, attempt.id, attempt.owner, receipt, checkpoint.reference, { phase, reason: input ? "user_input_required" : receipt.reason, ...(notBefore ? { notBefore } : {}), ...(["waiting", "backoff"].includes(phase) && before.runtime.nextEligibleAt ? { nextEligibleAt: before.runtime.nextEligibleAt } : {}) });
+      const notBefore = phase === "backoff" ? new Date(Math.max(Date.parse(cooldownNotBefore(Date.parse(safelyFinishedAt), before.runtime.cooldownStep + 1)), receipt.retryNotBefore ? Date.parse(receipt.retryNotBefore) : 0)).toISOString() : undefined;
+      const committed = this.storage.settleResilient(id, attempt.id, attempt.owner, receipt, checkpoint.reference, { phase, reason: input ? "user_input_required" : receipt.reason, ...(notBefore ? { notBefore } : {}), ...(["waiting", "backoff"].includes(phase) && before.runtime.nextEligibleAt ? { nextEligibleAt: before.runtime.nextEligibleAt } : {}) }, modelSdkClose);
       if (this.active.get(id)?.attempt.id === attempt.id) this.active.delete(id);
       if (committed) {
         this.hooks.onChange(this.current(id));
@@ -346,7 +364,7 @@ export class ResilientScheduling {
           const snapshot = run.handle.snapshot();
           if (["draining", "cancelling", "attention-required"].includes(snapshot.phase)) {
             const key = `${snapshot.phase}:${snapshot.reason ?? ""}:${snapshot.checkpointEntryId ?? ""}`;
-            if (run.projected !== key) {
+            if (run.projected !== key && !run.closing) {
               const phase = snapshot.phase as "draining" | "cancelling" | "attention-required";
               this.storage.markResilientPhase(id, run.attempt.id, run.attempt.owner, phase, snapshot.reason, snapshot.checkpointEntryId ? { sessionId: snapshot.binding.ownerSessionId, runId: snapshot.runId, entryId: snapshot.checkpointEntryId } : undefined);
               run.projected = key; this.hooks.onChange(this.current(id));

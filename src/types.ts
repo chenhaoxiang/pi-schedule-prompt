@@ -76,6 +76,14 @@ export interface NativeExecutionProof {
   failedRecoveryMs: number;
   retryNotBefore?: string;
 }
+/** Schedule-owned acknowledgement of the persistent child SDK/file writer, distinct from native loop settlement. */
+export interface ModelSdkCloseProof {
+  version: 1;
+  runId: string;
+  binding: NativeExecutionProof["binding"];
+  checkpointEntryId: string;
+  closedAt: string;
+}
 /** Final records are immutable; later evidence is appended to attemptResolutions instead. */
 export interface AttemptRecord {
   /** False only for a proven native refusal before execution, or an imported legacy record already counted in the baseline. */
@@ -90,6 +98,7 @@ export interface AttemptRecord {
   model?: string;
   reason?: string;
   nativeProof?: NativeExecutionProof;
+  modelSdkClose?: ModelSdkCloseProof;
   checkpoint?: NativeCheckpointReference;
   effectStatus: "none-observed" | "unknown";
   businessOutcome: "unverified";

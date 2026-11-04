@@ -1,15 +1,18 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AgentSession, CURRENT_SESSION_VERSION, type ExtensionContext, type FileEntry, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
-import { type NativeCapability, type NativeSessionReader, nativeCapability } from "./native.js";
+import { type NativeCapability, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
+import { validateModelSdkClose, validateNativeProof } from "./resilient-policy.js";
 import { prepareModelSession, resolveModelRoute } from "./subagent.js";
-import type { NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob } from "./types.js";
+import type { ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob } from "./types.js";
+
+export const MODEL_SDK_CLOSE_ENTRY = "schedule.model-sdk-closed.v1";
 
 export interface ScheduledModelPlan { route: string; checkpoint?: NativeCheckpointReference; }
 export interface PreparedScheduledModel {
   capability: NativeCapability;
   sessionManager: NativeSessionReader;
-  dispose(): Promise<void>;
+  dispose(receipt?: NativeExecutionProof): Promise<ModelSdkCloseProof | undefined>;
 }
 const sessionDirectory = (cwd: string) => path.resolve(cwd, ".pi", "schedule-native");
 const staticCapabilityVersion = () => (AgentSession as unknown as { scheduledExecutionVersion?: number }).scheduledExecutionVersion;
@@ -30,6 +33,20 @@ export function readStoredModelSession(cwd: string, sessionId: string, sessionFi
   if (entries.some(entry => !entry || typeof entry.id !== "string" || !entry.id) || new Set(entries.map(entry => entry.id)).size !== entries.length) throw new Error("Native transcript entries are malformed/duplicated; preserve original bytes");
   const byId = new Map(entries.map(entry => [entry.id, entry]));
   return { getSessionId: () => sessionId, getSessionFile: () => selected, getEntry: id => structuredClone(byId.get(id)), getEntries: () => structuredClone(entries) };
+}
+
+/** A native run receipt cannot substitute for this separate persistent SDK/file-writer acknowledgement. */
+export function readModelSdkClose(manager: NativeSessionReader, native: NativeExecutionProof): ModelSdkCloseProof | undefined {
+  const entries = manager.getEntries();
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY) continue;
+    const proof = entry.data as ModelSdkCloseProof;
+    if (proof?.runId !== native.runId || !sameNativeBinding(proof.binding, native.binding) || proof.checkpointEntryId !== native.checkpointEntryId) continue;
+    validateModelSdkClose(proof, native);
+    return structuredClone(proof);
+  }
+  return undefined;
 }
 
 /** Pure route/checkpoint/SDK preflight. It constructs no SDK session and writes no transcript. */
@@ -71,10 +88,32 @@ export async function prepareScheduledModel(ctx: ExtensionContext, job: Resilien
     bindFile(file);
   }
   const session = await prepareModelSession(ctx, route, { extensions: job.extensions, skills: job.skills }, manager, true);
-  const dispose = async () => {
-    await session.waitForIdle();
-    try { await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
-    finally { session.dispose(); }
+  let cleanup: Promise<string> | undefined;
+  let acknowledged: ModelSdkCloseProof | undefined;
+  const dispose = async (receipt?: NativeExecutionProof): Promise<ModelSdkCloseProof | undefined> => {
+    if (receipt) {
+      validateNativeProof(receipt);
+      if (!sameNativeBinding(receipt.binding, { jobId: job.id, attemptId: attempt.id, ownerSessionId: manager.getSessionId(), ownerEpoch: attempt.owner.epoch, revision: attempt.revision })) throw new Error("SDK close cannot acknowledge a different native attempt");
+    }
+    cleanup ??= (async () => {
+      await session.waitForIdle();
+      let shutdownFailed = false;
+      const unsubscribe = session.extensionRunner.onError(error => { if (error.event === "session_shutdown") shutdownFailed = true; });
+      try {
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        if (shutdownFailed) throw new Error("Model SDK shutdown handler failed; file-writer closure remains unacknowledged");
+      } finally { unsubscribe(); session.dispose(); }
+      // dispose() signals abort but returns void; acknowledge any SDK loop a shutdown hook left alive only after idle.
+      await session.waitForIdle();
+      return new Date().toISOString();
+    })();
+    const closedAt = await cleanup;
+    if (!receipt) return undefined;
+    if (acknowledged) { validateModelSdkClose(acknowledged, receipt); return structuredClone(acknowledged); }
+    const proof: ModelSdkCloseProof = { version: 1, runId: receipt.runId, binding: { ...receipt.binding }, checkpointEntryId: receipt.checkpointEntryId, closedAt };
+    manager.appendCustomEntry(MODEL_SDK_CLOSE_ENTRY, proof);
+    acknowledged = proof;
+    return structuredClone(proof);
   };
   if (staticCapabilityVersion() !== 1 || !session.model || `${session.model.provider}/${session.model.id}` !== route) { await dispose(); throw new Error("Scheduled model session did not select the exact native route/capability"); }
   const capability = nativeCapability(session);
