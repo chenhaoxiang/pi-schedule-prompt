@@ -1,9 +1,9 @@
 /**
- * Lightweight in-process subagent runner.
- *
- * Used when a scheduled job has `model` set: spawn a fresh AgentSession with
- * the chosen model, run the prompt to completion, return the assistant's text.
- * No subprocess, no extension recursion (noExtensions: true), no persistence.
+ * Existing in-process model-session preparation and legacy one-shot runner.
+ * Legacy model jobs keep their fresh in-memory prompt/text contract. Resilient
+ * jobs use the same preparation with an explicit persistent SessionManager and
+ * the native scheduled capability; neither route creates a subprocess or loads
+ * this scheduling extension recursively.
  */
 
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,8 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { scheduledToolCallBlock } from "./input-guard.js";
+import { nativeCapability } from "./native.js";
 
 const DEFAULT_TOOL_NAMES = ["bash", "read", "edit", "write", "grep", "find", "ls"];
 
@@ -131,19 +133,17 @@ export function describeAvailableModels(
   return `Available: ${sample}${more}`;
 }
 
-export async function runSubagentOnce(
+/** Prepare the existing native SDK model route without starting inference; callers own the returned session. */
+export async function prepareModelSession(
   ctx: ExtensionContext,
-  prompt: string,
   modelStr: string,
-  signal?: AbortSignal,
-  options: RunSubagentOptions = {},
-): Promise<SubagentResult> {
-  try {
+  options: RunSubagentOptions,
+  sessionManager: SessionManager,
+  scheduled = false,
+): Promise<AgentSession> {
     const resolution = resolveModelRoute(ctx.modelRegistry, modelStr);
-    if (!resolution.ok) return { ok: false, error: resolution.error };
+    if (!resolution.ok) throw new Error(resolution.error);
     const { model } = resolution;
-
-    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
     const agentDir = getAgentDir();
 
     // Helper: convert extensions/skills option to boolean and optionally filter.
@@ -155,6 +155,8 @@ export async function runSubagentOnce(
 
     const extList = getNameList(options.extensions);
     const skillList = getNameList(options.skills);
+    // The fixed builtin-only loadout has no question tool; extension loadouts need an unattended input guard.
+    const guardExternalInput = scheduled && isEnabled(options.extensions);
 
     const packageRoot = fileURLToPath(new URL("../", import.meta.url));
     const loader = new DefaultResourceLoader({
@@ -166,12 +168,24 @@ export async function runSubagentOnce(
       noSkills: !isEnabled(options.skills),
       noPromptTemplates: true,
       noThemes: true,
+      ...(guardExternalInput ? { extensionFactories: [{ name: "schedule-native-input-guard", factory: (pi) => {
+        pi.on("tool_call", (event, child) => {
+          const active = nativeCapability(child)?.active;
+          const blocked = scheduledToolCallBlock(!!active, event.toolName);
+          if (blocked && active) {
+            active.checkpoint({ waitingReason: "user_input_required", nextAction: "Wait for the exact missing input; do not repeat the blocked question" });
+            active.requestDrain("user_input_required");
+          }
+          return blocked;
+        });
+      } }] } : {}),
       ...(isEnabled(options.extensions) && {
         extensionsOverride: (base) => ({
           ...base,
           extensions: base.extensions.filter((ext) =>
-            !ext.path.startsWith(packageRoot) &&
-            (!extList || extList.some((name) => ext.path.toLowerCase().includes(name.toLowerCase()))),
+            (scheduled && ext.path === "<inline:schedule-native-input-guard>") ||
+            (!ext.path.startsWith(packageRoot) &&
+            (!extList || extList.some((name) => ext.path.toLowerCase().includes(name.toLowerCase())))),
           ),
         }),
       }),
@@ -194,7 +208,7 @@ export async function runSubagentOnce(
     const { session } = await createAgentSession({
       cwd: ctx.cwd,
       agentDir,
-      sessionManager: SessionManager.inMemory(ctx.cwd),
+      sessionManager,
       settingsManager: SettingsManager.create(ctx.cwd, agentDir),
       modelRuntime,
       thinkingLevel: ctx.thinkingLevel,
@@ -203,10 +217,24 @@ export async function runSubagentOnce(
       resourceLoader: loader,
     });
 
-    try {
     if (isEnabled(options.extensions)) {
-      await session.bindExtensions({});
+      try { await session.bindExtensions({}); }
+      catch (error) { session.dispose(); throw error; }
     }
+    return session;
+}
+
+export async function runSubagentOnce(
+  ctx: ExtensionContext,
+  prompt: string,
+  modelStr: string,
+  signal?: AbortSignal,
+  options: RunSubagentOptions = {},
+): Promise<SubagentResult> {
+  try {
+    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
+    const session = await prepareModelSession(ctx, modelStr, options, SessionManager.inMemory(ctx.cwd));
+    try {
     let onAbort: (() => void) | undefined;
     if (signal) {
       if (signal.aborted) {

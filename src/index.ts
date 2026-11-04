@@ -17,6 +17,7 @@ import { startEventApi } from "./event-api.js";
 import { EVENT_REQUEST, PROGRESS_REQUEST, validEventId, validEvidenceFingerprint, validProgressOutcome } from "./events.js";
 import { classifyFollowupReply, FOLLOWUP_CANCEL_TRANSPORT_EVENT, FOLLOWUP_OBSERVED_EVENT, FOLLOWUP_SCHEDULE_EVENT, type FollowupObservation, type FollowupRecord, type FollowupScheduleRequest, followupName, followupPrompt, validateFollowupBinding, validateFollowupOptions } from "./followup.js";
 import { scheduledToolCallBlock } from "./input-guard.js";
+import { isResilient } from "./resilient-policy.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
 import { receiptsByClaim, summarizeJobs } from "./status.js";
@@ -337,6 +338,7 @@ export default async function (pi: ExtensionAPI) {
       const jobSummary = summarizeJobs(selected, {
         receiptByClaim: receiptsByClaim(ctx.sessionManager.getEntries?.()),
         nextRun: id => scheduler?.getNextRun(id) ?? null,
+        nativeSnapshot: id => scheduler?.getNativeRunSnapshot(id),
       });
       const details = {
         requestId: match[1], ready: !!scheduler?.isRunning(), pid: process.pid, sessionId,
@@ -345,6 +347,9 @@ export default async function (pi: ExtensionAPI) {
           enabled: jobs.filter(job => job.enabled).length,
           disabled: jobs.filter(job => !job.enabled).length,
           disabledUnknown: jobs.filter(job => !job.enabled && (job.lastStatus === "unknown" || job.claim?.outcome === "unknown" || job.followUp?.state === "unknown")).length,
+          owned: jobs.filter(job => isResilient(job) && job.runtime.slot.kind === "owned").length,
+          needsAttention: jobs.filter(job => isResilient(job) && ["reconciling", "waiting-input", "attention-required"].includes(job.runtime.slot.phase)).length,
+          waiting: jobs.filter(job => job.enabled && isResilient(job) && job.runtime.slot.kind === "idle" && ["waiting", "backoff"].includes(job.runtime.slot.phase)).length,
         },
         jobSummary, jobSummaryTruncated: !match[2] && jobs.length > selected.length,
       };

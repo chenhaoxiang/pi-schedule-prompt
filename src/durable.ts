@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { eventBinding } from "./events.js";
+import { isResilient } from "./resilient-policy.js";
 import type { CronStorage } from "./storage.js";
 import type { CronJob, ExecutionOutcome, ExecutionReason, ExecutionReceipt } from "./types.js";
 
@@ -48,7 +49,7 @@ export class DurableExecution {
       .map(entry => (entry as { data: ExecutionReceipt }).data)
       .filter(data => data && data.sessionId === this.sessionId && ["success", "error", "aborted", "unknown"].includes(data.outcome));
     for (const job of this.storage.getAllJobs()) {
-      if (!job.durable || job.session !== this.sessionId) continue;
+      if (!job.durable || isResilient(job) || job.session !== this.sessionId) continue;
       this.storage.reconcileJob(job.id, this.sessionId, this.ownerId, receipts, processAlive);
       const latest = this.storage.getJob(job.id)!;
       if (latest.catchUp !== "latest" || latest.pendingIntent?.binding !== eventBinding(latest)) this.storage.updateJob(job.id, { pendingIntent: undefined });
@@ -178,7 +179,7 @@ export class DurableExecution {
   flushNotices(): void {
     for (const job of this.storage.getAllJobs()) {
       const notice = job.notice;
-      if (!job.durable || job.session !== this.sessionId || !notice || notice.state === "accepted" || notice.attempts >= 3) continue;
+      if (!job.durable || isResilient(job) || job.session !== this.sessionId || !notice || notice.state === "accepted" || notice.attempts >= 3) continue;
       let accepted = false;
       try {
         this.pi.events.emit("schedule:execution", { version: 1, jobId: job.id, ...notice });

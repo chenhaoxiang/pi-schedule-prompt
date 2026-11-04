@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-04
+goal: Implement approved serial persistent scheduling and recovery with native
+  Pi run-bound budgets, without replaying UNKNOWN effects or changing global
+  retry behavior

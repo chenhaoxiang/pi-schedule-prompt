@@ -6,8 +6,9 @@
 
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey } from "@earendil-works/pi-tui";
+import { isResilient } from "../resilient-policy.js";
 import { CronScheduler } from "../scheduler.js";
-import type { CronStorage } from "../storage.js";
+import { type CronStorage, canCleanupJob } from "../storage.js";
 import type { CronJob } from "../types.js";
 
 type ConfirmState =
@@ -89,11 +90,11 @@ export class JobsView implements Component {
   private handleConfirmInput(data: string): void {
     if (matchesKey(data, "y")) {
       if (this.confirm?.kind === "remove") {
-        this.storage.removeJob(this.confirm.id);
+        this.storage.removeJob(this.confirm.id, this.mySessionId);
         this.scheduler.removeJob(this.confirm.id);
       } else if (this.confirm?.kind === "cleanup") {
-        for (const j of this.mine.filter((j) => !j.enabled)) {
-          this.storage.removeJob(j.id);
+        for (const j of this.mine.filter(canCleanupJob)) {
+          this.storage.removeJob(j.id, this.mySessionId);
           this.scheduler.removeJob(j.id);
         }
       }
@@ -136,8 +137,8 @@ export class JobsView implements Component {
     if (matchesKey(data, "t")) {
       if (this.isSelectionForeign()) return;
       const enabled = !sel.enabled;
-      this.storage.updateJob(sel.id, { enabled });
-      this.scheduler.updateJob(sel.id, { ...sel, enabled });
+      this.storage.updateJob(sel.id, { enabled }, this.mySessionId);
+      this.scheduler.updateJob(sel.id, this.storage.getJob(sel.id)!);
       this.refresh();
       return;
     }
@@ -147,6 +148,7 @@ export class JobsView implements Component {
       // their in-memory schedulers are stale until session_start.
       if (this.isSelectionForeign()) return;
       if (sel.type === "event") { this.operationError = "Event jobs stay session-bound."; return; }
+      if (sel.durable || isResilient(sel)) { this.operationError = "Durable/resilient jobs stay session-bound; resource/owner transfer requires explicit idle reconciliation."; return; }
       const session = sel.session ? undefined : this.mySessionId;
       this.storage.updateJob(sel.id, { session });
       this.scheduler.updateJob(sel.id, { ...sel, session });
@@ -159,7 +161,7 @@ export class JobsView implements Component {
       return;
     }
     if (matchesKey(data, "c")) {
-      const count = this.mine.filter((j) => !j.enabled).length;
+      const count = this.mine.filter(canCleanupJob).length;
       if (count === 0) return;
       this.confirm = { kind: "cleanup", count };
     }
@@ -230,6 +232,12 @@ export class JobsView implements Component {
         .join("   ");
       lines.push(this.theme.fg("dim", ` Selected: ${sel.name} (${sel.id})`));
       lines.push(this.theme.fg("dim", ` ${meta}`));
+      if (isResilient(sel)) {
+        const slot = sel.runtime.slot; const last = sel.attemptHistory.at(-1);
+        lines.push(this.theme.fg("dim", ` Native: ${sel.policy.intervalMode ?? "cron / " + sel.policy.timezone} | Phase: ${slot.phase} | Reason: ${slot.reason ?? "none"} | User intent: ${sel.enabled ? "enabled" : "disabled"}`));
+        lines.push(this.theme.fg("dim", ` Attempt: ${slot.kind === "owned" ? slot.attempt.id : last?.id ?? "none"} | Next cadence: ${sel.runtime.nextEligibleAt ?? "none"} | Not before: ${sel.runtime.notBefore ?? "none"} | Business outcome: unverified`));
+        if (last?.modelSdkClose) lines.push(this.theme.fg("dim", ` SDK/file writer close acknowledged: ${last.modelSdkClose.closedAt}`));
+      }
       lines.push(this.theme.fg("dim", ` Prompt: ${truncate(sel.prompt, 200)}`));
     }
     lines.push(rule);
@@ -264,7 +272,7 @@ export class JobsView implements Component {
 
     const name = truncate(job.name, NAME_W).padEnd(NAME_W);
     const sched = truncate(
-      CronScheduler.describeSchedule(job.type, job.schedule),
+      isResilient(job) && job.policy.intervalMode === "fixed-delay" ? "finish + " + job.schedule : CronScheduler.describeSchedule(job.type, job.schedule),
       SCHED_W,
     ).padEnd(SCHED_W);
     const prompt = truncate(job.prompt, PROMPT_W).padEnd(PROMPT_W);

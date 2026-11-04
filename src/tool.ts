@@ -2,12 +2,33 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { nanoid } from "nanoid";
 import { validateGithub, validEventId, validEvidenceFingerprint } from "./events.js";
+import { nativeCapability } from "./native.js";
+import { isResilient, resilientDefinition } from "./resilient-policy.js";
+import { planScheduledModel } from "./scheduled-model.js";
 import { CronScheduler } from "./scheduler.js";
 import type { JobScope } from "./settings.js";
-import type { CronStorage } from "./storage.js";
+import { summarizeJobs } from "./status.js";
+import { type CronStorage, canCleanupJob } from "./storage.js";
 import { resolveModelRoute } from "./subagent.js";
-import type { CronJob, CronJobType, CronToolDetails, } from "./types.js";
+import type { CronJob, CronJobType, CronToolDetails, CronToolParamsType, ResilientPolicy } from "./types.js";
 import { CronToolParams } from "./types.js";
+
+const resilientFields = ["intervalMode", "timezone", "overlapPolicy", "misfirePolicy", "latenessMs", "workBudgetMs"] as const;
+function policyOptions(params: CronToolParamsType, job?: CronJob): Partial<ResilientPolicy> | undefined {
+  const mode = params.mode ?? job?.policy?.mode ?? "legacy";
+  if (!["legacy", "resilient"].includes(mode)) throw new Error("mode must be legacy or resilient");
+  if (job && isResilient(job) && mode !== "resilient") throw new Error("Resilient execution/history cannot be downgraded to legacy mode");
+  if (mode === "legacy") {
+    if (resilientFields.some(field => params[field] !== undefined)) throw new Error("Resilient policy fields require mode=resilient; legacy cadence is never silently reinterpreted");
+    return undefined;
+  }
+  if (job && !isResilient(job)) throw new Error("Existing legacy jobs require explicit schema4 migration after verified runtime quiescence; preview is read-only");
+  if (params.durable === false) throw new Error("Resilient jobs require durable native ownership");
+  if (params.quietOnNoChange === true || params.github !== undefined) throw new Error("Resilient timing does not reinterpret legacy event/GitHub quiet controls");
+  const alias = params.catchUp === "latest" ? "latest" : params.catchUp === "none" ? "skip" : undefined;
+  if (alias && params.misfirePolicy && alias !== params.misfirePolicy) throw new Error("catchUp conflicts with misfirePolicy");
+  return { ...Object.fromEntries(resilientFields.filter(field => params[field] !== undefined).map(field => [field, params[field]])), ...(params.misfirePolicy ?? alias ? { misfirePolicy: params.misfirePolicy ?? alias } : {}) };
+}
 
 /**
  * Create the schedule_prompt tool definition.
@@ -22,7 +43,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId), resume (needs jobId, exact settled UNKNOWN/aborted claimId and SHA-256 evidenceFingerprint). Resume creates only a FUTURE continuation; it never replays or marks the old claim successful. maxRunsPerDay counts UTC attempts.",
+      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId), resume (needs jobId, exact settled UNKNOWN/aborted claimId and SHA-256 evidenceFingerprint). Resume creates only a FUTURE continuation; it never replays or marks the old claim successful. maxRunsPerDay counts UTC attempts. Explicit mode=resilient requires native v1, finite maxRuns/expiresAt and a new/prepared schema4 store for session-bound recurring jobs. New resilient intervals default fixed-delay (N after exact safe finish), never silently replacing legacy cadence. Read-only status/preview; drain checkpoints the exact owned handle; reconcile requires an exact finalized attemptId, SHA-256 evidenceFingerprint and resolution from the ordinary owning operator context, not new authority.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -47,11 +68,12 @@ export function createCronTool(
       };
 
       try {
-        if (["remove", "enable", "disable", "update", "resume"].includes(action) && params.jobId) {
+        if (["remove", "enable", "disable", "update", "resume", "reconcile", "drain"].includes(action) && params.jobId) {
           const target = storage.getJob(params.jobId);
           if (target && !CronScheduler.isLoadedFor(target, ctx.sessionManager.getSessionId())) {
             throw new Error("Job belongs to another session and is read-only here");
           }
+          if (target && isResilient(target) && ["update", "enable", "reconcile"].includes(action) && scheduler.isScheduledTurn?.()) throw new Error("A scheduled turn cannot renew/change resilient authorization or reconcile its own evidence; use the ordinary owning operator context");
         }
         if (params.maxRuns !== undefined && (!Number.isSafeInteger(params.maxRuns) || params.maxRuns < 1)) {
           throw new Error("maxRuns must be a positive safe integer");
@@ -66,6 +88,29 @@ export function createCronTool(
           throw new Error("expiresAt must be an absolute future timestamp");
         }
         switch (action) {
+          case "preview": {
+            const preview = storage.previewSchema4Migration();
+            return { content: [{ type: "text", text: "Read-only schema4 preview. This is not runtime quiescence, effect reconciliation or execution authorization.\n" + JSON.stringify({ ...preview, legacyReaderRollback: storage.assessSchemaRollback([1, 2, 3]) }) }], details };
+          }
+          case "status": {
+            const all = storage.getAllJobs().filter(job => CronScheduler.isLoadedFor(job, ctx.sessionManager.getSessionId()));
+            const selected = params.jobId ? all.filter(job => job.id === params.jobId) : all.slice(0, 20);
+            details.status = summarizeJobs(selected, { nextRun: id => scheduler.getNextRun(id), nativeSnapshot: id => scheduler.getNativeRunSnapshot(id) });
+            details.truncated = !params.jobId && selected.length < all.length;
+            return { content: [{ type: "text", text: JSON.stringify({ running: scheduler.isRunning?.() ?? false, jobs: all.length, truncated: details.truncated, status: details.status }) }], details };
+          }
+          case "drain": {
+            if (!params.jobId) throw new Error("drain requires the exact jobId");
+            if (!scheduler.drainResilientJob(params.jobId)) throw new Error("No exact owned resilient native handle is available to checkpoint/drain; no unrelated turn was aborted");
+            details.jobId = params.jobId;
+            return { content: [{ type: "text", text: "Requested native checkpoint/drain for the exact handle. This is not an exit acknowledgement or business success." }], details };
+          }
+          case "reconcile": {
+            if (!params.jobId || !params.attemptId || !params.evidenceFingerprint || !params.resolution) throw new Error("reconcile requires jobId, exact finalized attemptId, SHA-256 evidenceFingerprint and resolution");
+            const result = scheduler.reconcileResilientJob(params.jobId, params.attemptId, params.evidenceFingerprint, params.resolution, params.safeScopes);
+            details.jobId = result.job.id; details.jobName = result.job.name; details.status = summarizeJobs([result.job], { nextRun: id => scheduler.getNextRun(id) });
+            return { content: [{ type: "text", text: `Exact checkpoint resolution ${result.changed ? "recorded" : "already recorded"}. Old execution/effect history is unchanged; this does not create new authority or business success.` }], details };
+          }
           case "resume": {
             if (!params.jobId || !params.claimId || !params.evidenceFingerprint) throw new Error("resume requires jobId, exact claimId and evidenceFingerprint");
             if (!validEventId(params.claimId) || !validEvidenceFingerprint(params.evidenceFingerprint)) throw new Error("resume requires a safe exact claimId and lowercase SHA-256 evidenceFingerprint");
@@ -83,7 +128,7 @@ export function createCronTool(
             return { content: [{ type: "text", text: `Event ${result.status}${result.reason ? ": " + result.reason : ""}` }], details };
           }
           case "add": {
-            if (process.env.PI_SCHEDULE_SERVICE_SESSION && (params.durable !== true || getDefaultScope() !== "session" || !params.maxRuns || !params.expiresAt)) throw new Error("Dedicated service requires explicit finite durable session-bound jobs");
+            if (process.env.PI_SCHEDULE_SERVICE_SESSION && ((params.durable !== true && params.mode !== "resilient") || getDefaultScope() !== "session" || !params.maxRuns || !params.expiresAt)) throw new Error("Dedicated service requires explicit finite durable session-bound jobs");
             if (!params.schedule || !params.prompt) {
               const missing = [];
               if (!params.schedule) missing.push("'schedule'");
@@ -122,7 +167,7 @@ export function createCronTool(
             const session =
               getDefaultScope() === "session" ? ctx.sessionManager.getSessionId() : undefined;
             if (getDefaultScope() === "session" && !session) throw new Error("Session-bound jobs require a session id");
-            const job: CronJob = {
+            let job: CronJob = {
               id: nanoid(10),
               name: jobName,
               schedule,
@@ -150,6 +195,14 @@ export function createCronTool(
               session,
             };
 
+            const policy = policyOptions(params);
+            if (policy) {
+              if (!nativeCapability(ctx)) throw new Error("Resilient scheduling requires loaded native capability v1; no definition/attempt was created");
+              if (!session) throw new Error("Resilient jobs must be explicitly session-bound, not shared/broadcast");
+              const nativeJob = resilientDefinition(job, policy);
+              if (nativeJob.model) planScheduledModel(ctx, nativeJob);
+              job = nativeJob;
+            }
             storage.addJob(job);
             scheduler.addJob(job);
             details.jobs = [job];
@@ -157,13 +210,14 @@ export function createCronTool(
             details.jobName = job.name;
 
             const modelLine = job.model
-              ? `\nModel: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
+              ? `\nModel: ${job.model} (${isResilient(job) ? "persistent native child" : "runs in subagent"}${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
               : "";
+            const policyLine = isResilient(job) ? `\nMode: ${job.policy.intervalMode ?? "cron / " + job.policy.timezone} | Overlap: ${job.policy.overlapPolicy} | Misfire: ${job.policy.misfirePolicy} | Work target ms: ${job.policy.workBudgetMs} | Hard elapsed ms: ${job.deadlineMs}` : "";
             return {
               content: [
                 {
                   type: "text",
-                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${job.schedule}\nPrompt: ${job.prompt}${modelLine}`,
+                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${job.schedule}\nPrompt: ${job.prompt}${modelLine}${policyLine}`,
                 },
               ],
               details,
@@ -180,7 +234,7 @@ export function createCronTool(
               throw new Error(`Job not found: ${params.jobId}`);
             }
 
-            const removed = storage.removeJob(params.jobId);
+            const removed = storage.removeJob(params.jobId, ctx.sessionManager.getSessionId());
             if (removed) {
               scheduler.removeJob(params.jobId);
               details.jobId = params.jobId;
@@ -190,7 +244,7 @@ export function createCronTool(
                 content: [
                   {
                     type: "text",
-                    text: `✓ Removed cron job "${job.name}" (${params.jobId})`,
+                    text: storage.getJob(params.jobId) ? `✓ Removed future fires for "${job.name}" (${params.jobId}); live/UNKNOWN/spending evidence is retained` : `✓ Removed cron job "${job.name}" (${params.jobId})`,
                   },
                 ],
                 details,
@@ -212,9 +266,9 @@ export function createCronTool(
 
             const enabled = action === "enable";
             const model = enabled ? canonicalModel(job.model) : undefined;
-            const modelUpdate = model && model !== job.model ? { model } : {};
-            storage.updateJob(params.jobId, { enabled, ...modelUpdate });
-            const updated = { ...job, enabled, ...modelUpdate };
+            const modelUpdate = model && model !== job.model && !isResilient(job) ? { model } : {};
+            storage.updateJob(params.jobId, { enabled, ...modelUpdate }, ctx.sessionManager.getSessionId());
+            const updated = storage.getJob(params.jobId)!;
             scheduler.updateJob(params.jobId, updated);
 
             details.jobs = [updated];
@@ -225,7 +279,7 @@ export function createCronTool(
               content: [
                 {
                   type: "text",
-                  text: `✓ ${enabled ? "Enabled" : "Disabled"} cron job "${job.name}" (${params.jobId})`,
+                  text: `✓ ${enabled ? "Enabled" : "Disabled"} cron job "${job.name}" (${params.jobId})${isResilient(updated) ? `; user intent only, runtime ${updated.runtime.slot.phase}; limits and reconciliation are unchanged` : ""}`,
                 },
               ],
               details,
@@ -238,7 +292,7 @@ export function createCronTool(
             const mySessionId = ctx.sessionManager.getSessionId();
             const disabledJobs = storage
               .getAllJobs()
-              .filter((j) => !j.enabled && !j.recovery && !["unknown", "aborted"].includes(j.claim?.outcome ?? "") && CronScheduler.isLoadedFor(j, mySessionId));
+              .filter((j) => CronScheduler.isLoadedFor(j, mySessionId) && canCleanupJob(j));
 
             if (disabledJobs.length === 0) {
               details.jobs = [];
@@ -254,7 +308,7 @@ export function createCronTool(
             }
 
             for (const job of disabledJobs) {
-              storage.removeJob(job.id);
+              storage.removeJob(job.id, mySessionId);
               scheduler.removeJob(job.id);
             }
 
@@ -306,7 +360,7 @@ export function createCronTool(
             if (params.prompt) updates.prompt = params.prompt;
             if (params.description !== undefined) updates.description = params.description;
             const model = canonicalModel(params.model ?? (job.enabled ? job.model : undefined));
-            if (model !== undefined && model !== job.model) updates.model = model;
+            if (model !== undefined && model !== job.model && (!isResilient(job) || params.model !== undefined)) updates.model = model;
             if (params.notify !== undefined) updates.notify = params.notify;
             if (params.extensions !== undefined) updates.extensions = params.extensions;
             if (params.skills !== undefined) updates.skills = params.skills;
@@ -320,8 +374,13 @@ export function createCronTool(
               if (validated.intervalMs !== undefined) updates.intervalMs = validated.intervalMs;
             }
 
-            storage.updateJob(params.jobId, updates);
-            const updated = { ...job, ...updates };
+            const policy = policyOptions(params, job);
+            if (policy) {
+              if (params.type && params.type !== job.type) throw new Error("Resilient job kind cannot be silently changed; create a separate authorized definition");
+              updates.policy = resilientDefinition({ ...job, ...updates }, policy).policy;
+            }
+            storage.updateJob(params.jobId, updates, ctx.sessionManager.getSessionId());
+            const updated = storage.getJob(params.jobId)!;
             scheduler.updateJob(params.jobId, updated);
 
             details.jobs = [updated];
@@ -362,7 +421,11 @@ export function createCronTool(
 
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
-              if (job.durable) lines.push(`  Durable claim: ${job.claim?.id ?? "none"} | Phase: ${job.claim?.phase ?? "none"} | Outcome: ${job.claim?.outcome ?? "not-proven"} | Deadline ms: ${job.deadlineMs ?? 600000} | Waiting: ${job.waitingReason ?? "none"} | Reason: ${job.claim?.outcomeReason ?? "not-recorded"} | Notice: ${job.notice?.state ?? "none"}`);
+              if (isResilient(job)) {
+                lines.push(`  Native ${job.policy.intervalMode ?? "cron / " + job.policy.timezone} | Phase: ${job.runtime.slot.phase} | Reason: ${job.runtime.slot.reason ?? "none"} | Overlap: ${job.policy.overlapPolicy} | Misfire: ${job.policy.misfirePolicy}`);
+                lines.push(`  Work target ms: ${job.policy.workBudgetMs} | Hard elapsed ms: ${job.deadlineMs} | Next cadence: ${job.runtime.nextEligibleAt ?? "none"} | Not before: ${job.runtime.notBefore ?? "none"} | Business outcome: unverified`);
+              }
+              else if (job.durable) lines.push(`  Durable claim: ${job.claim?.id ?? "none"} | Phase: ${job.claim?.phase ?? "none"} | Outcome: ${job.claim?.outcome ?? "not-proven"} | Deadline ms: ${job.deadlineMs ?? 600000} | Waiting: ${job.waitingReason ?? "none"} | Reason: ${job.claim?.outcomeReason ?? "not-recorded"} | Notice: ${job.notice?.state ?? "none"}`);
               if (job.quietOnNoChange) lines.push(`  No-change quiet: ${job.noChangeCount ?? 0}/${job.noChangeThreshold ?? 2} | Until: ${job.quietUntil ?? "not-quiet"} | Reason: ${job.waitingReason ?? "none"}`);
               if (job.maxRunsPerDay) lines.push(`  UTC daily cap: ${job.maxRunsPerDay} | Tracked day: ${job.dailyUsage?.day ?? "not-yet-tracked"} | Attempts: ${job.dailyUsage?.attempts ?? "unknown"}`);
               if (job.type === "event") lines.push(`  Event restore: ${job.catchUp ?? "none"} | Pending: ${!!job.pendingEvent}`);

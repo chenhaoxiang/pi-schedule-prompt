@@ -1,4 +1,5 @@
-import { type Static, Type } from "@earendil-works/pi-ai";
+import { type Static, Type } from "typebox";
+import type { ScheduleJobStatus } from "./status.js";
 
 const StringEnum = <T extends string>(values: T[], options?: { description?: string }) =>
   Type.Union(values.map((value) => Type.Literal(value)), options);
@@ -7,6 +8,117 @@ const StringEnum = <T extends string>(values: T[], options?: { description?: str
  * Type of cron job
  */
 export type CronJobType = "cron" | "once" | "interval" | "event";
+
+export type IntervalMode = "fixed-delay" | "fixed-rate";
+export type ResilientPolicy = {
+  mode: "resilient";
+  version: 1;
+  intervalMode?: IntervalMode;
+  timezone?: string;
+  anchorAt: string;
+  overlapPolicy: "skip" | "buffer-one";
+  misfirePolicy: "skip" | "latest";
+  latenessMs: number;
+  workBudgetMs: number;
+};
+export type ExecutionPolicy = { mode: "legacy" } | ResilientPolicy;
+export interface TimedOccurrence { id: string; dueAt: string; revision: number; source: "timer" | "overlap" | "misfire" | "continuation"; }
+export interface AttemptOwner { sessionId: string; instanceId: string; epoch: number; }
+export interface NativeCheckpointReference { sessionId: string; entryId: string; runId: string; sessionFile?: string; }
+export interface OwnedAttempt {
+  id: string;
+  revision: number;
+  owner: AttemptOwner;
+  occurrence: TimedOccurrence;
+  admittedAt: string;
+  deadlineMs: number;
+  workBudgetMs: number;
+  /** Accepted explicit-model route, if any; later definition edits do not change this attempt. */
+  model?: string;
+  nativeSessionId?: string;
+  /** Exact persistent child transcript reserved before native start; absent for inline work. */
+  nativeSessionFile?: string;
+  nativeRunId?: string;
+  nativeStartedAt?: string;
+  nativeDeadlineAt?: string;
+  checkpoint?: NativeCheckpointReference;
+}
+export type ResilientIdlePhase = "waiting" | "backoff" | "reconciling" | "waiting-input" | "attention-required" | "finished";
+export type ResilientSlot =
+  | { kind: "idle"; phase: ResilientIdlePhase; reason?: string }
+  | { kind: "owned"; phase: "running" | "draining" | "cancelling" | "attention-required"; attempt: OwnedAttempt; reason?: string };
+export interface ResilientRuntime {
+  /** Preserved pre-schema4 spending, never replenished by recovery or ownership transfer. */
+  baselineAttempts: number;
+  baselineDailyUsage?: { day: string; attempts: number };
+  /** Preserved uncertainty is not cleared by a status/UI/enable update. */
+  legacyUncertainty?: { status: "unknown" | "aborted"; claimId?: string };
+  slot: ResilientSlot;
+  ownerEpoch: number;
+  missedCount: number;
+  cooldownStep: number;
+  pending?: TimedOccurrence;
+  lastFinishedAt?: string;
+  nextEligibleAt?: string;
+  notBefore?: string;
+  continuation?: { attemptId: string; checkpoint: NativeCheckpointReference; evidenceFingerprint?: string };
+}
+export type NativeExecutionOutcome = "completed" | "failed" | "deferred" | "cancelled" | "interrupted";
+/** Forward-typed public Pi v1 metadata; never a model-supplied settlement or a second protocol. */
+export interface NativeExecutionProof {
+  version: 1;
+  runId: string;
+  binding: { jobId: string; attemptId: string; ownerSessionId: string; ownerEpoch: number; revision: number };
+  finishedAt: string;
+  execution: NativeExecutionOutcome;
+  checkpointEntryId: string;
+  effectStatus: "none-observed" | "unknown";
+  businessOutcome: "unverified";
+  failedRecoveryMs: number;
+  retryNotBefore?: string;
+}
+/** Schedule-owned acknowledgement of the persistent child SDK/file writer, distinct from native loop settlement. */
+export interface ModelSdkCloseProof {
+  version: 1;
+  runId: string;
+  binding: NativeExecutionProof["binding"];
+  checkpointEntryId: string;
+  closedAt: string;
+}
+/** Final records are immutable; later evidence is appended to attemptResolutions instead. */
+export interface AttemptRecord {
+  /** False only for a proven native refusal before execution, or an imported legacy record already counted in the baseline. */
+  charged: boolean;
+  id: string;
+  revision: number;
+  owner: AttemptOwner;
+  occurrence: TimedOccurrence;
+  admittedAt: string;
+  closedAt: string;
+  outcome: NativeExecutionOutcome | "unknown" | "not-started";
+  model?: string;
+  reason?: string;
+  nativeProof?: NativeExecutionProof;
+  modelSdkClose?: ModelSdkCloseProof;
+  checkpoint?: NativeCheckpointReference;
+  effectStatus: "none-observed" | "unknown";
+  businessOutcome: "unverified";
+}
+export interface AttemptResolution {
+  attemptId: string;
+  evidenceFingerprint: string;
+  at: string;
+  disposition: "continue" | "waiting-input" | "unknown" | "native-closure";
+  checkpoint?: NativeCheckpointReference;
+  safeScopes?: string[];
+}
+export interface StoreMigration {
+  fromVersion: 1 | 2 | 3;
+  at: string;
+  originalSha256: string;
+  backupRef: string;
+}
+
 
 export interface GithubTrigger { repo: string; kind: "pull-request" | "workflow"; number?: number; branch?: string; pollSeconds?: number; }
 export interface PendingEvent { revision: number; binding: string; keys: string[]; acceptedAt: string; evidenceFingerprint?: string; }
@@ -81,8 +193,15 @@ export interface CronJob {
   schedule: string;
   /** The prompt to execute */
   prompt: string;
-  /** Whether the job is enabled */
+  /** User enablement intent for resilient jobs; legacy jobs retain their historical automatic-disable behavior. */
   enabled: boolean;
+  /** Absence means legacy behavior. Incompatible resilient state is schema4 only. */
+  policy?: ExecutionPolicy;
+  runtime?: ResilientRuntime;
+  attemptHistory?: AttemptRecord[];
+  attemptResolutions?: AttemptResolution[];
+  /** Proven legacy predecessor identities; original jobs/UNKNOWN claims remain retained. */
+  legacyLineage?: string[];
   /** Type of job */
   type: CronJobType;
   /** Interval in milliseconds (for interval type) */
@@ -157,7 +276,10 @@ export interface CronJob {
 export interface CronStore {
   jobs: CronJob[];
   version: number;
+  migration?: StoreMigration;
 }
+
+export type ResilientJob = CronJob & { policy: ResilientPolicy; runtime: ResilientRuntime; attemptHistory: AttemptRecord[]; attemptResolutions: AttemptResolution[] };
 
 /**
  * Tool result details for LLM context
@@ -165,6 +287,8 @@ export interface CronStore {
 export interface CronToolDetails {
   action: string;
   jobs: CronJob[];
+  status?: ScheduleJobStatus[];
+  truncated?: boolean;
   error?: string;
   jobId?: string;
   jobName?: string;
@@ -174,7 +298,7 @@ export interface CronToolDetails {
  * Tool parameter schema
  */
 export const CronToolParams = Type.Object({
-  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "trigger", "resume"], {
+  action: StringEnum(["add", "remove", "list", "status", "enable", "disable", "update", "cleanup", "trigger", "resume", "reconcile", "drain", "preview"], {
     description: "Action to perform",
   }),
   name: Type.Optional(
@@ -208,6 +332,16 @@ export const CronToolParams = Type.Object({
       description: "Optional job description",
     })
   ),
+  mode: Type.Optional(StringEnum(["legacy", "resilient"], { description: "Explicit execution contract. Omission keeps legacy behavior; resilient is finite, session-bound recurring timing on native capability v1/schema4." })),
+  intervalMode: Type.Optional(StringEnum(["fixed-delay", "fixed-rate"], { description: "Resilient intervals only. fixed-delay waits N after exact safe finish; fixed-rate keeps an anchored cadence. New resilient intervals default fixed-delay." })),
+  timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Resilient cron effective IANA timezone, persisted so process timezone changes do not alter the schedule." })),
+  overlapPolicy: Type.Optional(StringEnum(["skip", "buffer-one"], { description: "Resilient overlap policy; default skip. buffer-one retains the first waiting occurrence, never an unbounded backlog. Fixed-delay arms only after closure." })),
+  misfirePolicy: Type.Optional(StringEnum(["skip", "latest"], { description: "Resilient restart/sleep policy; default skip. latest admits at most one fresh missed occurrence, distinct from live overlap." })),
+  latenessMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 86400000, description: "Resilient occurrence freshness window, independent of cadence and execution budgets; default 300000." })),
+  workBudgetMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 86400000, description: "Resilient soft work/drain target, strictly below deadlineMs; never a cadence timeout or a renewed authority." })),
+  attemptId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for reconcile: exact finalized resilient attempt id/checkpoint. Native/SDK resource closure must already be acknowledged." })),
+  resolution: Type.Optional(StringEnum(["continue", "waiting-input", "unknown"], { description: "Required for reconcile. Records the owning operator's verified evidence, not business success or new authorization." })),
+  safeScopes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]+$" }), { maxItems: 32, description: "Optional bounded scopes of reconciliation evidence; scoped evidence does not release the whole job's conflicting writes." })),
   claimId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for resume: exact settled UNKNOWN/aborted claim ID." })),
   evidenceFingerprint: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "Required for resume: SHA-256 of reconciled checkpoint/effect evidence. Explicit future occurrences only, never replay or mark the old claim successful." })),
   eventName: Type.Optional(Type.String({ description: "Required for trigger. Must match the existing event job schedule." })),

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.12 (2026-11-04; source candidate, release/install acceptance separate)
+- Add explicit resilient recurrence with native v1 capability negotiation, exact serial attempt ownership and run-scoped work/recovery/hard budgets; preserve legacy scheduling when no resilient mode is selected.
+- Separate fixed-delay/fixed-rate cadence, cron timezone, overlap and misfire policies from execution deadlines, with bounded pending work and preserved lifetime/daily/expiry limits.
+- Persist native completed-result checkpoints and retain model-child ownership through exact SDK close acknowledgement; uncertain effects require exact owner reconciliation, never automatic replay.
+- Add canonical tool/TUI management and bounded status, explicit schema4 preview/quiescent migration, and state-aware rollback assessment that cannot restore stale backups over newer activity.
+- Bind fixed installation to canonical Pi1.3/1.4/1.5 exact peers; unsupported native hosts hold without spending an attempt. Source, release, loaded runtime and natural/business acceptance remain distinct.
+
 ### Maintained fork 0.4.1-fork.11 (2026-11-01; supersedes local-only fork.10 candidate)
 - Add absolute per-round time budgets and a native tool-boundary wind-down reserve inside the unchanged hard deadline; preserve local checkpointing and prevent new long/effectful work during finalization.
 - Preserve exact interruption reasons in receipts, claims, notices and read-only status.

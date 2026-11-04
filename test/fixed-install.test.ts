@@ -64,6 +64,19 @@ describe("fixed installation boundaries", () => {
     expect(f.install().status).not.toBe(0);
   });
 
+  it.each(["1.3.0-fork.1", "1.4.0-fork.5", "1.5.0-fork.2", "1.5.0-fork.3"])("binds exact canonical %s SDK peers without treating version metadata as native activation", version => {
+    const f = fixture();
+    for (const name of ["pi-coding-agent", "pi-ai", "pi-tui"]) fs.writeFileSync(path.join(f.root, "host/@earendil-works", name, "package.json"), JSON.stringify({ name: "@earendil-works/" + name, version }));
+    const result = f.install(); expect(result.status, result.stderr).toBe(0);
+    const installed = JSON.parse(result.stdout.split("\n").find(line => line.startsWith('{"installed":'))!);
+    expect(installed.hostVersion).toBe(version); expect(installed.globalSettingsChanged).toBe(false);
+  });
+
+  it.each(["1.2.0", "1.5.0-beta.1", "1.5.0-fork.0", "1.5.0-fork.01", "1.6.0", "2.0.0"])("refuses unqualified or noncanonical host %s", version => {
+    const f = fixture(); fs.writeFileSync(path.join(f.root, "host/@earendil-works/pi-coding-agent/package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version }));
+    const result = f.install(); expect(result.status).not.toBe(0); expect(result.stderr).toContain("recognized stable Pi"); expect(fs.existsSync(path.join(f.root, "installed"))).toBe(false);
+  });
+
   it("refuses archive tampering before installation", () => {
     const f = fixture();
     fs.appendFileSync(f.archive, "tamper");

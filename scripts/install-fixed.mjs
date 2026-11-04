@@ -29,7 +29,7 @@ const host = process.env.PI_SCHEDULE_HOST_PACKAGE_DIR;
 if (!host || !path.isAbsolute(host)) throw new Error('Set PI_SCHEDULE_HOST_PACKAGE_DIR to the exact maintained Pi host package directory');
 const hostRoot = fs.realpathSync(host);
 const hostPackage = JSON.parse(fs.readFileSync(path.join(hostRoot, 'package.json'), 'utf8'));
-if (hostPackage.name !== '@earendil-works/pi-coding-agent' || !/^1\.3\.\d+(?:-fork\.\d+)?$/.test(hostPackage.version)) throw new Error('Expected a Pi 1.3 host');
+if (hostPackage.name !== '@earendil-works/pi-coding-agent' || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(hostPackage.version)) throw new Error('Expected a recognized stable Pi 1.3/1.4/1.5 host; native capability is negotiated at runtime');
 const root = path.resolve(rootArg || path.join(homedir(), '.pi/agent/packages/pi-schedule-prompt'));
 fs.mkdirSync(root, { recursive: true, mode: 0o700 });
 if (!fs.lstatSync(root).isDirectory() || fs.lstatSync(root).isSymbolicLink()) throw new Error('Install root must be an owned real directory');
@@ -40,7 +40,11 @@ const verifyRuntime = directory => {
     if (JSON.parse(fs.readFileSync(path.join(directory, 'node_modules', name, 'package.json'), 'utf8')).version !== version) throw new Error('Runtime dependency mismatch: ' + name);
   }
   for (const name of ['pi-coding-agent', 'pi-ai', 'pi-tui']) {
-    if (fs.realpathSync(path.join(directory, 'node_modules/@earendil-works', name)) !== fs.realpathSync(path.join(path.dirname(hostRoot), name))) throw new Error('Host peer binding mismatch: ' + name);
+    const expected = fs.realpathSync(path.join(path.dirname(hostRoot), name));
+    const actual = fs.realpathSync(path.join(directory, 'node_modules/@earendil-works', name));
+    if (actual !== expected) throw new Error('Host peer binding mismatch: ' + name);
+    const peer = JSON.parse(fs.readFileSync(path.join(actual, 'package.json'), 'utf8'));
+    if (peer.version !== hostPackage.version) throw new Error('Host peer version mismatch: ' + name);
   }
 };
 const verify = directory => {

@@ -39,13 +39,13 @@ export function readConfig(file) {
 function validatePins(config) {
   if (sha(fs.readFileSync(config.piCli)) !== config.piCliSha256) throw new Error('Pi CLI pin mismatch');
   const receipt = JSON.parse(fs.readFileSync(path.join(config.packageRoot, '.install-receipt.json'), 'utf8'));
-  if (receipt.sourceSha !== config.sourceCommit || !/^1\.3\.\d+(?:-fork\.\d+)?$/.test(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
+  if (receipt.sourceSha !== config.sourceCommit || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
   if (typeof receipt.hostPath !== 'string' || fs.realpathSync(path.join(path.dirname(config.piCli), 'node_modules/@earendil-works/pi-coding-agent')) !== receipt.hostPath || JSON.parse(fs.readFileSync(path.join(receipt.hostPath, 'package.json'), 'utf8')).version !== receipt.hostVersion) throw new Error('CLI and fixed installer host bindings differ');
   if (fs.realpathSync(config.packageRoot) !== config.packageRoot || fs.realpathSync(config.cwd) !== config.cwd) throw new Error('Use canonical cwd/package paths');
   const storePath = path.join(config.cwd, '.pi/schedule-prompts.json');
   if (fs.existsSync(storePath)) {
     const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-    if (![1, 2, 3].includes(store.version) || !Array.isArray(store.jobs) || store.jobs.some(job => job.enabled && (!job.session || (job.session === config.sessionId && (!job.durable || !job.maxRuns || !job.expiresAt))))) throw new Error('Dedicated host requires finite durable session-bound schedules');
+    if (![1, 2, 3, 4].includes(store.version) || !Array.isArray(store.jobs) || store.jobs.some(job => job.enabled && (!job.session || (job.session === config.sessionId && (!job.durable || !job.maxRuns || !job.expiresAt))))) throw new Error('Dedicated host requires finite durable session-bound schedules');
   }
 }
 
@@ -107,10 +107,11 @@ export async function run(config) {
         state.jobSummary = details.jobSummary; state.jobSummaryTruncated = details.jobSummaryTruncated;
         state.jobStatusFresh = true; state.jobStatusObservedAt = new Date().toISOString();
         for (const job of details.jobSummary ?? []) {
-          if (job.operationalState !== 'disabled-unknown' && !(job.enabled === false && job.lastStatus === 'error')) continue;
-          const key = sha(JSON.stringify([job.id, job.claim?.id, job.claim?.outcome, job.lastStatus]));
+          const nativeAttention = job.resilient && ['reconciling', 'waiting-input', 'attention-required'].includes(job.resilient.phase);
+          if (!nativeAttention && job.operationalState !== 'disabled-unknown' && !(job.enabled === false && job.lastStatus === 'error')) continue;
+          const key = sha(JSON.stringify([job.id, job.claim?.id, job.claim?.outcome, job.lastStatus, job.resilient?.attemptId ?? job.resilient?.lastAttempt?.id, job.resilient?.phase, job.resilient?.reason]));
           if (state.healthAlerts.some(alert => alert.key === key)) continue;
-          const alert = { key, jobId: job.id, ...(job.claim ? { claimId: job.claim.id } : {}), reason: job.operationalState === 'disabled-unknown' ? 'disabled-unknown' : 'disabled-error', observedAt: state.jobStatusObservedAt };
+          const alert = { key, jobId: job.id, ...(job.claim ? { claimId: job.claim.id } : {}), ...(job.resilient?.attemptId ?? job.resilient?.lastAttempt?.id ? { attemptId: job.resilient.attemptId ?? job.resilient.lastAttempt?.id } : {}), reason: nativeAttention ? 'native-' + job.resilient.phase : job.operationalState === 'disabled-unknown' ? 'disabled-unknown' : 'disabled-error', observedAt: state.jobStatusObservedAt };
           state.healthAlerts = [...state.healthAlerts, alert].slice(-20);
           console.error('Scheduling attention required: ' + JSON.stringify(alert));
         }
