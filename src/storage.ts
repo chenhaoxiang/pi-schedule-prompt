@@ -8,6 +8,12 @@ import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, ty
 
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
 
+/** Generic cleanup removes unused definitions, never immutable spending/UNKNOWN/resource evidence. */
+export function canCleanupJob(job: CronJob): boolean {
+  if (job.enabled || job.recovery || job.lastStatus === "unknown" || (job.claim && job.claim.phase !== "settled") || ["unknown", "aborted"].includes(job.claim?.outcome ?? "") || job.followUp?.state === "unknown") return false;
+  return !isResilient(job) || !(job.runtime.slot.kind === "owned" || job.attemptHistory.length || job.attemptResolutions.length || job.runtime.baselineAttempts || job.runtime.legacyUncertainty || job.claim || job.legacyLineage?.length);
+}
+
 function validate(store: unknown): asserts store is CronStore {
   if (!store || typeof store !== "object") throw new Error("Invalid schedule store");
   const data = store as CronStore;
@@ -418,7 +424,9 @@ export class CronStorage {
       const job = store.jobs.find(item => item.id === id);
       if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind === "owned") return false;
       const record = job.attemptHistory.find(item => item.id === attemptId);
-      if (record?.effectStatus !== "unknown" || !record.checkpoint || !record.nativeProof || !record.charged) return false;
+      if (!record?.checkpoint || !record.nativeProof || !record.charged) return false;
+      if (job.runtime.continuation && job.runtime.continuation.attemptId !== attemptId) return false;
+      if (record.effectStatus !== "unknown" && job.runtime.continuation?.attemptId !== attemptId) return false;
       const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint);
       if (prior) {
         if (prior.disposition !== disposition || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution");
@@ -431,7 +439,9 @@ export class CronStorage {
         const blocked = requiresReconciliation(job);
         const exhausted = !job.enabled || Date.parse(job.expiresAt!) <= Date.now() || job.attemptCount! >= job.maxRuns!;
         job.runtime.slot = { kind: "idle", phase: blocked ? "reconciling" : exhausted ? "finished" : "waiting", reason: blocked ? "scope_or_effect_unresolved" : exhausted ? "authorization_bound" : "reconciled" };
-        job.runtime.nextEligibleAt = undefined; job.runtime.notBefore = undefined;
+        job.runtime.nextEligibleAt = undefined;
+        const providerNotBefore = record.nativeProof.retryNotBefore;
+        if (providerNotBefore && (!job.runtime.notBefore || Date.parse(providerNotBefore) > Date.parse(job.runtime.notBefore))) job.runtime.notBefore = providerNotBefore;
       } else if (disposition === "waiting-input") {
         job.runtime.slot = { kind: "idle", phase: "waiting-input", reason: "reconciled_waiting_input" };
       } else {
@@ -735,12 +745,14 @@ export class CronStorage {
   }
 
   addJob(job: CronJob): void {
+    const resilient = isResilient(job);
     this.mutate(store => {
+      if (resilient && store.version !== 4 && fs.existsSync(this.storePath)) throw new Error("Existing stores require explicit schema4 migration after verified native/writer quiescence; use read-only preview first");
       if (store.jobs.some(item => item.id === job.id || item.name === job.name)) {
         throw new Error("A scheduled job with this id or name already exists");
       }
       store.jobs.push({ ...job, revision: job.revision ?? 1 });
-    });
+    }, resilient ? { targetVersion: 4 } : {});
   }
 
   createFollowUp(job: CronJob): { job: CronJob; created: boolean } {
@@ -849,6 +861,10 @@ export class CronStorage {
   removeJob(id: string, sessionId?: string): boolean {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
+      if (job && !isResilient(job) && (job.recovery || (job.claim && (job.claim.phase !== "settled" || ["unknown", "aborted"].includes(job.claim.outcome ?? ""))) || job.followUp?.state === "unknown")) {
+        job.enabled = false; job.pendingIntent = undefined; job.pendingEvent = undefined;
+        return true;
+      }
       if (job && isResilient(job)) {
         if (job.session !== sessionId) throw new Error("Only the owning session may remove a resilient definition");
         if (job.runtime.slot.kind === "owned" || job.attemptHistory.length || job.attemptResolutions.length || job.runtime.baselineAttempts || job.runtime.legacyUncertainty || job.claim || job.recovery || job.legacyLineage?.length) {

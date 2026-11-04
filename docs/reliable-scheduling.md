@@ -52,7 +52,26 @@ The child session id/file remains bound to the attempt and exact checkpoint. Con
 
 Native settlement alone does not close the persistent child SDK/file writer. A model attempt stays owned/draining through SDK idle, awaited shutdown hooks, disposal and the final SDK idle acknowledgement. Only then does the existing native transcript receive a Schedule-owned `schedule.model-sdk-closed.v1` entry bound to that exact attempt/session/epoch/revision/run/checkpoint. The final attempt retains this acknowledgement; a missing/failed/foreign ACK keeps owned attention, including on restart when a native receipt already exists. A native refusal is refunded only after the prepared SDK has closed. Completion-delay and scheduler cooldown use the actual SDK-close timestamp, never the earlier native receipt timestamp. This is resource closure, not business acceptance. Legacy explicit-model/one-shot/event/reply-follow-up contracts remain unchanged.
 
-This is still an incremental source/fixture slice, not installation, loaded-capability or live-migration proof. Public management/UI, packed integration and remaining Change acceptance must be finished before activation.
+Canonical management now distinguishes legacy and resilient contracts at the existing `schedule_prompt`/TUI seams. New resilient definitions require native v1, schema4, a session owner, finite `maxRuns` and absolute `expiresAt`; interval mode, cron timezone, overlap, misfire, lateness, work target and hard elapsed budget are explicit and conflicting inputs fail before mutation. Existing legacy rows are never silently promoted by update; `preview` is read-only and reports that migration still needs verified quiescence. `status` returns bounded attempt/phase/reason/next-eligibility/checkpoint/resource metadata without prompts or transcript bodies. `drain` addresses only the exact owned native handle, and `reconcile` requires an exact finalized attempt/evidence resolution from the owning ordinary context; user intent toggles never clear history, spend or UNKNOWN effects. TUI rows show mode, phase, cooldown/cadence, user intent and unverified business outcome; generic cleanup leaves live/UNKNOWN/history-bearing resilient rows intact. Supervisor health alerts retain the existing dedup/read-only behavior for legacy claims; release/loaded/migration/live acceptance remain separate.
+
+## Canonical resilient management examples
+
+These are source/fixture examples, not an instruction to activate an existing UNKNOWN task. Replace the expiry placeholder only with an already-authorized finite future expiry. A new store can opt into schema4; an existing schema1/2/3 file requires explicit, backed-up migration after affected writers/executions are verified quiescent.
+
+```json
+{"action":"add","type":"interval","schedule":"1h","mode":"resilient","intervalMode":"fixed-delay","prompt":"Advance the already-authorized bounded goal from saved results","maxRuns":20,"expiresAt":"REPLACE_WITH_ALREADY_AUTHORIZED_FUTURE_ISO","workBudgetMs":1500000,"deadlineMs":2700000,"overlapPolicy":"skip","misfirePolicy":"skip","latenessMs":300000}
+```
+
+`fixed-delay` means one hour after exact safe finish (including a child SDK writer's close ACK), not hourly start times. To choose anchored cadence explicitly, update an existing resilient definition with `intervalMode:"fixed-rate"`; `buffer-one` retains the first waiting occurrence and lateness still expires it. Cron uses a six-field expression plus an effective persisted IANA `timezone`. Legacy rows/default tool calls keep their preceding behavior.
+
+```json
+{"action":"status","jobId":"EXACT_JOB_ID"}
+{"action":"preview"}
+{"action":"drain","jobId":"EXACT_OWNED_JOB_ID"}
+{"action":"reconcile","jobId":"EXACT_JOB_ID","attemptId":"EXACT_FINALIZED_ATTEMPT","evidenceFingerprint":"REPLACE_WITH_VERIFIED_LOWERCASE_SHA256","resolution":"waiting-input"}
+```
+
+`status`/`preview` are metadata reads and never model wakes. A drain request checkpoints/yields but is not closure acknowledgement. Reconciliation consumes the exact retained checkpoint after native/SDK resources have closed; inspect original results/external effects first, never manufacture evidence from a summary. Repeating identical evidence is idempotent, scoped evidence does not release global conflicting writes, and no operation rewrites old UNKNOWN to business success, renews authority, resets spending or removes an existing expiry. Required-input waits and provider Retry-After/cooldown/UTC limits remain explicit unblock conditions. Scheduled turns cannot self-create, renew/change resilient definitions or self-certify reconciliation through this tool.
 
 ## Composition
 

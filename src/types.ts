@@ -1,4 +1,5 @@
 import { type Static, Type } from "typebox";
+import type { ScheduleJobStatus } from "./status.js";
 
 const StringEnum = <T extends string>(values: T[], options?: { description?: string }) =>
   Type.Union(values.map((value) => Type.Literal(value)), options);
@@ -286,6 +287,8 @@ export type ResilientJob = CronJob & { policy: ResilientPolicy; runtime: Resilie
 export interface CronToolDetails {
   action: string;
   jobs: CronJob[];
+  status?: ScheduleJobStatus[];
+  truncated?: boolean;
   error?: string;
   jobId?: string;
   jobName?: string;
@@ -295,7 +298,7 @@ export interface CronToolDetails {
  * Tool parameter schema
  */
 export const CronToolParams = Type.Object({
-  action: StringEnum(["add", "remove", "list", "enable", "disable", "update", "cleanup", "trigger", "resume"], {
+  action: StringEnum(["add", "remove", "list", "status", "enable", "disable", "update", "cleanup", "trigger", "resume", "reconcile", "drain", "preview"], {
     description: "Action to perform",
   }),
   name: Type.Optional(
@@ -329,6 +332,16 @@ export const CronToolParams = Type.Object({
       description: "Optional job description",
     })
   ),
+  mode: Type.Optional(StringEnum(["legacy", "resilient"], { description: "Explicit execution contract. Omission keeps legacy behavior; resilient is finite, session-bound recurring timing on native capability v1/schema4." })),
+  intervalMode: Type.Optional(StringEnum(["fixed-delay", "fixed-rate"], { description: "Resilient intervals only. fixed-delay waits N after exact safe finish; fixed-rate keeps an anchored cadence. New resilient intervals default fixed-delay." })),
+  timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Resilient cron effective IANA timezone, persisted so process timezone changes do not alter the schedule." })),
+  overlapPolicy: Type.Optional(StringEnum(["skip", "buffer-one"], { description: "Resilient overlap policy; default skip. buffer-one retains the first waiting occurrence, never an unbounded backlog. Fixed-delay arms only after closure." })),
+  misfirePolicy: Type.Optional(StringEnum(["skip", "latest"], { description: "Resilient restart/sleep policy; default skip. latest admits at most one fresh missed occurrence, distinct from live overlap." })),
+  latenessMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 86400000, description: "Resilient occurrence freshness window, independent of cadence and execution budgets; default 300000." })),
+  workBudgetMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 86400000, description: "Resilient soft work/drain target, strictly below deadlineMs; never a cadence timeout or a renewed authority." })),
+  attemptId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for reconcile: exact finalized resilient attempt id/checkpoint. Native/SDK resource closure must already be acknowledged." })),
+  resolution: Type.Optional(StringEnum(["continue", "waiting-input", "unknown"], { description: "Required for reconcile. Records the owning operator's verified evidence, not business success or new authorization." })),
+  safeScopes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]+$" }), { maxItems: 32, description: "Optional bounded scopes of reconciliation evidence; scoped evidence does not release the whole job's conflicting writes." })),
   claimId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for resume: exact settled UNKNOWN/aborted claim ID." })),
   evidenceFingerprint: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "Required for resume: SHA-256 of reconciled checkpoint/effect evidence. Explicit future occurrences only, never replay or mark the old claim successful." })),
   eventName: Type.Optional(Type.String({ description: "Required for trigger. Must match the existing event job schedule." })),

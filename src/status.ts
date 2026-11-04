@@ -1,11 +1,15 @@
-import type { CronJob, ExecutionReceipt } from "./types.js";
+import type { NativeRunSnapshot } from "./native.js";
+import { isResilient } from "./resilient-policy.js";
+import { summarizeResilient } from "./status-resilient.js";
+import type { CronJob, ExecutionReceipt, ResilientSlot } from "./types.js";
 
 export type ReconciliationState =
   | "not-required"
   | "receipt-found"
   | "owner-live"
   | "pre-dispatch-releasable"
-  | "unknown-needs-external-reconciliation";
+  | "unknown-needs-external-reconciliation"
+  | "native-closure-required";
 
 export interface ScheduleJobStatus {
   id: string;
@@ -35,6 +39,34 @@ export interface ScheduleJobStatus {
     transportState?: NonNullable<CronJob["followUp"]>["transportState"];
     unknownReason?: string;
   };
+  resilient?: {
+    mode: "fixed-delay" | "fixed-rate" | "cron";
+    phase: ResilientSlot["phase"];
+    reason?: string;
+    overlapPolicy?: "skip" | "buffer-one";
+    misfirePolicy?: "skip" | "latest";
+    latenessMs?: number;
+    nextEligibleAt?: string;
+    notBefore?: string;
+    continuationAttemptId?: string;
+    nativeSessionId?: string;
+    nativeRunId?: string;
+    sdkCloseAt?: string;
+    timezone?: string;
+    ownerEpoch?: number;
+    revision?: number;
+    acceptedRevision?: number;
+    ownerSessionId?: string;
+    attemptId?: string;
+    missedCount?: number;
+    cooldownStep?: number;
+    workBudgetMs?: number;
+    deadlineMs?: number;
+    nativeDeadlineAt?: string;
+    lastAttempt?: { id: string; execution: string; effectStatus: "none-observed" | "unknown"; businessOutcome: "unverified" };
+    native?: { phase: NativeRunSnapshot["phase"]; nativeClosed: boolean; ownedHandles: string[]; requestCount: number; retryCount: number; failedRecoveryMs: number; providerPhase: NativeRunSnapshot["providerPhase"] };
+    businessOutcome: "unverified";
+  };
   reconciliation: ReconciliationState;
   reconciliationReason?: string;
 }
@@ -43,6 +75,7 @@ export interface JobStatusOptions {
   receiptByClaim?: ReadonlyMap<string, ExecutionReceipt>;
   ownerAlive?: (pid: number) => boolean;
   nextRun?: (jobId: string) => Date | null;
+  nativeSnapshot?: (jobId: string) => NativeRunSnapshot | undefined;
 }
 
 export const claimKey = (jobId: string, claimId: string, sessionId: string): string => `${sessionId}\u0000${jobId}\u0000${claimId}`;
@@ -80,6 +113,7 @@ function unknownReason(job: CronJob): string {
 }
 
 export function summarizeJob(job: CronJob, options: JobStatusOptions = {}): ScheduleJobStatus {
+  if (isResilient(job)) return summarizeResilient(job, options);
   const ownerAlive = options.ownerAlive ?? defaultOwnerAlive;
   const candidate = job.claim ? options.receiptByClaim?.get(claimKey(job.id, job.claim.id, job.claim.sessionId)) : undefined;
   const receipt = candidate?.sessionId === job.session ? candidate : undefined;

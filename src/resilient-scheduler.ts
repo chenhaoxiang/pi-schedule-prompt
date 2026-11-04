@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeRunCheckpoint, type NativeRunHandle, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
-import { isResilient } from "./resilient-policy.js";
+import { isResilient, spentOnUtcDay } from "./resilient-policy.js";
 import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readModelSdkClose, readStoredModelSession } from "./scheduled-model.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { cooldownNotBefore, misfire, nextDue, nextEligibleAfter, occurrence, timingView } from "./timing.js";
@@ -72,6 +72,9 @@ export class ResilientScheduling {
       }
       if (job.runtime.slot.kind !== "idle" || !["waiting", "backoff"].includes(job.runtime.slot.phase)) return;
       const now = Date.now();
+      const day = new Date(now).toISOString().slice(0, 10);
+      const delayed = (job.runtime.notBefore && Date.parse(job.runtime.notBefore) > now) || (job.maxRunsPerDay !== undefined && spentOnUtcDay(job, day) >= job.maxRunsPerDay) || (job.dailyUsage && day < job.dailyUsage.day);
+      if (delayed) { const next = nextEligibleAfter(job, now); if (next) this.persistAndArm(job, next.getTime(), true); return; }
       if (job.runtime.pending) {
         if (restoring && job.policy.misfirePolicy === "skip") {
           const next = nextEligibleAfter(job, now);
@@ -222,7 +225,7 @@ export class ResilientScheduling {
 
   requestDrain(id: string): boolean {
     const run = this.active.get(id);
-    if (!run) return false;
+    if (!run || run.closing || run.handle.snapshot().nativeClosed) return false;
     run.handle.checkpoint();
     return run.handle.requestDrain("operator_drain");
   }

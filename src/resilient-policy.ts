@@ -83,8 +83,8 @@ export function requiresReconciliation(job: ResilientJob): boolean {
   const continuation = job.runtime.continuation;
   if (!continuation) return false;
   const record = job.attemptHistory.find(item => item.id === continuation.attemptId);
-  if (record?.outcome === "deferred" && record.effectStatus === "none-observed") return false;
   const latest = latestEffectResolution(job, continuation.attemptId);
+  if (!latest && record?.outcome === "deferred" && record.effectStatus === "none-observed") return false;
   return latest?.disposition !== "continue" || !!latest.safeScopes?.length || latest.evidenceFingerprint !== continuation.evidenceFingerprint || !sameCheckpointReference(latest.checkpoint, continuation.checkpoint);
 }
 

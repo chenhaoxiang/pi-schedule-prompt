@@ -133,6 +133,24 @@ export class CronScheduler {
     return this.durable.blockTool(toolName);
   }
   onMessageEnd(message: { role: string; stopReason?: string }): void { this.durable.messageEnd(message); }
+  drainResilientJob(id: string): boolean {
+    const job = this.storage.getJob(id);
+    return !!job && isResilient(job) && job.session === this.ctx.sessionManager.getSessionId() && this.resilient.requestDrain(id);
+  }
+  getNativeRunSnapshot(id: string) { return this.resilient.snapshot(id); }
+  reconcileResilientJob(id: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): { job: CronJob; changed: boolean } {
+    const job = this.storage.getJob(id);
+    if (!job || !isResilient(job) || job.session !== this.ctx.sessionManager.getSessionId()) throw new Error("Exact resilient reconciliation requires the owning session");
+    if (!["continue", "waiting-input", "unknown"].includes(disposition)) throw new Error("Invalid exact checkpoint resolution");
+    const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && JSON.stringify(item.safeScopes ?? []) === JSON.stringify(safeScopes));
+    if (prior) return { job, changed: false };
+    if (job.runtime.slot.kind === "owned") throw new Error("Wait for exact native/SDK resource closure before checkpoint/effect reconciliation");
+    const changed = this.storage.reconcileResilientAttempt(id, job.session!, attemptId, evidenceFingerprint, disposition, safeScopes);
+    const updated = this.storage.getJob(id);
+    if (!updated || !isResilient(updated) || !updated.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition)) throw new Error("No exact finalized checkpoint resolution was recorded; no old work was replayed");
+    if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated); this.drain(); }
+    return { job: updated, changed };
+  }
 
   stop(): void {
     this.stopped = true;

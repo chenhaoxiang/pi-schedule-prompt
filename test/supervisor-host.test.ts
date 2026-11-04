@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resilientDefinition } from "../src/resilient-policy.js";
 import { CronStorage } from "../src/storage.js";
 
 const root = path.resolve("tmp/native-supervisor-fixtures");
@@ -57,6 +58,7 @@ function command(op: string, file: string, jobId?: string) {
 }
 async function ready(h: Awaited<ReturnType<typeof fixture>>, process: ReturnType<typeof start>) {
   await vi.waitFor(() => {
+    if (process.child.exitCode !== null) throw new Error("Fixture host exited before readiness: " + process.stderr());
     const status = JSON.parse(fs.readFileSync(path.join(h.stateDir, "status.json"), "utf8"));
     if (process.child.exitCode !== null) throw new Error("Fixture host exited: " + process.stderr() + (fs.existsSync(path.join(h.cwd, "tmp/native-fixture-error")) ? fs.readFileSync(path.join(h.cwd, "tmp/native-fixture-error"), "utf8") : (fs.existsSync(path.join(h.cwd, "tmp/native-fixture-stderr")) ? fs.readFileSync(path.join(h.cwd, "tmp/native-fixture-stderr"), "utf8") : JSON.stringify(status))));
     const owner = JSON.parse(fs.readFileSync(path.join(h.stateDir, "host.json"), "utf8"));
@@ -93,6 +95,15 @@ describe("dedicated native RPC supervisor service", () => {
     expect(JSON.parse((await command("status", h.file)).data)).toMatchObject({ active: false, state: "stopped" });
     expect(running.stderr()).not.toContain("synthetic consent");
   }, 40000);
+  it("reports enabled resilient attention once without inferring a wake or requesting a model", async () => {
+    const h = await fixture(); h.storage.addJob(resilientDefinition({ id: "native-unavailable", name: "native-unavailable", type: "interval", schedule: "1h", intervalMs: 3600000, prompt: "PRIVATE_NATIVE_PROMPT_MUST_NOT_LEAK", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, maxRuns: 2, expiresAt: new Date(Date.now() + 60000).toISOString(), deadlineMs: 10000 }));
+    const running = start(h.file); await ready(h, running);
+    const first = JSON.parse((await command("status", h.file)).data);
+    expect(first).toMatchObject({ ready: true, active: true, jobStatusFresh: true, jobCounts: { enabled: 1, owned: 0, needsAttention: 1 }, jobSummary: [{ id: "native-unavailable", enabled: true, attemptCount: 0, resilient: { phase: "attention-required", reason: "runtime_unavailable", businessOutcome: "unverified" } }], healthAlerts: [{ jobId: "native-unavailable", reason: "native-attention-required" }] });
+    const second = JSON.parse((await command("status", h.file)).data); expect(second.healthAlerts).toHaveLength(1); expect(running.stderr().match(/Scheduling attention required/g)).toHaveLength(1);
+    expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(false); expect(JSON.stringify(second)).not.toContain("PRIVATE_NATIVE_PROMPT_MUST_NOT_LEAK");
+    await command("stop", h.file); await vi.waitFor(() => expect(running.child.exitCode).toBe(0), { timeout: 12000 });
+  }, 35000);
   it("reads health metadata during a live turn without steering or extending the turn", async () => {
     const h = await fixture(); h.storage.addJob({ id: "live", name: "live", type: "once", schedule: new Date(Date.now() + 3000).toISOString(), prompt: "synthetic live status check", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, durable: true, catchUp: "latest", maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
     const running = start(h.file, { SCHEDULE_FIXTURE_BLOCK: "1" }); await ready(h, running);
