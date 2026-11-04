@@ -342,6 +342,7 @@ export default async function (pi: ExtensionAPI) {
       });
       const details = {
         requestId: match[1], ready: !!scheduler?.isRunning(), pid: process.pid, sessionId,
+        runtime: scheduler?.runtimeReadback(),
         jobs: jobs.length,
         counts: {
           enabled: jobs.filter(job => job.enabled).length,

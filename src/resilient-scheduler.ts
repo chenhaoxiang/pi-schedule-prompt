@@ -109,6 +109,9 @@ export class ResilientScheduling {
     }
   }
 
+  /** Registered in-process runs, including SDK-closing owners; not an external SDK/process census. */
+  registeredJobIds(): string[] { return [...this.active.keys()]; }
+
   scheduleAfterSettlement(id: string): void {
     const job = this.current(id);
     if (this.stopped || !job?.enabled) return;

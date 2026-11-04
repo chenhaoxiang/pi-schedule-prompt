@@ -53,6 +53,8 @@ export interface ResilientRuntime {
   baselineDailyUsage?: { day: string; attempts: number };
   /** Preserved uncertainty is not cleared by a status/UI/enable update. */
   legacyUncertainty?: { status: "unknown" | "aborted"; claimId?: string };
+  /** First whole-claim recovery checkpoint; pre-checkpoint ticks can never become new attempts. */
+  legacyFutureAfter?: string;
   slot: ResilientSlot;
   ownerEpoch: number;
   missedCount: number;
@@ -109,6 +111,8 @@ export interface AttemptResolution {
   evidenceFingerprint: string;
   at: string;
   disposition: "continue" | "waiting-input" | "unknown" | "native-closure";
+  /** Required for a preserved legacy claim resolution, which has no fabricated native checkpoint. */
+  legacyClaimBinding?: string;
   checkpoint?: NativeCheckpointReference;
   safeScopes?: string[];
 }
@@ -117,6 +121,17 @@ export interface StoreMigration {
   at: string;
   originalSha256: string;
   backupRef: string;
+}
+export interface LegacyOwnerHandover {
+  predecessorJobId: string;
+  successorJobId: string;
+  fromSessionId: string;
+  toSessionId: string;
+  claimId: string;
+  claimBinding: string;
+  recoveryEvidenceFingerprint: string;
+  handoverEvidenceFingerprint: string;
+  evidenceRef: string;
 }
 
 
@@ -202,6 +217,8 @@ export interface CronJob {
   attemptResolutions?: AttemptResolution[];
   /** Proven legacy predecessor identities; original jobs/UNKNOWN claims remain retained. */
   legacyLineage?: string[];
+  /** Explicit evidence for an owner/session takeover; never inferred from recovery metadata alone. */
+  legacyHandovers?: LegacyOwnerHandover[];
   /** Type of job */
   type: CronJobType;
   /** Interval in milliseconds (for interval type) */
@@ -342,7 +359,8 @@ export const CronToolParams = Type.Object({
   attemptId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for reconcile: exact finalized resilient attempt id/checkpoint. Native/SDK resource closure must already be acknowledged." })),
   resolution: Type.Optional(StringEnum(["continue", "waiting-input", "unknown"], { description: "Required for reconcile. Records the owning operator's verified evidence, not business success or new authorization." })),
   safeScopes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]+$" }), { maxItems: 32, description: "Optional bounded scopes of reconciliation evidence; scoped evidence does not release the whole job's conflicting writes." })),
-  claimId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for resume: exact settled UNKNOWN/aborted claim ID." })),
+  claimId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Exact settled UNKNOWN/aborted legacy claim ID for resume or migrated-legacy reconcile; never a native attempt alias." })),
+  claimBinding: Type.Optional(Type.String({ minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$", description: "Required with claimId for migrated-legacy reconcile: exact retained claim binding. External effect evidence is separate." })),
   evidenceFingerprint: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "Required for resume: SHA-256 of reconciled checkpoint/effect evidence. Explicit future occurrences only, never replay or mark the old claim successful." })),
   eventName: Type.Optional(Type.String({ description: "Required for trigger. Must match the existing event job schedule." })),
   eventId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for trigger; stable producer id, never prompt text." })),

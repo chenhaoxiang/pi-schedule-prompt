@@ -17,6 +17,10 @@ Routine recovery SHALL keep a stable logical job identity with separately identi
 - **WHEN** a historical predecessor/successor chain is imported
 - **THEN** old identifiers, UNKNOWN claims, spent attempts, expiry and evidence references remain traceable without merging unrelated jobs
 
+#### Scenario: A legacy chain crosses an authorized session handover
+- **WHEN** a proven legacy chain crosses session owners
+- **THEN** migration requires the exact retained predecessor claim/binding/recovery and separately verified historical user-handover evidence, preserves disabled predecessor rows and counts every ancestor's spending once without treating the handover as business-effect or resource-closure evidence
+
 ### Requirement: Atomic ownership and budget accounting
 Cooperating local writers SHALL serialize admission, ownership transfer, attempt accounting, checkpoint references and next eligibility in the existing store. Recovered business executions SHALL obey the same lifetime accounting; request-level model retries and skipped ticks SHALL remain distinct observations.
 
@@ -63,6 +67,10 @@ Rollout SHALL distinguish source, release, installation, selected runtime, loade
 #### Scenario: Package installed but old session remains loaded
 - **WHEN** a new package exists on disk but a busy session still runs the old version
 - **THEN** status reports the mismatch and no forced reload or false live-upgrade claim occurs
+
+#### Scenario: Bounded loaded-runtime status
+- **WHEN** the existing status tool or native host-status command reads runtime identity
+- **THEN** it reports module-load-captured Schedule identity, actual optional native capability and registered work separately from disk selection, bound SDK and unobserved SDK resources, without inferring the running Core version or all-resource quiescence
 
 #### Scenario: Rollback after new activity
 - **WHEN** newer state contains attempts absent from the pre-migration backup

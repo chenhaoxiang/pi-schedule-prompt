@@ -1,5 +1,6 @@
 import { Cron } from "croner";
 import { validEventId, validEvidenceFingerprint } from "./events.js";
+import { validateLegacyHandover } from "./legacy-lineage.js";
 import type { AttemptOwner, AttemptRecord, AttemptResolution, CronJob, ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, ResilientPolicy, TimedOccurrence } from "./types.js";
 
 const idlePhases = new Set(["waiting", "backoff", "reconciling", "waiting-input", "attention-required", "finished"]);
@@ -73,7 +74,7 @@ export function requiresReconciliation(job: ResilientJob): boolean {
   const old = job.runtime.legacyUncertainty;
   if (old) {
     const latest = latestEffectResolution(job, old.claimId);
-    if (!old.claimId || latest?.disposition !== "continue" || latest.safeScopes?.length) return true;
+    if (!old.claimId || latest?.disposition !== "continue" || latest.legacyClaimBinding !== job.claim?.binding || latest.safeScopes?.length) return true;
   }
   for (const record of job.attemptHistory) {
     if (record.effectStatus !== "unknown") continue;
@@ -144,7 +145,7 @@ function validateRecord(record: AttemptRecord, job: ResilientJob): void {
 export function validateResilientJob(job: CronJob, storeVersion: number): void {
   if (!job.policy || job.policy.mode === "legacy") {
     if (job.policy && Object.keys(job.policy).some(key => key !== "mode")) throw new Error("Legacy policy cannot opt into resilient timing fields");
-    if (job.runtime !== undefined || job.attemptHistory !== undefined || job.attemptResolutions !== undefined || job.legacyLineage !== undefined) throw new Error("Resilient state requires an explicit schema4 policy");
+    if (job.runtime !== undefined || job.attemptHistory !== undefined || job.attemptResolutions !== undefined || job.legacyLineage !== undefined || job.legacyHandovers !== undefined) throw new Error("Resilient state requires an explicit schema4 policy");
     return;
   }
   if (job.policy.mode !== "resilient" || storeVersion !== 4) throw new Error("Resilient jobs require an explicit schema4 migration");
@@ -161,7 +162,7 @@ export function validateResilientJob(job: CronJob, storeVersion: number): void {
     const cron = new Cron(value.schedule, { paused: true, timezone: policy.timezone }); cron.stop();
   }
   if (!runtime || !safeInteger(runtime.baselineAttempts) || !safeInteger(runtime.ownerEpoch, 1) || !safeInteger(runtime.missedCount) || !safeInteger(runtime.cooldownStep) || runtime.cooldownStep > 5 || !runtime.slot || !Array.isArray(value.attemptHistory) || !Array.isArray(value.attemptResolutions)) throw new Error("Invalid resilient runtime");
-  for (const date of [runtime.lastFinishedAt, runtime.nextEligibleAt, runtime.notBefore]) if (date !== undefined && !instant(date)) throw new Error("Invalid persisted resilient eligibility");
+  for (const date of [runtime.lastFinishedAt, runtime.nextEligibleAt, runtime.notBefore, runtime.legacyFutureAfter]) if (date !== undefined && !instant(date)) throw new Error("Invalid persisted resilient eligibility");
   if (runtime.pending) { validateOccurrence(runtime.pending); if (runtime.pending.revision !== value.revision) throw new Error("Stale pending occurrence revision"); }
   if (runtime.slot.kind === "owned") {
     if (!ownedPhases.has(runtime.slot.phase) || !reason(runtime.slot.reason)) throw new Error("Invalid owned execution phase");
@@ -186,16 +187,28 @@ export function validateResilientJob(job: CronJob, storeVersion: number): void {
   for (const resolution of value.attemptResolutions) {
     const legacy = value.claim?.phase === "settled" && value.claim.id === resolution.attemptId;
     if ((!ids.has(resolution.attemptId) && !legacy) || !validEvidenceFingerprint(resolution.evidenceFingerprint) || !instant(resolution.at) || !["continue", "waiting-input", "unknown", "native-closure"].includes(resolution.disposition) || (resolution.safeScopes !== undefined && (!Array.isArray(resolution.safeScopes) || resolution.safeScopes.length > 32 || !resolution.safeScopes.every(scope => validEventId(scope))))) throw new Error("Invalid exact-attempt reconciliation");
+    if (legacy && (resolution.legacyClaimBinding !== value.claim?.binding || resolution.checkpoint !== undefined || resolution.disposition === "native-closure")) throw new Error("Legacy resolution must bind its exact retained claim, not a fabricated native checkpoint");
+    if (!legacy && resolution.legacyClaimBinding !== undefined) throw new Error("Native resolution cannot claim legacy identity");
     const resolvedRecord = value.attemptHistory.find(item => item.id === resolution.attemptId);
     if (resolvedRecord && resolution.disposition === "continue" && !sameCheckpointReference(resolution.checkpoint, resolvedRecord.checkpoint)) throw new Error("Resolution must bind the exact retained native checkpoint");
     if (resolution.checkpoint !== undefined && (!resolvedRecord?.checkpoint || !sameCheckpointReference(resolution.checkpoint, resolvedRecord.checkpoint))) throw new Error("Reconciliation evidence references a different checkpoint");
     const key = resolution.attemptId + ":" + resolution.evidenceFingerprint;
     if (resolutionKeys.has(key)) throw new Error("Duplicate reconciliation evidence"); resolutionKeys.add(key);
   }
+  if (runtime.legacyFutureAfter && (!runtime.legacyUncertainty?.claimId || !value.attemptResolutions.some(item => item.attemptId === runtime.legacyUncertainty!.claimId && item.legacyClaimBinding === value.claim?.binding && item.disposition === "continue" && !item.safeScopes?.length && item.at === runtime.legacyFutureAfter))) throw new Error("Legacy future boundary requires its exact retained whole-claim resolution");
   if (runtime.continuation) {
     const record = value.attemptHistory.find(item => item.id === runtime.continuation!.attemptId);
     if (!record?.checkpoint || JSON.stringify(record.checkpoint) !== JSON.stringify(runtime.continuation.checkpoint) || (runtime.continuation.evidenceFingerprint !== undefined && !validEvidenceFingerprint(runtime.continuation.evidenceFingerprint))) throw new Error("Continuation must consume its exact retained checkpoint");
   }
   if (runtime.slot.kind === "idle" && ["waiting", "backoff"].includes(runtime.slot.phase) && requiresReconciliation(value)) throw new Error("Unresolved effects cannot become eligible through a status change");
+  if (value.legacyHandovers !== undefined) {
+    if (!Array.isArray(value.legacyHandovers) || value.legacyHandovers.length > 32) throw new Error("Invalid bounded retained handovers");
+    const seen = new Set<string>();
+    for (const proof of value.legacyHandovers) {
+      validateLegacyHandover(proof);
+      if (!value.legacyLineage?.includes(proof.predecessorJobId) || (proof.successorJobId !== value.id && !value.legacyLineage.includes(proof.successorJobId)) || seen.has(proof.predecessorJobId)) throw new Error("Retained handover does not belong to the proven lineage");
+      seen.add(proof.predecessorJobId);
+    }
+  }
   if (value.legacyLineage && (!Array.isArray(value.legacyLineage) || new Set(value.legacyLineage).size !== value.legacyLineage.length || value.legacyLineage.includes(value.id) || !value.legacyLineage.every(validEventId))) throw new Error("Invalid proven legacy lineage");
 }

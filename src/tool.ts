@@ -43,7 +43,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId), resume (needs jobId, exact settled UNKNOWN/aborted claimId and SHA-256 evidenceFingerprint). Resume creates only a FUTURE continuation; it never replays or marks the old claim successful. maxRunsPerDay counts UTC attempts. Explicit mode=resilient requires native v1, finite maxRuns/expiresAt and a new/prepared schema4 store for session-bound recurring jobs. New resilient intervals default fixed-delay (N after exact safe finish), never silently replacing legacy cadence. Read-only status/preview; drain checkpoints the exact owned handle; reconcile requires an exact finalized attemptId, SHA-256 evidenceFingerprint and resolution from the ordinary owning operator context, not new authority.",
+      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId), resume (needs jobId, exact settled UNKNOWN/aborted claimId and SHA-256 evidenceFingerprint). Resume creates only a FUTURE continuation; it never replays or marks the old claim successful. maxRunsPerDay counts UTC attempts. Explicit mode=resilient requires native v1, finite maxRuns/expiresAt and a new/prepared schema4 store for session-bound recurring jobs. New resilient intervals default fixed-delay (N after exact safe finish), never silently replacing legacy cadence. Read-only status/preview; drain checkpoints the exact owned handle; reconcile requires either an exact finalized attemptId or migrated legacy claimId/claimBinding, separate SHA-256 effect evidenceFingerprint and resolution from the ordinary owning operator context, not new authority.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -97,7 +97,7 @@ export function createCronTool(
             const selected = params.jobId ? all.filter(job => job.id === params.jobId) : all.slice(0, 20);
             details.status = summarizeJobs(selected, { nextRun: id => scheduler.getNextRun(id), nativeSnapshot: id => scheduler.getNativeRunSnapshot(id) });
             details.truncated = !params.jobId && selected.length < all.length;
-            return { content: [{ type: "text", text: JSON.stringify({ running: scheduler.isRunning?.() ?? false, jobs: all.length, truncated: details.truncated, status: details.status }) }], details };
+            return { content: [{ type: "text", text: JSON.stringify({ running: scheduler.isRunning?.() ?? false, jobs: all.length, truncated: details.truncated, status: details.status, runtime: scheduler.runtimeReadback() }) }], details };
           }
           case "drain": {
             if (!params.jobId) throw new Error("drain requires the exact jobId");
@@ -106,8 +106,11 @@ export function createCronTool(
             return { content: [{ type: "text", text: "Requested native checkpoint/drain for the exact handle. This is not an exit acknowledgement or business success." }], details };
           }
           case "reconcile": {
-            if (!params.jobId || !params.attemptId || !params.evidenceFingerprint || !params.resolution) throw new Error("reconcile requires jobId, exact finalized attemptId, SHA-256 evidenceFingerprint and resolution");
-            const result = scheduler.reconcileResilientJob(params.jobId, params.attemptId, params.evidenceFingerprint, params.resolution, params.safeScopes);
+            if (!params.jobId || !params.evidenceFingerprint || !params.resolution || (!params.attemptId && !params.claimId) || (params.attemptId && params.claimId)) throw new Error("reconcile requires jobId, either exact finalized attemptId or retained legacy claimId/binding, SHA-256 effect evidence and resolution");
+            if (params.claimId && !params.claimBinding) throw new Error("Migrated legacy reconciliation requires the exact retained claimBinding");
+            const result = params.claimId
+              ? scheduler.reconcileLegacyJob(params.jobId, params.claimId, params.claimBinding!, params.evidenceFingerprint, params.resolution, params.safeScopes)
+              : scheduler.reconcileResilientJob(params.jobId, params.attemptId!, params.evidenceFingerprint, params.resolution, params.safeScopes);
             details.jobId = result.job.id; details.jobName = result.job.name; details.status = summarizeJobs([result.job], { nextRun: id => scheduler.getNextRun(id) });
             return { content: [{ type: "text", text: `Exact checkpoint resolution ${result.changed ? "recorded" : "already recorded"}. Old execution/effect history is unchanged; this does not create new authority or business success.` }], details };
           }
