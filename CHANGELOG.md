@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.15 (2026-11-05; loaded/natural acceptance separate)
+- Hand off unattended input/budget enforcement only to an actual native input-guard-v1 capability with an exact active run binding; detach only Schedule's legacy tool hook and restore it after native settlement or on ordinary/legacy work.
+- Preserve old-host/no-unsubscribe/unknown-identity safety, arbitrary third-party call/result hook UNKNOWN, immutable history and all execution bounds.
+- Expose actual unattendedInputGuardVersion in existing runtime metadata, not a version-derived claim.
+
 ### Maintained fork 0.4.1-fork.14 (2026-11-04; source candidate, live acceptance separate)
 - Preserve complete legacy recovery spending across an explicitly evidenced cross-session handover; retain disabled predecessors and reject mismatched, duplicate or unused handover tuples without rewriting their original claims.
 - Add exact migrated-legacy claim reconciliation through the existing owning-session tool/API, without fabricated native history, automatic enablement, replacement jobs, replay or new lifetime/daily/expiry allowance.

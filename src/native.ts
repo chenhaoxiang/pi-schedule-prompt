@@ -50,6 +50,7 @@ export interface NativeRunHandle {
 }
 export interface NativeCapability {
   readonly version: 1;
+  readonly unattendedInputGuardVersion?: 1;
   readonly active: NativeRunHandle | undefined;
   start(request: { binding: NativeExecutionProof["binding"]; policy: { softDeadlineMs: number; hardDeadlineMs: number; recoveryBudgetMs?: number }; content: string }): { accepted: true; handle: NativeRunHandle } | { accepted: false; reason: "busy" | "disposed" };
 }
