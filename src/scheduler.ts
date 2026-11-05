@@ -155,7 +155,7 @@ export class CronScheduler {
     return {
       version: 1, observedAt: new Date().toISOString(), pid: process.pid, sessionId: this.ctx.sessionManager.getSessionId(), storePath: this.storage.getStorePath(),
       loadedSchedule: { name: loadedPackage.name, version: loadedPackage.version, sourceSha: loadedInstall?.sourceSha ?? null, boundSdkVersion: loadedInstall?.hostVersion ?? null, moduleUrl: import.meta.url, commandPath: this.pi.getCommands?.().find(command => command.name === "schedule-host-status")?.sourceInfo?.path ?? null, readerSchemas: [1, 2, 3, 4] },
-      actualCoreVersion: "not-exposed", nativeCapabilityVersion: capability?.version ?? null, native,
+      actualCoreVersion: "not-exposed", nativeCapabilityVersion: capability?.version ?? null, unattendedInputGuardVersion: capability?.unattendedInputGuardVersion ?? null, native,
       coreIdle: this.ctx.isIdle?.() ?? null, pendingMessages: this.ctx.hasPendingMessages?.() ?? null, effectiveTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       registered: { running: !this.stopped, scheduledTurn: this.scheduledTurn, legacyDurableBusy: this.durable.busy(), activeLegacyJobCount: this.activeJobs.size, activeLegacyModelControllerCount: this.activeSubagents.size, resilientJobIds: this.resilient.registeredJobIds().slice(0, 20), pendingJobCount: this.pending.size },
       untrackedSdkHandles: "not-observed", closureEvidence: "This is registered scheduler/native metadata only, not proof that unrelated or untracked SDK/delegated handles closed.",

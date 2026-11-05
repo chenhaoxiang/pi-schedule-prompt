@@ -10,13 +10,14 @@
 
 import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
 import { startEventApi } from "./event-api.js";
 import { EVENT_REQUEST, PROGRESS_REQUEST, validEventId, validEvidenceFingerprint, validProgressOutcome } from "./events.js";
 import { classifyFollowupReply, FOLLOWUP_CANCEL_TRANSPORT_EVENT, FOLLOWUP_OBSERVED_EVENT, FOLLOWUP_SCHEDULE_EVENT, type FollowupObservation, type FollowupRecord, type FollowupScheduleRequest, followupName, followupPrompt, validateFollowupBinding, validateFollowupOptions } from "./followup.js";
 import { scheduledToolCallBlock } from "./input-guard.js";
+import { nativeCapability } from "./native.js";
 import { isResilient } from "./resilient-policy.js";
 import { CronScheduler } from "./scheduler.js";
 import { loadSettings, type ScheduleSettings, saveSettings } from "./settings.js";
@@ -173,20 +174,43 @@ export default async function (pi: ExtensionAPI) {
     cleanupSession(ctx);
   });
 
-  pi.on("before_agent_start", (event) => {
-    scheduler?.setScheduledTurn(event.messageType === "custom" && event.message.customType === "scheduled_prompt");
-    scheduler?.onScheduledStart(event.messageType === "custom" && event.message.customType === "scheduled_prompt" ? (event.message.details as { claimId?: string } | undefined)?.claimId : undefined);
-  });
-  pi.on("tool_call", event => {
+  // Only our legacy hook is detached, and only after actual native input/budget protection is negotiated.
+  let stopLegacyGuard: (() => void) | undefined;
+  let legacyGuardRegistered = false;
+  const legacyGuard = (event: ToolCallEvent) => {
     const windDown = scheduler?.blockScheduledTool(event.toolName);
     if (windDown) return windDown;
     const blocked = scheduledToolCallBlock(scheduler?.isScheduledTurn() ?? false, event.toolName);
     if (!blocked) return;
     scheduler?.recordScheduledInputRequired(event.toolCallId);
     return blocked;
+  };
+  const restoreLegacyGuard = () => {
+    if (legacyGuardRegistered) return;
+    const stop = pi.on("tool_call", legacyGuard);
+    stopLegacyGuard = typeof stop === "function" ? stop : undefined;
+    legacyGuardRegistered = true;
+  };
+  restoreLegacyGuard();
+  pi.on("before_agent_start", (event, ctx) => {
+    const scheduled = event.messageType === "custom" && event.message.customType === "scheduled_prompt";
+    const details = scheduled ? event.message.details as { jobId?: string; attemptId?: string; ownerSessionId?: string; ownerEpoch?: number; revision?: number; nativeRunId?: string; claimId?: string } | undefined : undefined;
+    const capability = nativeCapability(ctx);
+    const handle = capability?.active;
+    let exactNative = false;
+    try {
+      const snapshot = handle?.snapshot();
+      exactNative = !!handle && !!snapshot && scheduled && capability?.unattendedInputGuardVersion === 1 && typeof details?.nativeRunId === "string" && handle.runId === details.nativeRunId && snapshot?.binding.jobId === details.jobId && snapshot.binding.attemptId === details.attemptId && snapshot.binding.ownerSessionId === details.ownerSessionId && snapshot.binding.ownerEpoch === details.ownerEpoch && snapshot.binding.revision === details.revision;
+    } catch { /* An unavailable identity never releases our legacy safety guard. */ }
+    if (exactNative && stopLegacyGuard) { stopLegacyGuard(); stopLegacyGuard = undefined; legacyGuardRegistered = false; }
+    else restoreLegacyGuard();
+    scheduler?.setScheduledTurn(scheduled);
+    scheduler?.onScheduledStart(details?.claimId);
   });
   pi.on("message_end", event => { scheduler?.onMessageEnd(event.message); });
   pi.on("agent_settled", event => {
+    // Core commits/closes the exact native receipt before agent_settled; restoration cannot taint that run.
+    restoreLegacyGuard();
     if (scheduler && !scheduler.isScheduledTurn()) {
       try { scheduler.emitEvent("lifecycle:agent-settled", randomUUID()); }
       catch { console.error("Lifecycle event admission unavailable"); }
