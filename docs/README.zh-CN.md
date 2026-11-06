@@ -73,7 +73,7 @@ created: 2026-10-20
 
 新增 `type:event`，schedule 填最多四个逗号分隔事件名；任务必须绑定 session。`action:trigger` 只接受既有 jobId、eventName 和稳定 eventId，不能由事件提供新提示或命令。`maxRunsPerDay` 按 UTC 日历日限制已准入尝试，catchUp 明确选 none 或 latest。
 
-生命周期和本地事件共用准入；可选 GitHub 配置只读指定仓库/PR或工作流元数据，至少六十秒轮询。可选 eventApi 默认关闭，只监听回环地址，Token 由指定环境变量提供，HTTP 仅允许 api: 事件名。本版新状态写入版本3，可读版本1/2/3；旧运行时会拒绝新格式，不要混用同一份状态文件。完整边界见 [事件准入](event-admission.md)。
+生命周期和本地事件共用准入；可选 GitHub 配置只读指定仓库/PR或工作流元数据，至少六十秒轮询。新增显式 `github:{repo,kind:"pull-request-checks",number}` 配合事件名 `github:pull-request-checks`，观察该PR当前精确head的check runs与旧式commit statuses；首次有效快照也通知原负责人对账一次，避免注册时CI已完成却一直等待；之后相同证据保持安静。评论、输出正文和无关workflow不会进入指纹。PR读取期间head/base变化、集合不完整或超限时不发布结果，沿现有退避处理；原负责人仍须重新核对适用审查、CI和权限，事件不代表可以合并。旧PR/workflow模式不变；旧运行时拒绝新selector，不得混用该任务存储。可选 eventApi 默认关闭，只监听回环地址，Token 由指定环境变量提供，HTTP 仅允许 api: 事件名。本版新状态写入版本3，可读版本1/2/3；旧运行时会拒绝新格式，不要混用同一份状态文件。完整边界见 [事件准入](event-admission.md)。
 
 ## 可选常驻与恢复
 

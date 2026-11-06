@@ -797,14 +797,15 @@ export class CronStorage {
     return this.mutate(store => this.queueInto(store.jobs.find(job => job.id === id), name, eventId, sessionId, evidenceFingerprint));
   }
 
-  observeGithub(id: string, revision: number, fingerprint: string, sessionId: string | undefined, binding: string): EventResult {
+  observeGithub(id: string, revision: number, fingerprint: string, sessionId: string | undefined, binding: string, seedOnly = false): EventResult {
     if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error("Invalid GitHub fingerprint");
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job?.github || !job.enabled || ((job.revision ?? 0) !== revision || eventBinding(job) !== binding) || (job.session && job.session !== sessionId)) return { status: "ignored", reason: "source-changed" };
+      if (seedOnly) { job.sourceFingerprint = fingerprint; return { status: "ignored", reason: "seeded" }; }
       if (job.sourceFingerprint === fingerprint) return { status: "duplicate" };
       const seeded = !!job.sourceFingerprint;
-      if (!seeded) { job.sourceFingerprint = fingerprint; return { status: "ignored", reason: "seeded" }; }
+      if (!seeded && job.github.kind !== "pull-request-checks") { job.sourceFingerprint = fingerprint; return { status: "ignored", reason: "seeded" }; }
       const result = this.queueInto(job, "github:" + job.github.kind, fingerprint, sessionId);
       if (result.status !== "ignored" || job.catchUp !== "latest") job.sourceFingerprint = fingerprint;
       return result;
