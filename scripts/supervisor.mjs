@@ -53,7 +53,7 @@ export function readConfig(file) {
     !/^[a-f0-9]{64}$/.test(config.piCliSha256) || !/^[a-f0-9]{40}$/.test(config.sourceCommit) ||
     !/^[a-zA-Z0-9](?:[a-zA-Z0-9._-]{0,62}[a-zA-Z0-9])?$/.test(config.sessionId) ||
     typeof config.model !== 'string' || !/^[a-zA-Z0-9_.-]+\/[^\s:]+$/.test(config.model) ||
-    (config.thinkingLevel !== undefined && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(config.thinkingLevel)) ||
+    (config.thinkingLevel !== undefined && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(config.thinkingLevel)) ||
     (config.toolProfile !== undefined && config.toolProfile !== 'read-only') ||
     (config.sessionFile !== undefined && (typeof config.sessionFile !== 'string' || !path.isAbsolute(config.sessionFile) || path.normalize(config.sessionFile) !== config.sessionFile))) throw new Error('Invalid fixed native supervisor config');
   if (!Number.isInteger(config.controlPort) || config.controlPort < 49152 || config.controlPort > 65535) throw new Error('controlPort must be a selected loopback port 49152–65535');

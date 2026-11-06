@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.18 (2026-11-06; activation separate)
+- Accept explicit native `thinkingLevel: max` in fixed supervisor configuration and forward it unchanged, instead of rejecting a level supported by the current Pi host.
+- Keep omitted-level inheritance, invalid-level rejection, model/host checks and execution bounds unchanged. Native/model support and actual loaded thinking still require runtime readback; no automatic downgrade or active-session reload.
+
 ### Maintained fork 0.4.1-fork.17 (2026-11-06; activation separate)
 - Preserve the existing optional evidence fingerprint through the public event trigger and trusted local event bus, so configured unchanged-evidence suppression works without a second scheduling path.
 - Keep invalid payload rejection, ordinary event-id behavior, owner/limit/quiet rules and UNKNOWN recovery unchanged.
