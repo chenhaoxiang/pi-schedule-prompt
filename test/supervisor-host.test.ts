@@ -176,6 +176,53 @@ describe("dedicated native RPC supervisor service", () => {
     const legacy = start(h.file); await vi.waitFor(() => expect(legacy.child.exitCode).toBe(1));
     expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(false);
   });
+  it("resumes the exact existing native transcript with a hard read-only builtin registry", async () => {
+    const h = await fixture(); h.storage.addJob({ id: "retained", name: "retained", type: "once", schedule: new Date(Date.now() + 3000).toISOString(), prompt: "synthetic retained result", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, durable: true, catchUp: "latest", maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
+    const first = start(h.file); await ready(h, first);
+    await vi.waitFor(() => expect(h.storage.getJob("retained")?.notice?.state).toBe("accepted"), { timeout: 12000 });
+    expect((await command("stop", h.file)).code).toBe(0); await vi.waitFor(() => expect(first.child.exitCode).toBe(0), { timeout: 12000 });
+    const oldStatus = JSON.parse(fs.readFileSync(path.join(h.stateDir, "status.json"), "utf8"));
+    const sessionFile = oldStatus.nativeIdentity.sessionFile; const before = fs.readFileSync(sessionFile);
+    const storeBefore = fs.readFileSync(h.storage.getStorePath());
+    const stateDir = path.join(h.cwd, "resumed-state"); fs.mkdirSync(stateDir, { mode: 0o700 });
+    const file = path.join(h.cwd, "resume.json"); fs.writeFileSync(file, JSON.stringify({ ...h.config, stateDir, sessionFile, toolProfile: "read-only" }), { mode: 0o600 });
+    const resumed = start(file); await ready({ ...h, file, stateDir }, resumed);
+    const status = JSON.parse((await command("status", file)).data);
+    expect(status).toMatchObject({ ready: true, active: true, toolProfile: "read-only", toolProfileVerified: true, nativeIdentity: { sessionFile, sessionId: h.config.sessionId }, runtime: { sessionFile, tools: { state: "observed", truncated: false } } });
+    expect(status.runtime.tools.active.sort()).toEqual(["find", "grep", "ls", "read"]);
+    expect(status.runtime.tools.registered.map((tool: any) => [tool.name, tool.source, tool.path, tool.exposure]).sort()).toEqual(["find", "grep", "ls", "read"].map(name => [name, "builtin", "builtin:" + name, "direct"]));
+    expect(fs.readFileSync(sessionFile).subarray(0, before.length)).toEqual(before);
+    expect(fs.readdirSync(path.join(stateDir, "sessions"))).toHaveLength(0);
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(storeBefore);
+    expect(fs.readFileSync(path.join(h.cwd, "inference-started"), "utf8").trim().split("\n")).toHaveLength(1);
+    expect((await command("stop", file)).code).toBe(0); await vi.waitFor(() => expect(resumed.child.exitCode).toBe(0), { timeout: 12000 });
+  }, 45000);
+  it("rejects invalid tool profiles and foreign/missing/symlinked session files before native launch", async () => {
+    const h = await fixture();
+    fs.writeFileSync(h.file, JSON.stringify({ ...h.config, toolProfile: "arbitrary-shell" }));
+    expect((await command("plist", h.file)).code).toBe(1);
+    const directory = path.join(h.cwd, "private-sessions"); fs.mkdirSync(directory, { mode: 0o700 });
+    const sessionFile = path.join(directory, "retained.jsonl");
+    const header = { type: "session", version: 3, id: h.config.sessionId, cwd: h.cwd, timestamp: new Date().toISOString() };
+    fs.writeFileSync(sessionFile, JSON.stringify(header) + "\n", { mode: 0o600 });
+    const link = path.join(directory, "link.jsonl"); fs.symlinkSync(sessionFile, link);
+    for (const selected of [path.join(directory, "missing.jsonl"), link, directory]) {
+      fs.writeFileSync(h.file, JSON.stringify({ ...h.config, sessionFile: selected }));
+      const blocked = start(h.file); await vi.waitFor(() => expect(blocked.child.exitCode).toBe(1), { timeout: 10000 });
+      expect(fs.existsSync(path.join(h.stateDir, "host.json"))).toBe(false);
+    }
+    for (const changed of [{ ...header, id: "foreign" }, { ...header, cwd: path.dirname(h.cwd) }]) {
+      fs.writeFileSync(sessionFile, JSON.stringify(changed) + "\n");
+      fs.writeFileSync(h.file, JSON.stringify({ ...h.config, sessionFile }));
+      const blocked = start(h.file); await vi.waitFor(() => expect(blocked.child.exitCode).toBe(1), { timeout: 10000 });
+      expect(blocked.stderr()).toContain("header/cwd identity mismatch");
+    }
+    fs.writeFileSync(h.file, JSON.stringify({ ...h.config, toolProfile: "read-only" }));
+    h.storage.addJob({ id: "explicit-model", name: "explicit-model", type: "once", schedule: new Date(Date.now() + 10000).toISOString(), prompt: "must not create a separate unrestricted SDK child", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, model: "durable-fixture/fixture", durable: true, maxRuns: 1, expiresAt: new Date(Date.now() + 60000).toISOString() });
+    const model = start(h.file); await vi.waitFor(() => expect(model.child.exitCode).toBe(1), { timeout: 10000 });
+    expect(model.stderr()).toContain("read-only profile requires inline jobs");
+    expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(false);
+  }, 40000);
   it("prints an opt-in launchd definition without starting or installing a service", async () => {
     const h = await fixture(); const result = await command("plist", h.file);
     expect(result.code).toBe(0); expect(result.data).toContain("<key>Crashed</key><true/>"); expect(result.data).toContain("<integer>60</integer>");

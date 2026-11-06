@@ -28,6 +28,21 @@ const promptFor = (job: CronJob) => {
   return base + budgetPrompt(job);
 };
 const snippet = (text: string) => text.length > 500 ? text.slice(0, 500) + "…" : text;
+const toolReadback = (pi: ExtensionAPI) => {
+  try {
+    const active = pi.getActiveTools?.(); const registered = pi.getAllTools?.();
+    if (!Array.isArray(active) || !Array.isArray(registered)) throw new Error("Tool metadata unavailable");
+    return {
+      state: "observed", truncated: active.length > 64 || registered.length > 64 || active.some(name => name.length > 128) || registered.some(tool => tool.name.length > 128 || tool.sourceInfo.path.length > 1024),
+      active: active.slice(0, 64).map(name => name.slice(0, 128)),
+      registered: registered.slice(0, 64).map(tool => ({ name: tool.name.slice(0, 128), exposure: tool.exposure, source: tool.sourceInfo.source, path: tool.sourceInfo.path.slice(0, 1024), reachesTools: !!tool.reachesTools })),
+    };
+  } catch { return { state: "unknown", truncated: false, active: null, registered: null }; }
+};
+const readOnlyToolNames = ["find", "grep", "ls", "read"];
+const matchesReadOnlyProfile = (tools: ReturnType<typeof toolReadback>) => tools.state === "observed" && !tools.truncated && !!tools.active && !!tools.registered &&
+  JSON.stringify([...tools.active].sort()) === JSON.stringify(readOnlyToolNames) && tools.registered.length === readOnlyToolNames.length &&
+  new Set(tools.registered.map(tool => tool.name)).size === readOnlyToolNames.length && tools.registered.every(tool => readOnlyToolNames.includes(tool.name) && tool.source === "builtin" && tool.path === "builtin:" + tool.name && tool.exposure === "direct" && !tool.reachesTools);
 
 /** Timers own intent only. Host acceptance never proves business completion. */
 export class CronScheduler {
@@ -63,6 +78,9 @@ export class CronScheduler {
 
   start(): void {
     this.stop();
+    // The native service must validate its actual registry before restoring/queuing work,
+    // not after a continuation has raced a slower supervisor readiness response.
+    if (!this.profileAllowsAdmission()) return;
     this.stopped = false;
     this.resilient.start();
     const session = this.ctx.sessionManager.getSessionId();
@@ -153,7 +171,7 @@ export class CronScheduler {
       if (snapshot) native = { state: "owned", runId: snapshot.runId, jobId: snapshot.binding.jobId, phase: snapshot.phase, nativeClosed: snapshot.nativeClosed, ownedHandleCount: snapshot.ownedHandles.length };
     } catch { native = { state: "unknown" }; }
     return {
-      version: 1, observedAt: new Date().toISOString(), pid: process.pid, sessionId: this.ctx.sessionManager.getSessionId(), storePath: this.storage.getStorePath(),
+      version: 1, observedAt: new Date().toISOString(), pid: process.pid, sessionId: this.ctx.sessionManager.getSessionId(), sessionFile: this.ctx.sessionManager.getSessionFile?.() ?? null, storePath: this.storage.getStorePath(), tools: toolReadback(this.pi),
       loadedSchedule: { name: loadedPackage.name, version: loadedPackage.version, sourceSha: loadedInstall?.sourceSha ?? null, boundSdkVersion: loadedInstall?.hostVersion ?? null, moduleUrl: import.meta.url, commandPath: this.pi.getCommands?.().find(command => command.name === "schedule-host-status")?.sourceInfo?.path ?? null, readerSchemas: [1, 2, 3, 4] },
       actualCoreVersion: "not-exposed", nativeCapabilityVersion: capability?.version ?? null, unattendedInputGuardVersion: capability?.unattendedInputGuardVersion ?? null, native,
       coreIdle: this.ctx.isIdle?.() ?? null, pendingMessages: this.ctx.hasPendingMessages?.() ?? null, effectiveTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -409,10 +427,20 @@ export class CronScheduler {
     return job;
   }
 
+  private profileAllowsAdmission(): boolean {
+    const required = process.env.PI_SCHEDULE_SERVICE_TOOL_PROFILE;
+    if (!required) return true;
+    if (required === "read-only" && process.env.PI_SCHEDULE_SERVICE_SESSION === this.ctx.sessionManager.getSessionId() && matchesReadOnlyProfile(toolReadback(this.pi))) return true;
+    this.stop();
+    return false;
+  }
+
   private eligible(id: string): CronJob | undefined {
-    if (this.stopped) return;
+    if (this.stopped || !this.profileAllowsAdmission()) return;
     const stored = this.storage.getJob(id);
     if (!stored?.enabled || !CronScheduler.isLoadedFor(stored, this.ctx.sessionManager.getSessionId())) return;
+    // A separately constructed model SDK has a distinct tool registry/loadout.
+    if (process.env.PI_SCHEDULE_SERVICE_TOOL_PROFILE && stored.model) { this.stop(); return; }
     const job = this.prepareModel(stored);
     if (!job) return;
     if (isResilient(job)) {

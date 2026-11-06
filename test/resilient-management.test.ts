@@ -46,6 +46,21 @@ describe("canonical resilient management", () => {
     expect(readback.untrackedSdkHandles).toBe("not-observed"); expect(readback.closureEvidence).toContain("not proof");
   });
 
+  it("reports actual active/registered tool provenance with bounded metadata and unknown on missing or throwing APIs", () => {
+    const h = fixture(); expect(h.scheduler.runtimeReadback().tools).toMatchObject({ state: "unknown", active: null, registered: null });
+    const pi = h.pi as any;
+    pi.getActiveTools = () => ["read"];
+    pi.getAllTools = () => [{ name: "read", exposure: "direct", sourceInfo: { source: "builtin", path: "builtin:read" }, parameters: { PRIVATE_SCHEMA: "must not leak" }, description: "PRIVATE_DESCRIPTION" }];
+    const observed = h.scheduler.runtimeReadback();
+    expect(observed.sessionFile).toBe(h.ctx.sessionManager.getSessionFile());
+    expect(observed.tools).toEqual({ state: "observed", truncated: false, active: ["read"], registered: [{ name: "read", exposure: "direct", source: "builtin", path: "builtin:read", reachesTools: false }] });
+    expect(JSON.stringify(observed)).not.toContain("PRIVATE_");
+    pi.getAllTools = () => Array.from({ length: 70 }, (_, index) => ({ name: String(index), exposure: "deferred", sourceInfo: { source: "sdk", path: "x".repeat(1100) }, reachesTools: () => "all" }));
+    const bounded = h.scheduler.runtimeReadback().tools; expect(bounded.truncated).toBe(true); expect(bounded.registered).toHaveLength(64); expect(bounded.registered![0].path).toHaveLength(1024); expect(bounded.registered![0].reachesTools).toBe(true);
+    pi.getActiveTools = () => { throw new Error("unavailable"); };
+    expect(h.scheduler.runtimeReadback().tools.state).toBe("unknown");
+  });
+
   it("creates schema4 only for an explicit new resilient store and defaults to completion-delay", async () => {
     const h = fixture(); const result = await h.add(); expect(result.isError).not.toBe(true);
     const job = h.row(result.details!.jobId!);
