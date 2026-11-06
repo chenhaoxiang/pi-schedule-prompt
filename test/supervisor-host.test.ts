@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+// @ts-expect-error Packaged helper is deliberately dependency-free ESM.
+import { readConfig } from "../scripts/supervisor.mjs";
 import { resilientDefinition } from "../src/resilient-policy.js";
 import { CronStorage } from "../src/storage.js";
 
@@ -81,6 +83,24 @@ afterEach(async () => {
 });
 
 describe("dedicated native RPC supervisor service", () => {
+  it("preserves every explicit native thinking level including max", async () => {
+    const h = await fixture();
+    for (const thinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+      fs.writeFileSync(h.file, JSON.stringify({ ...h.config, thinkingLevel }));
+      expect(readConfig(h.file).thinkingLevel).toBe(thinkingLevel);
+    }
+    fs.writeFileSync(h.file, JSON.stringify(h.config));
+    expect(readConfig(h.file).thinkingLevel).toBeUndefined();
+    expect(fs.existsSync(path.join(h.stateDir, "host.json"))).toBe(false);
+  });
+  it("rejects invalid thinking levels before native startup", async () => {
+    const h = await fixture();
+    for (const thinkingLevel of ["auto", "MAX", "maximum", "", 7, null]) {
+      fs.writeFileSync(h.file, JSON.stringify({ ...h.config, thinkingLevel }));
+      expect(() => readConfig(h.file)).toThrow("Invalid fixed native supervisor config");
+    }
+    expect(fs.existsSync(path.join(h.stateDir, "host.json"))).toBe(false);
+  });
   it("starts idle with real SDK/RPC, rejects duplicate launcher, denies UI, then stops only its child", async () => {
     const h = await fixture(); const running = start(h.file, { SCHEDULE_FIXTURE_UI: "1" }); await ready(h, running);
     await vi.waitFor(() => expect(fs.readFileSync(path.join(h.cwd, "ui-denied"), "utf8")).toBe("true"));
