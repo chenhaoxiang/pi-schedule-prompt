@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.17 (2026-11-06; activation separate)
+- Preserve the existing optional evidence fingerprint through the public event trigger and trusted local event bus, so configured unchanged-evidence suppression works without a second scheduling path.
+- Keep invalid payload rejection, ordinary event-id behavior, owner/limit/quiet rules and UNKNOWN recovery unchanged.
+- Add isolated native SDK write/read artifact verification and explicit stop/readback coverage; synthetic execution is not live business acceptance.
+
 ### Maintained fork 0.4.1-fork.16 (2026-11-06; source/installed/natural acceptance separate)
 - Add an opt-in native read-only builtin tool profile through the existing Core CLI registry filter, with actual active/registered provenance verification before scheduler restoration and final reserve/admission as well as service readiness; do not use prompt-only restrictions, shell whitelists or unrestricted model children.
 - Resume an explicitly selected existing canonical native session file with the same id/cwd and preserve history/checkpoints/results through a normal owned-host transition; never copy history, clear UNKNOWN or reset spending/expiry.
