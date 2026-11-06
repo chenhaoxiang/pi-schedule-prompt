@@ -98,20 +98,20 @@ describe("exact selected PR-head check events", () => {
     }
   });
 
-  it("retains the existing store/admission contract: seed, quiet, change, foreign owner and stop", async () => {
+  it("notifies the initial exact-PR snapshot once, then preserves dedup/change/owner/stop admission", async () => {
     const root = path.resolve("tmp/pr-check-event-fixtures"); fs.mkdirSync(root, { recursive: true });
     const cwd = fs.mkdtempSync(path.join(root, "case-")); owned.push(cwd);
     const storage = new CronStorage(cwd);
     storage.addJob({ id: "exact", name: "exact", type: "event", schedule: "github:pull-request-checks", github: config, prompt: "Recheck original evidence; no automatic merge", session: "owner", enabled: true, createdAt: new Date().toISOString(), runCount: 0, maxRuns: 2 });
     const current = storage.getJob("exact")!;
     const before = await githubFingerprint(config, reader());
-    expect(storage.observeGithub("exact", current.revision!, before, "owner", eventBinding(current))).toMatchObject({ status: "ignored", reason: "seeded" });
+    expect(storage.observeGithub("exact", current.revision!, before, "owner", eventBinding(current))).toEqual({ status: "queued" });
     expect(storage.observeGithub("exact", current.revision!, before, "owner", eventBinding(current))).toEqual({ status: "duplicate" });
     const s = statuses(); s.statuses[0].state = "failure";
     const changed = await githubFingerprint(config, reader(pr(), checks(), s));
     expect(storage.observeGithub("exact", current.revision!, changed, "foreign", eventBinding(current))).toMatchObject({ status: "ignored" });
     expect(storage.observeGithub("exact", current.revision!, changed, "owner", eventBinding(current))).toEqual({ status: "queued" });
-    expect(storage.getJob("exact")?.pendingEvent?.keys).toHaveLength(1);
+    expect(storage.getJob("exact")?.pendingEvent?.keys).toHaveLength(2);
     storage.updateJob("exact", { enabled: false });
     expect(storage.observeGithub("exact", current.revision!, before, "owner", eventBinding(current))).toMatchObject({ status: "ignored" });
     expect(storage.getJob("exact")?.attemptCount ?? 0).toBe(0);

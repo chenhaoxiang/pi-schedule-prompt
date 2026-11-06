@@ -27,16 +27,45 @@ describe("bounded selected GitHub producers", () => {
     read.mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("a".repeat(64)).mockRejectedValueOnce(new Error("PR head changed while reading")).mockResolvedValueOnce("b".repeat(64));
     const h = setup({ repo: "owner/repo", kind: "pull-request-checks", number: 42, pollSeconds: 60 });
     await vi.advanceTimersByTimeAsync(180000);
-    expect(h.pi.sendMessage).not.toHaveBeenCalled();
+    expect(h.pi.sendMessage).toHaveBeenCalledOnce();
     expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("a".repeat(64));
     await vi.advanceTimersByTimeAsync(120000);
-    expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(h.pi.sendMessage).toHaveBeenCalledTimes(2);
     expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("b".repeat(64));
     h.storage.updateJob("gh", { enabled: false }); h.scheduler.updateJob("gh", h.storage.getJob("gh")!);
     await vi.advanceTimersByTimeAsync(120000);
-    expect(read).toHaveBeenCalledTimes(4); expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledTimes(4); expect(h.pi.sendMessage).toHaveBeenCalledTimes(2);
     h.scheduler.stop();
   });
+  it.each(["none", "latest"] as const)("preserves %s restart policy after initial PR-check notification", async catchUp => {
+    read.mockResolvedValueOnce("a".repeat(64)).mockRejectedValueOnce(new Error("temporary unavailable")).mockResolvedValueOnce("b".repeat(64)).mockResolvedValueOnce("c".repeat(64));
+    const h = setup({ repo: "owner/repo", kind: "pull-request-checks", number: 42, pollSeconds: 60 });
+    h.storage.updateJob("gh", { catchUp });
+    await vi.advanceTimersByTimeAsync(60000); expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    h.scheduler.stop(); h.scheduler.start();
+    await vi.advanceTimersByTimeAsync(180000);
+    expect(h.pi.sendMessage).toHaveBeenCalledTimes(catchUp === "none" ? 1 : 2);
+    expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("b".repeat(64));
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.pi.sendMessage).toHaveBeenCalledTimes(catchUp === "none" ? 2 : 3);
+    h.scheduler.stop();
+  });
+
+  it("does not lose the established PR baseline across a restart during failed reseeding", async () => {
+    read.mockResolvedValueOnce("a".repeat(64)).mockRejectedValueOnce(new Error("temporary unavailable")).mockResolvedValueOnce("b".repeat(64)).mockResolvedValueOnce("c".repeat(64));
+    const h = setup({ repo: "owner/repo", kind: "pull-request-checks", number: 42, pollSeconds: 60 });
+    await vi.advanceTimersByTimeAsync(60000); expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    h.scheduler.stop(); h.scheduler.start();
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("a".repeat(64));
+    h.scheduler.stop(); h.scheduler.start();
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("b".repeat(64));
+    await vi.advanceTimersByTimeAsync(60000); expect(h.pi.sendMessage).toHaveBeenCalledTimes(2);
+    h.scheduler.stop();
+  });
+
   it("seeds without inference and wakes only on the later metadata change", async () => {
     read.mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("b".repeat(64));
     const h = setup();
