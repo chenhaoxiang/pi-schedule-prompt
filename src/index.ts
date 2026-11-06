@@ -342,8 +342,10 @@ export default async function (pi: ExtensionAPI) {
     if (request.version !== 1 || !validEventId(request.requestId)) return;
     let result: unknown = { status: "ignored", reason: "invalid-request" };
     try {
-      if (Object.keys(request).every(key => ["version", "requestId", "jobId", "eventName", "eventId"].includes(key)) && typeof request.jobId === "string" && typeof request.eventName === "string" && typeof request.eventId === "string" && scheduler) {
-        result = scheduler.receiveEvent(request.jobId, request.eventName, request.eventId);
+      if (Object.keys(request).every(key => ["version", "requestId", "jobId", "eventName", "eventId", "evidenceFingerprint"].includes(key)) &&
+        typeof request.jobId === "string" && typeof request.eventName === "string" && typeof request.eventId === "string" &&
+        (request.evidenceFingerprint === undefined || validEvidenceFingerprint(request.evidenceFingerprint)) && scheduler) {
+        result = scheduler.receiveEvent(request.jobId, request.eventName, request.eventId, request.evidenceFingerprint as string | undefined);
       }
     } catch { result = { status: "ignored", reason: "admission-unavailable" }; }
     try { pi.events.emit(EVENT_REQUEST + ":result:" + request.requestId, result); }

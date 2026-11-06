@@ -126,7 +126,7 @@ export function createCronTool(
           case "trigger": {
             if (scheduler.isScheduledTurn?.()) throw new Error("Scheduled turns cannot trigger another schedule recursively");
             if (!params.jobId || !params.eventName || !params.eventId) throw new Error("trigger requires jobId,eventName,eventId");
-            const result = scheduler.receiveEvent(params.jobId, params.eventName, params.eventId);
+            const result = scheduler.receiveEvent(params.jobId, params.eventName, params.eventId, params.evidenceFingerprint);
             details.jobs = storage.getAllJobs().filter(job => job.id === params.jobId && CronScheduler.isLoadedFor(job, ctx.sessionManager.getSessionId()));
             return { content: [{ type: "text", text: `Event ${result.status}${result.reason ? ": " + result.reason : ""}` }], details };
           }
