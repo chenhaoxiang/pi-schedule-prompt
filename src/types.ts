@@ -135,7 +135,7 @@ export interface LegacyOwnerHandover {
 }
 
 
-export interface GithubTrigger { repo: string; kind: "pull-request" | "workflow"; number?: number; branch?: string; pollSeconds?: number; }
+export interface GithubTrigger { repo: string; kind: "pull-request" | "pull-request-checks" | "workflow"; number?: number; branch?: string; pollSeconds?: number; }
 export interface PendingEvent { revision: number; binding: string; keys: string[]; acceptedAt: string; evidenceFingerprint?: string; }
 export type EventResult = { status: "queued" | "duplicate" | "ignored"; reason?: string };
 
@@ -371,7 +371,7 @@ export const CronToolParams = Type.Object({
   quietOnNoChange: Type.Optional(Type.Boolean({ description: "Event/evidence jobs only. Quiet after repeated unchanged fingerprints; default false." })),
   noChangeThreshold: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "Consecutive unchanged evidence observations before quieting; default 2." })),
   quietForMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86400000, description: "Quiet duration after no-change threshold; default 3600000." })),
-  github: Type.Optional(Type.Object({ repo: Type.String(), kind: StringEnum(["pull-request", "workflow"]), number: Type.Optional(Type.Integer({ minimum: 1 })), branch: Type.Optional(Type.String()), pollSeconds: Type.Optional(Type.Integer({ minimum: 60, maximum: 3600 })) })),
+  github: Type.Optional(Type.Object({ repo: Type.String(), kind: StringEnum(["pull-request", "pull-request-checks", "workflow"]), number: Type.Optional(Type.Integer({ minimum: 1 })), branch: Type.Optional(Type.String()), pollSeconds: Type.Optional(Type.Integer({ minimum: 60, maximum: 3600 })) })),
   maxRuns: Type.Optional(Type.Integer({ minimum: 1, description: "Lifetime dispatch/attempt limit, not a token or invoice cap." })),
   expiresAt: Type.Optional(Type.String({ description: "Absolute ISO expiry. New fires stop at this time." })),
   model: Type.Optional(

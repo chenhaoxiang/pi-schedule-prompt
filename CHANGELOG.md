@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.19 (2026-11-06; activation separate)
+- Add an explicit `pull-request-checks` GitHub event selector over one PR’s current exact head, bounded latest check runs and legacy status contexts, with a final PR-binding recheck.
+- Fingerprint closed metadata only; reject incomplete/oversized/foreign/changing snapshots, ignore response ordering and comment/output text, and preserve existing seed/quiet/ownership/pause/budget behavior.
+- Events wake the original owner to recheck applicable review/CI and delivery authority; no automatic merge decision, required-check inference, extra executor or old-job migration. Existing PR/workflow selectors are unchanged; old runtimes refuse the new selector.
+
 ### Maintained fork 0.4.1-fork.18 (2026-11-06; activation separate)
 - Accept explicit native `thinkingLevel: max` in fixed supervisor configuration and forward it unchanged, instead of rejecting a level supported by the current Pi host.
 - Keep omitted-level inheritance, invalid-level rejection, model/host checks and execution bounds unchanged. Native/model support and actual loaded thinking still require runtime readback; no automatic downgrade or active-session reload.

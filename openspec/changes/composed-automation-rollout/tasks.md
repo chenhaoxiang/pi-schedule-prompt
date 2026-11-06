@@ -30,3 +30,9 @@
 ## Final source/runtime delivery
 - [x] Complete independent review, required CI and regular merge/readback for implementation stages B/C/D.
 - [x] Report installed/active/live separately; the selected live stop case does not substitute for unfinished-goal/physical-device/OS-reboot acceptance.
+
+## E — Exact PR-check continuation (2026-11-06)
+- [x] Add opt-in exact-current-PR-head check/status metadata, complete bounded collections and final PR-binding recheck without required-check or merge inference.
+- [x] Cover API ordering/noise, head changes, incomplete/foreign collections, public selector/store admission and existing quiet/pause/backoff fences with provider-free tests.
+- [ ] Complete independent exact-head review, normal PR/CI/merge and fixed release/install readback.
+- [ ] Consume an actual authorized unfinished PR’s CI change through the finite original-owner path, independently verify applicable original delivery evidence, and confirm stop; no completed-PR replay or artificial CI rerun.

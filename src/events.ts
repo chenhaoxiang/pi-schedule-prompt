@@ -32,10 +32,11 @@ export function dailyLimited(job: CronJob, now = Date.now()): boolean {
 }
 export function validateGithub(value: GithubTrigger): void {
   if (!value || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(value.repo) || [".", ".."].includes(value.repo.split("/")[1]) ||
-    !["pull-request", "workflow"].includes(value.kind) ||
-    (value.kind === "pull-request" && (!Number.isSafeInteger(value.number) || (value.number ?? 0) < 1)) ||
+    !["pull-request", "pull-request-checks", "workflow"].includes(value.kind) ||
+    (value.kind !== "workflow" && (!Number.isSafeInteger(value.number) || (value.number ?? 0) < 1)) ||
+    (value.kind === "pull-request-checks" && value.branch !== undefined) ||
     (value.branch !== undefined && !/^[A-Za-z0-9_./-]{1,100}$/.test(value.branch)) ||
     (value.pollSeconds !== undefined && (!Number.isSafeInteger(value.pollSeconds) || value.pollSeconds < 60 || value.pollSeconds > 3600))) {
-    throw new Error("GitHub trigger requires a safe owner/repo, pull-request/workflow kind and 60–3600 second poll interval");
+    throw new Error("GitHub trigger requires a safe owner/repo, pull-request/pull-request-checks/workflow kind and 60–3600 second poll interval; PR kinds require a number, and pull-request-checks does not accept branch");
   }
 }
