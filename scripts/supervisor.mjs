@@ -7,6 +7,28 @@ import { fileURLToPath } from 'node:url';
 import { NativeRpc } from './supervisor-rpc.mjs';
 
 const sha = value => createHash('sha256').update(value).digest('hex');
+const readOnlyTools = ['find', 'grep', 'ls', 'read'];
+// Resume the existing native transcript, never copy it or select a same-id replacement.
+function validateSessionFile(config) {
+  if (config.sessionFile === undefined) return;
+  const file = config.sessionFile;
+  const parent = fs.lstatSync(path.dirname(file));
+  if (fs.realpathSync(file) !== file || !parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o077) || (process.getuid && parent.uid !== process.getuid())) throw new Error('Session file must be canonical and privately contained by its owner');
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || (stat.mode & 0o022) || (process.getuid && stat.uid !== process.getuid())) throw new Error('Session file must be an owned regular file, not writable by others');
+    const buffer = Buffer.alloc(16384); const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, count).indexOf(10);
+    if (newline < 0) throw new Error('Session header missing or oversized');
+    const header = JSON.parse(buffer.subarray(0, newline).toString('utf8'));
+    if (header.type !== 'session' || header.id !== config.sessionId || header.cwd !== config.cwd) throw new Error('Exact session header/cwd identity mismatch');
+  } finally { fs.closeSync(fd); }
+}
+function verifyReadOnlyTools(runtime) {
+  const tools = runtime?.tools;
+  if (tools?.state !== 'observed' || tools.truncated || JSON.stringify([...tools.active].sort()) !== JSON.stringify(readOnlyTools) || tools.registered.length !== readOnlyTools.length || !tools.registered.every(tool => readOnlyTools.includes(tool.name) && tool.source === 'builtin' && tool.path === 'builtin:' + tool.name && tool.exposure === 'direct' && !tool.reachesTools) || new Set(tools.registered.map(tool => tool.name)).size !== readOnlyTools.length) throw new Error('Actual native read-only tool registry/loadout mismatch');
+}
 const alive = pid => {
   if (!Number.isSafeInteger(pid) || pid < 1) return true; // Incomplete record is not death proof.
   try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
@@ -25,13 +47,15 @@ export function readConfig(file) {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8192 || (stat.mode & 0o077) || (process.getuid && stat.uid !== process.getuid())) throw new Error('Config must be a private regular file <=8KiB');
   const config = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const keys = ['version', 'cwd', 'piCli', 'piCliSha256', 'packageRoot', 'sourceCommit', 'sessionId', 'model', 'thinkingLevel', 'stateDir', 'controlPort'];
+  const keys = ['version', 'cwd', 'piCli', 'piCliSha256', 'packageRoot', 'sourceCommit', 'sessionId', 'sessionFile', 'model', 'thinkingLevel', 'toolProfile', 'stateDir', 'controlPort'];
   if (!config || config.version !== 1 || Object.keys(config).some(key => !keys.includes(key)) ||
     !['cwd', 'piCli', 'packageRoot', 'stateDir'].every(key => typeof config[key] === 'string' && path.isAbsolute(config[key]) && path.normalize(config[key]) === config[key]) ||
     !/^[a-f0-9]{64}$/.test(config.piCliSha256) || !/^[a-f0-9]{40}$/.test(config.sourceCommit) ||
     !/^[a-zA-Z0-9](?:[a-zA-Z0-9._-]{0,62}[a-zA-Z0-9])?$/.test(config.sessionId) ||
     typeof config.model !== 'string' || !/^[a-zA-Z0-9_.-]+\/[^\s:]+$/.test(config.model) ||
-    (config.thinkingLevel !== undefined && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(config.thinkingLevel))) throw new Error('Invalid fixed native supervisor config');
+    (config.thinkingLevel !== undefined && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(config.thinkingLevel)) ||
+    (config.toolProfile !== undefined && config.toolProfile !== 'read-only') ||
+    (config.sessionFile !== undefined && (typeof config.sessionFile !== 'string' || !path.isAbsolute(config.sessionFile) || path.normalize(config.sessionFile) !== config.sessionFile))) throw new Error('Invalid fixed native supervisor config');
   if (!Number.isInteger(config.controlPort) || config.controlPort < 49152 || config.controlPort > 65535) throw new Error('controlPort must be a selected loopback port 49152–65535');
   return { ...config, fingerprint: sha(JSON.stringify(config)) };
 }
@@ -42,10 +66,11 @@ function validatePins(config) {
   if (receipt.sourceSha !== config.sourceCommit || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
   if (typeof receipt.hostPath !== 'string' || fs.realpathSync(path.join(path.dirname(config.piCli), 'node_modules/@earendil-works/pi-coding-agent')) !== receipt.hostPath || JSON.parse(fs.readFileSync(path.join(receipt.hostPath, 'package.json'), 'utf8')).version !== receipt.hostVersion) throw new Error('CLI and fixed installer host bindings differ');
   if (fs.realpathSync(config.packageRoot) !== config.packageRoot || fs.realpathSync(config.cwd) !== config.cwd) throw new Error('Use canonical cwd/package paths');
+  validateSessionFile(config);
   const storePath = path.join(config.cwd, '.pi/schedule-prompts.json');
   if (fs.existsSync(storePath)) {
     const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-    if (![1, 2, 3, 4].includes(store.version) || !Array.isArray(store.jobs) || store.jobs.some(job => job.enabled && (!job.session || (job.session === config.sessionId && (!job.durable || !job.maxRuns || !job.expiresAt))))) throw new Error('Dedicated host requires finite durable session-bound schedules');
+    if (![1, 2, 3, 4].includes(store.version) || !Array.isArray(store.jobs) || store.jobs.some(job => job.enabled && (!job.session || (job.session === config.sessionId && (!job.durable || !job.maxRuns || !job.expiresAt || (config.toolProfile === 'read-only' && job.model)))))) throw new Error('Dedicated host requires finite durable session-bound schedules; read-only profile requires inline jobs');
   }
 }
 
@@ -78,7 +103,7 @@ export async function run(config) {
   let owned = false;
   let record = { version: 1, pid: process.pid, childPid: null, fingerprint: config.fingerprint, token };
   const stateFile = path.join(config.stateDir, 'status.json');
-  const state = { version: 1, state: 'starting', ready: false, sessionId: config.sessionId, sourceCommit: config.sourceCommit, packageRoot: config.packageRoot, stateDir: config.stateDir, childPid: null, uiDenied: 0, stderrBytes: 0, jobStatusFresh: false, healthAlerts: [] };
+  const state = { version: 1, state: 'starting', ready: false, sessionId: config.sessionId, sourceCommit: config.sourceCommit, packageRoot: config.packageRoot, stateDir: config.stateDir, childPid: null, toolProfile: config.toolProfile ?? 'host-default', toolProfileVerified: null, uiDenied: 0, stderrBytes: 0, jobStatusFresh: false, healthAlerts: [] };
   try {
     const previous = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     if (previous.sessionId === config.sessionId && previous.sourceCommit === config.sourceCommit && Array.isArray(previous.healthAlerts)) state.healthAlerts = previous.healthAlerts.slice(-20);
@@ -103,6 +128,11 @@ export async function run(config) {
     refreshing = (async () => {
       try {
         const details = await readJobs();
+        state.runtime = details.runtime;
+        if (config.toolProfile === 'read-only') {
+          try { verifyReadOnlyTools(details.runtime); state.toolProfileVerified = true; }
+          catch (error) { state.toolProfileVerified = false; state.ready = false; void shutdown('tool-profile-mismatch'); throw error; }
+        }
         state.jobs = details.jobs; state.jobCounts = details.counts;
         state.jobSummary = details.jobSummary; state.jobSummaryTruncated = details.jobSummaryTruncated;
         state.jobStatusFresh = true; state.jobStatusObservedAt = new Date().toISOString();
@@ -185,9 +215,11 @@ export async function run(config) {
     // The fixed supervisor must load exactly its pinned extension. A normal Pi
     // session may also have a git-installed scheduler in settings; discovering
     // both copies causes a schedule_prompt tool collision and prevents readiness.
-    const args = ['--mode', 'rpc', '--offline', '--no-extensions', '--session-id', config.sessionId, '--session-dir', path.join(config.stateDir, 'sessions'), '--model', config.model, '--extension', config.packageRoot, '--prompt-template', path.join(config.packageRoot, 'prompts')];
+    const args = ['--mode', 'rpc', '--offline', '--no-extensions', ...(config.sessionFile ? ['--session', config.sessionFile] : ['--session-id', config.sessionId]), '--session-dir', path.join(config.stateDir, 'sessions'), '--model', config.model, '--extension', config.packageRoot, '--prompt-template', path.join(config.packageRoot, 'prompts')];
+    // Core filters the registry, including restored/late/deferred tools; this is not a prompt or shell whitelist.
+    if (config.toolProfile === 'read-only') args.push('--tools', readOnlyTools.join(','), '--exclude-tools', 'mcp__*');
     if (config.thinkingLevel !== undefined) args.push('--thinking', config.thinkingLevel);
-    rpc = new NativeRpc(config.piCli, args, { cwd: config.cwd, env: { ...process.env, PI_SCHEDULE_SERVICE_SESSION: config.sessionId },
+    rpc = new NativeRpc(config.piCli, args, { cwd: config.cwd, env: { ...process.env, PI_SCHEDULE_SERVICE_SESSION: config.sessionId, PI_SCHEDULE_SERVICE_TOOL_PROFILE: config.toolProfile ?? '' },
       onExit: () => { if (!stopping) void shutdown('native-exited'); },
       onFatal: () => { if (!stopping) void shutdown('rpc-unavailable'); } });
     record = { ...record, childPid: rpc.child.pid }; atomic(recordFile, record);
@@ -205,13 +237,16 @@ export async function run(config) {
     state.step = 'get-state'; persist();
     const native = await rpc.request('get_state');
     state.step = 'verify-native-identity'; persist();
-    if (native.sessionId !== config.sessionId || native.model?.provider + '/' + native.model?.id !== config.model || !native.sessionFile || !path.resolve(native.sessionFile).startsWith(path.join(config.stateDir, 'sessions') + path.sep)) throw new Error('Native session/model identity mismatch');
+    state.nativeIdentity = { sessionId: native.sessionId, sessionFile: native.sessionFile, model: native.model?.provider + '/' + native.model?.id, thinkingLevel: native.thinkingLevel }; persist();
+    if (native.sessionId !== config.sessionId || native.model?.provider + '/' + native.model?.id !== config.model || !native.sessionFile || (config.sessionFile ? native.sessionFile !== config.sessionFile : !path.resolve(native.sessionFile).startsWith(path.join(config.stateDir, 'sessions') + path.sep))) throw new Error('Native session/model identity mismatch');
     state.step = 'get-commands'; persist();
     const { commands } = await rpc.request('get_commands');
     state.step = 'verify-loaded-package'; persist();
     if (!commands.some(command => command.name === 'schedule-host-status' && command.sourceInfo?.path === path.join(config.packageRoot, 'src/index.ts'))) throw new Error('Pinned scheduler command not loaded');
     state.step = 'readiness-handshake'; persist();
     const ready = await readJobs(undefined, 30000);
+    state.runtime = ready.runtime; state.step = 'verify-tool-profile'; persist();
+    if (config.toolProfile === 'read-only') { verifyReadOnlyTools(ready.runtime); state.toolProfileVerified = true; }
     if (!ready.ready) throw new Error('Scheduler not ready in the owned native process');
     const current = await rpc.request('get_state');
     state.state = current.isStreaming ? 'running' : 'idle-ready'; state.ready = true; persist();

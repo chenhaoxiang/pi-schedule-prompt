@@ -10,13 +10,14 @@ const sdk = await import(process.env.PI_SCHEDULE_HOST_ENTRY || '@earendil-works/
 const ai = await import(process.env.PI_SCHEDULE_AI_ENTRY || '@earendil-works/pi-ai');
 const { createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager, runRpcMode } = sdk;
 const { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryModelsStore } = ai;
-const arg = name => process.argv[process.argv.indexOf(name) + 1];
+const arg = name => { const index = process.argv.indexOf(name); return index < 0 ? undefined : process.argv[index + 1]; };
 const cwd = process.cwd();
 const agentDir = path.join(cwd, 'fixture-agent'); fs.mkdirSync(agentDir, { recursive: true });
 const sessionDir = arg('--session-dir'); const id = arg('--session-id'); const packageRoot = arg('--extension');
+const sessionFile = arg('--session'); const tools = arg('--tools');
 const sessions = await SessionManager.list(cwd, sessionDir);
 const previous = sessions.find(info => info.id === id);
-const manager = previous ? SessionManager.open(previous.path, sessionDir, cwd) : SessionManager.create(cwd, sessionDir, { id });
+const manager = sessionFile ? SessionManager.open(sessionFile, sessionDir, cwd) : previous ? SessionManager.open(previous.path, sessionDir, cwd) : SessionManager.create(cwd, sessionDir, { id });
 const faux = fauxProvider({ provider: 'durable-fixture', models: [{ id: 'fixture' }] });
 faux.setResponses([async () => {
   fs.appendFileSync(path.join(cwd, 'inference-started'), 'synthetic\n');
@@ -36,7 +37,7 @@ const createRuntime = async ({ sessionManager, sessionStartEvent }) => {
     additionalExtensionPaths: [path.join(packageRoot, 'src/index.ts')],
     extensionFactories: process.env.SCHEDULE_FIXTURE_UI === '1' ? [pi => { pi.on('session_start', (_event, ctx) => { setTimeout(async () => { const confirmed = await ctx.ui.confirm('fixture', 'synthetic consent'); fs.writeFileSync(path.join(cwd, 'ui-denied'), String(!confirmed)); }, 300); }); }] : [] };
   const services = await createAgentSessionServices({ cwd, agentDir, modelRuntime, settingsManager, resourceLoaderOptions });
-  return { ...(await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: faux.getModel(), thinkingLevel: 'off', noTools: true })), services, diagnostics: services.diagnostics };
+  return { ...(await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: faux.getModel(), thinkingLevel: 'off', ...(tools ? { tools: tools.split(','), excludeTools: [arg('--exclude-tools')] } : { noTools: true }) })), services, diagnostics: services.diagnostics };
 };
 const runtime = await createAgentSessionRuntime(createRuntime, { cwd, agentDir, sessionManager: manager });
 // The native mode owns lifecycle, LF framing, extension UI and EOF disposal.
