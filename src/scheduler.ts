@@ -48,7 +48,7 @@ const matchesReadOnlyProfile = (tools: ReturnType<typeof toolReadback>) => tools
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private githubTimers = new Map<string, NodeJS.Timeout>();
-  private githubSources = new Set<string>();
+  private githubSources = new Map<string, { binding: string; seedOnly: boolean }>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private nextRuns = new Map<string, Date>();
   private pending = new Set<string>();
@@ -211,6 +211,7 @@ export class CronScheduler {
     for (const cron of this.jobs.values()) cron.stop();
     for (const timer of this.intervals.values()) clearTimeout(timer);
     for (const timer of this.githubTimers.values()) clearTimeout(timer);
+    for (const id of this.githubSources.keys()) this.generations.set(id, (this.generations.get(id) ?? 0) + 1);
     this.githubTimers.clear();
     this.githubSources.clear();
     this.jobs.clear();
@@ -245,11 +246,13 @@ export class CronScheduler {
   }
 
   updateJob(id: string, updated: CronJob): void {
+    const source = this.githubSources.get(id);
+    const seedOnly = source?.seedOnly === true && source.binding === eventBinding(updated);
     this.unscheduleJob(id);
     if (this.activeJobs.has(id)) this.storage.updateJob(id, { lastStatus: "unknown" });
     const prepared = this.prepareModel(updated);
     if (!prepared) return;
-    if (!this.stopped && prepared.enabled && CronScheduler.isLoadedFor(prepared, this.ctx.sessionManager.getSessionId())) this.scheduleJob(prepared);
+    if (!this.stopped && prepared.enabled && CronScheduler.isLoadedFor(prepared, this.ctx.sessionManager.getSessionId())) this.scheduleJob(prepared, seedOnly);
     this.emitChange({ type: "update", job: prepared });
   }
 
@@ -363,7 +366,8 @@ export class CronScheduler {
     const definition = this.storage.getJob(id);
     if (this.stopped || !definition?.enabled || !definition.github) return;
     if (!this.githubSources.has(id) && this.githubSources.size >= 10) throw new Error("At most 10 selected GitHub sources are allowed per session");
-    this.githubSources.add(id);
+    const source = { binding: eventBinding(definition), seedOnly };
+    this.githubSources.set(id, source);
     const generation = this.generations.get(id) ?? 0;
     const timer = setTimeout(() => {
       this.githubTimers.delete(id);
@@ -376,10 +380,11 @@ export class CronScheduler {
           const fingerprint = await githubFingerprint(current.github);
           if (this.stopped || generation !== (this.generations.get(id) ?? 0)) return;
           const result = this.storage.observeGithub(id, current.revision ?? 0, fingerprint, this.ctx.sessionManager.getSessionId(), eventBinding(current), seedOnly);
-          seedOnly = false;
+          seedOnly = false; source.seedOnly = false;
           if (result.status === "queued") { this.pending.add(id); this.drain(); }
           failed = 0;
         } catch {
+          if (this.stopped || generation !== (this.generations.get(id) ?? 0)) return;
           failed = Math.min(failures + 1, 4);
           this.emitChange({ type: "error", jobId: id, error: "Selected GitHub event source unavailable; backing off" });
         }

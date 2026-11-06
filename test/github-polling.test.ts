@@ -66,6 +66,48 @@ describe("bounded selected GitHub producers", () => {
     h.scheduler.stop();
   });
 
+  it("preserves an outstanding silent reseed across metadata-only rearming", async () => {
+    read.mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("b".repeat(64));
+    const h = setup({ repo: "owner/repo", kind: "pull-request-checks", number: 42, pollSeconds: 60 });
+    await vi.advanceTimersByTimeAsync(60000); expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    h.scheduler.stop(); h.scheduler.start();
+    const before = h.storage.getJob("gh")!;
+    h.storage.updateJob("gh", { description: "Changed display note only" });
+    expect(h.storage.getJob("gh")?.revision).toBe(before.revision);
+    h.scheduler.updateJob("gh", h.storage.getJob("gh")!);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("b".repeat(64));
+    h.scheduler.stop();
+  });
+
+  it("does not carry silent reseeding into a changed PR definition", async () => {
+    read.mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("b".repeat(64));
+    const h = setup({ repo: "owner/repo", kind: "pull-request-checks", number: 42, pollSeconds: 60 });
+    await vi.advanceTimersByTimeAsync(60000);
+    h.scheduler.stop(); h.scheduler.start();
+    h.storage.updateJob("gh", { github: { repo: "owner/repo", kind: "pull-request-checks", number: 43, pollSeconds: 60 } });
+    h.scheduler.updateJob("gh", h.storage.getJob("gh")!);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(read.mock.calls[1][0].number).toBe(43); h.scheduler.stop();
+  });
+
+  it.each(["resolve", "reject"])("fences an older in-flight GitHub %s across same-instance stop/start", async outcome => {
+    let finish!: (value: string) => void;
+    read.mockResolvedValueOnce("a".repeat(64)).mockImplementationOnce(() => new Promise((resolve, reject) => { finish = value => outcome === "resolve" ? resolve(value) : reject(new Error("stale failure")); })).mockResolvedValueOnce("c".repeat(64));
+    const h = setup({ repo: "owner/repo", kind: "pull-request-checks", number: 42, pollSeconds: 60 });
+    await vi.advanceTimersByTimeAsync(120000); expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    h.scheduler.stop(); h.scheduler.start();
+    finish("b".repeat(64)); await vi.advanceTimersByTimeAsync(0);
+    expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("a".repeat(64));
+    expect(h.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(h.pi.events.emit.mock.calls.some(([, payload]) => payload?.type === "error")).toBe(false);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.storage.getJob("gh")?.sourceFingerprint).toBe("c".repeat(64));
+    expect(h.pi.sendMessage).toHaveBeenCalledOnce(); h.scheduler.stop();
+  });
+
   it("seeds without inference and wakes only on the later metadata change", async () => {
     read.mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("b".repeat(64));
     const h = setup();
