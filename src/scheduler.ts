@@ -28,6 +28,17 @@ const promptFor = (job: CronJob) => {
   return base + budgetPrompt(job);
 };
 const snippet = (text: string) => text.length > 500 ? text.slice(0, 500) + "…" : text;
+const toolReadback = (pi: ExtensionAPI) => {
+  try {
+    const active = pi.getActiveTools?.(); const registered = pi.getAllTools?.();
+    if (!Array.isArray(active) || !Array.isArray(registered)) throw new Error("Tool metadata unavailable");
+    return {
+      state: "observed", truncated: active.length > 64 || registered.length > 64 || active.some(name => name.length > 128) || registered.some(tool => tool.name.length > 128 || tool.sourceInfo.path.length > 1024),
+      active: active.slice(0, 64).map(name => name.slice(0, 128)),
+      registered: registered.slice(0, 64).map(tool => ({ name: tool.name.slice(0, 128), exposure: tool.exposure, source: tool.sourceInfo.source, path: tool.sourceInfo.path.slice(0, 1024), reachesTools: !!tool.reachesTools })),
+    };
+  } catch { return { state: "unknown", truncated: false, active: null, registered: null }; }
+};
 
 /** Timers own intent only. Host acceptance never proves business completion. */
 export class CronScheduler {
@@ -153,7 +164,7 @@ export class CronScheduler {
       if (snapshot) native = { state: "owned", runId: snapshot.runId, jobId: snapshot.binding.jobId, phase: snapshot.phase, nativeClosed: snapshot.nativeClosed, ownedHandleCount: snapshot.ownedHandles.length };
     } catch { native = { state: "unknown" }; }
     return {
-      version: 1, observedAt: new Date().toISOString(), pid: process.pid, sessionId: this.ctx.sessionManager.getSessionId(), storePath: this.storage.getStorePath(),
+      version: 1, observedAt: new Date().toISOString(), pid: process.pid, sessionId: this.ctx.sessionManager.getSessionId(), sessionFile: this.ctx.sessionManager.getSessionFile?.() ?? null, storePath: this.storage.getStorePath(), tools: toolReadback(this.pi),
       loadedSchedule: { name: loadedPackage.name, version: loadedPackage.version, sourceSha: loadedInstall?.sourceSha ?? null, boundSdkVersion: loadedInstall?.hostVersion ?? null, moduleUrl: import.meta.url, commandPath: this.pi.getCommands?.().find(command => command.name === "schedule-host-status")?.sourceInfo?.path ?? null, readerSchemas: [1, 2, 3, 4] },
       actualCoreVersion: "not-exposed", nativeCapabilityVersion: capability?.version ?? null, unattendedInputGuardVersion: capability?.unattendedInputGuardVersion ?? null, native,
       coreIdle: this.ctx.isIdle?.() ?? null, pendingMessages: this.ctx.hasPendingMessages?.() ?? null, effectiveTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
