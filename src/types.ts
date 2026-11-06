@@ -361,7 +361,7 @@ export const CronToolParams = Type.Object({
   safeScopes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]+$" }), { maxItems: 32, description: "Optional bounded scopes of reconciliation evidence; scoped evidence does not release the whole job's conflicting writes." })),
   claimId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Exact settled UNKNOWN/aborted legacy claim ID for resume or migrated-legacy reconcile; never a native attempt alias." })),
   claimBinding: Type.Optional(Type.String({ minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$", description: "Required with claimId for migrated-legacy reconcile: exact retained claim binding. External effect evidence is separate." })),
-  evidenceFingerprint: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "Required for resume: SHA-256 of reconciled checkpoint/effect evidence. Explicit future occurrences only, never replay or mark the old claim successful." })),
+  evidenceFingerprint: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "Optional for trigger: SHA-256 of the selected evidence, enabling configured no-change quieting. Required for resume/reconcile: reconciled checkpoint/effect evidence; never replay or mark an old claim successful." })),
   eventName: Type.Optional(Type.String({ description: "Required for trigger. Must match the existing event job schedule." })),
   eventId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for trigger; stable producer id, never prompt text." })),
   maxRunsPerDay: Type.Optional(Type.Integer({ minimum: 1, description: "UTC daily admitted-attempt limit." })),

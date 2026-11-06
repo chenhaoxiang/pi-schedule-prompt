@@ -48,6 +48,40 @@ describe("unified event admission", () => {
     h.idle(); expect(h.pi.sendMessage).toHaveBeenCalledTimes(1); h.scheduler.stop();
   });
 
+  it("preserves evidence fingerprints through the public trigger, quiets unchanged input and admits progress", async () => {
+    const h = setup({ quietOnNoChange: true, noChangeThreshold: 2, quietForMs: 60_000 });
+    const tool = createCronTool(() => h.storage, () => h.scheduler);
+    const trigger = (eventId: string, evidenceFingerprint: string) => tool.execute("trigger-" + eventId,
+      { action: "trigger", jobId: "event", eventName: "local:build", eventId, evidenceFingerprint }, undefined, undefined, h.ctx as any);
+    try {
+      expect((await trigger("one", "a".repeat(64))).content[0]).toEqual({ type: "text", text: "Event queued" });
+      h.idle();
+      expect(h.pi.sendMessage).toHaveBeenCalledTimes(1);
+      for (const id of ["two", "three"]) {
+        expect((await trigger(id, "a".repeat(64))).content[0]).toEqual({ type: "text", text: "Event duplicate: no-change" });
+      }
+      expect(h.storage.getJob("event")).toMatchObject({ lastStatus: "quiet", noChangeCount: 2, lastEvidenceFingerprint: "a".repeat(64) });
+      expect(h.pi.sendMessage).toHaveBeenCalledTimes(1);
+      expect((await trigger("four", "b".repeat(64))).content[0]).toEqual({ type: "text", text: "Event queued" });
+      expect(h.pi.sendMessage).toHaveBeenCalledTimes(2);
+      expect(h.storage.getJob("event")).toMatchObject({ noChangeCount: 0, lastEvidenceFingerprint: "b".repeat(64) });
+      expect(h.storage.getJob("event")?.quietUntil).toBeUndefined();
+    } finally { h.scheduler.stop(); }
+  });
+
+  it.each(["", "not-a-hash", "A".repeat(64), "a".repeat(63)])("rejects invalid public trigger evidence %j without admission", async evidenceFingerprint => {
+    const h = setup({ quietOnNoChange: true });
+    const before = h.storage.getJob("event");
+    const tool = createCronTool(() => h.storage, () => h.scheduler);
+    try {
+      const result = await tool.execute("invalid", { action: "trigger", jobId: "event", eventName: "local:build", eventId: "bad", evidenceFingerprint }, undefined, undefined, h.ctx as any);
+      expect(result.content[0]).toEqual({ type: "text", text: "Event ignored: invalid-evidence" });
+      expect(h.storage.getJob("event")).toEqual(before);
+      h.idle();
+      expect(h.pi.sendMessage).not.toHaveBeenCalled();
+    } finally { h.scheduler.stop(); }
+  });
+
   it("retains the next coalesced event while the same model job is still active", async () => {
     let finish!: (value: { ok: true; text: string }) => void;
     const run = vi.mocked(runSubagentOnce);
