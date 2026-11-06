@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Maintained fork 0.4.1-fork.16 (2026-11-06; source/installed/natural acceptance separate)
-- Add an opt-in native read-only builtin tool profile through the existing Core CLI registry filter, with actual active/registered provenance verification; do not use prompt-only restrictions, shell whitelists or unrestricted model children.
+- Add an opt-in native read-only builtin tool profile through the existing Core CLI registry filter, with actual active/registered provenance verification before scheduler restoration and final reserve/admission as well as service readiness; do not use prompt-only restrictions, shell whitelists or unrestricted model children.
 - Resume an explicitly selected existing canonical native session file with the same id/cwd and preserve history/checkpoints/results through a normal owned-host transition; never copy history, clear UNKNOWN or reset spending/expiry.
 - Expose bounded actual tool loadout/session-file metadata through the existing runtime/service status, retaining unknown observations and refusing overridden builtins.
 - Add provider-free real SDK and pinned real-CLI/faux-provider exact-file continuation, hard forbidden-tool, late/deferred/MCP and wrapped-reader rejection checks; synthetic rounds are not live natural acceptance.

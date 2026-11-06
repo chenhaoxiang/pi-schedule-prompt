@@ -46,7 +46,7 @@ export default pi=>{
  const responses=old?[context=>{inspect(context);return fauxAssistantMessage(fauxToolCall('bash',{command:'printf SYNTHETIC_SAVED_RESULT'},{id:'retained-bash'}),{stopReason:'toolUse'});},fauxAssistantMessage('SAVED_CANDIDATE: exact completed synthetic title/FAQ; consume this, never replay retained-bash.')]:mode==='forbidden'?[context=>{inspect(context);return fauxAssistantMessage([fauxToolCall('bash',{command:'printf BAD > ${marker}'},{id:'denied-bash'}),fauxToolCall('write',{path:${JSON.stringify(marker)},content:'BAD'},{id:'denied-write'}),fauxToolCall('edit',{path:${JSON.stringify(artifact)},edits:[{oldText:'SYNTHETIC_READONLY_SOURCE',newText:'BAD'}]},{id:'denied-edit'}),fauxToolCall('codemode',{code:'await tools.write({path:${marker},content:BAD})'},{id:'denied-wrapper'}),fauxToolCall('late_write',{}, {id:'denied-deferred'}),fauxToolCall('mcp__fixture__write',{}, {id:'denied-mcp'})],{stopReason:'toolUse'});},fauxAssistantMessage('All forbidden calls rejected; no effect claimed.')]:Array.from({length:3},(_,n)=>[context=>{inspect(context);return fauxAssistantMessage(fauxToolCall('read',{path:${JSON.stringify(artifact)}},{id:'new-read-'+n}),{stopReason:'toolUse'});},fauxAssistantMessage('READONLY_CANDIDATE_'+n+': saved candidate consumed with a new source observation.')]).flat();faux.setResponses(responses);pi.registerProvider(faux.provider);
 };`);
   const bin = path.join(cwd, 'bin'); fs.mkdirSync(bin); const cli = path.join(bin, 'pi');
-  fs.writeFileSync(cli, `#!/usr/bin/env node\nprocess.argv.push('--extension',${JSON.stringify(extension)});import(${JSON.stringify(pathToFileURL(realCli).href)}).catch(error=>{console.error(error);process.exitCode=1;});\n`, { mode: 0o700 });
+  fs.writeFileSync(cli, `#!/usr/bin/env node\nif(process.argv.includes('--session')){const actual=process.stdout.write.bind(process.stdout);process.stdout.write=(chunk,...args)=>{if(String(chunk).includes('"command":"get_commands"')){setTimeout(()=>actual(chunk,...args),1500);return true;}return actual(chunk,...args);};}process.argv.push('--extension',${JSON.stringify(extension)});import(${JSON.stringify(pathToFileURL(realCli).href)}).catch(error=>{console.error(error);process.exitCode=1;});\n`, { mode: 0o700 });
   fs.symlinkSync(path.join(path.dirname(cliArg), 'node_modules'), path.join(bin, 'node_modules'), 'dir');
   const firstState = path.join(cwd, 'first-state'); fs.mkdirSync(firstState, { mode: 0o700 });
   const config = { version: 1, cwd, piCli: cli, piCliSha256: sha(fs.readFileSync(cli)), packageRoot: pkg, sourceCommit: receipt.sourceSha, sessionId: 'readonly-resume-' + mode, model: 'readonly-cli-fixture/fixture', thinkingLevel: 'off', stateDir: firstState, controlPort: await selectedPort() };
@@ -64,7 +64,7 @@ export default pi=>{
     assert.equal((await command('stop', firstFile)).confirmedStopped, true); await until(() => first.child.exitCode === 0, first, 'first stop');
     const prefix = fs.readFileSync(sessionFile); const immutable = structuredClone(original.attemptHistory);
     const evidence = sha(JSON.stringify({ checkpoint: immutable[0].checkpoint, syntheticClosedBash: true, priorResult: 'SYNTHETIC_SAVED_RESULT' }));
-    if (mode !== 'override') assert(storage.reconcileResilientAttempt(mode, config.sessionId, immutable[0].id, evidence, 'continue'));
+    assert(storage.reconcileResilientAttempt(mode, config.sessionId, immutable[0].id, evidence, 'continue'));
     assert.deepEqual(storage.getJob(mode).attemptHistory, immutable);
     const stateDir = path.join(cwd, 'resumed-state'); fs.mkdirSync(stateDir, { mode: 0o700 }); const file = path.join(cwd, 'resumed.json');
     fs.writeFileSync(file, JSON.stringify({ ...config, stateDir, sessionFile, toolProfile: 'read-only' }), { mode: 0o600 });
@@ -73,6 +73,8 @@ export default pi=>{
       await until(() => resumed.child.exitCode === 1, resumed, 'wrapped read refused');
       const blocked = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8')); assert.equal(blocked.ready, false); assert.equal(blocked.state, 'blocked'); assert.equal(blocked.step, 'verify-tool-profile');
       assert.equal(storage.getJob(mode).attemptCount, 1); assert(!fs.existsSync(marker));
+      assert.deepEqual(storage.getJob(mode).attemptHistory, immutable); assert.deepEqual(fs.readFileSync(sessionFile).subarray(0, prefix.length), prefix);
+      const requests = fs.readFileSync(observed, 'utf8').trim().split('\n').map(JSON.parse); assert.equal(requests.filter(request => !request.old).length, 0, 'Profile mismatch must block before provider requests, not just before readiness');
       results.push({ mode, passed: true, refusedNonBuiltinRead: true, providerRequestsAfterResume: 0 }); return;
     }
     const expected = mode === 'read' ? 4 : 2;

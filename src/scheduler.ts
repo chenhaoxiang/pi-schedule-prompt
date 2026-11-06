@@ -39,6 +39,10 @@ const toolReadback = (pi: ExtensionAPI) => {
     };
   } catch { return { state: "unknown", truncated: false, active: null, registered: null }; }
 };
+const readOnlyToolNames = ["find", "grep", "ls", "read"];
+const matchesReadOnlyProfile = (tools: ReturnType<typeof toolReadback>) => tools.state === "observed" && !tools.truncated && !!tools.active && !!tools.registered &&
+  JSON.stringify([...tools.active].sort()) === JSON.stringify(readOnlyToolNames) && tools.registered.length === readOnlyToolNames.length &&
+  new Set(tools.registered.map(tool => tool.name)).size === readOnlyToolNames.length && tools.registered.every(tool => readOnlyToolNames.includes(tool.name) && tool.source === "builtin" && tool.path === "builtin:" + tool.name && tool.exposure === "direct" && !tool.reachesTools);
 
 /** Timers own intent only. Host acceptance never proves business completion. */
 export class CronScheduler {
@@ -74,6 +78,9 @@ export class CronScheduler {
 
   start(): void {
     this.stop();
+    // The native service must validate its actual registry before restoring/queuing work,
+    // not after a continuation has raced a slower supervisor readiness response.
+    if (!this.profileAllowsAdmission()) return;
     this.stopped = false;
     this.resilient.start();
     const session = this.ctx.sessionManager.getSessionId();
@@ -420,10 +427,20 @@ export class CronScheduler {
     return job;
   }
 
+  private profileAllowsAdmission(): boolean {
+    const required = process.env.PI_SCHEDULE_SERVICE_TOOL_PROFILE;
+    if (!required) return true;
+    if (required === "read-only" && process.env.PI_SCHEDULE_SERVICE_SESSION === this.ctx.sessionManager.getSessionId() && matchesReadOnlyProfile(toolReadback(this.pi))) return true;
+    this.stop();
+    return false;
+  }
+
   private eligible(id: string): CronJob | undefined {
-    if (this.stopped) return;
+    if (this.stopped || !this.profileAllowsAdmission()) return;
     const stored = this.storage.getJob(id);
     if (!stored?.enabled || !CronScheduler.isLoadedFor(stored, this.ctx.sessionManager.getSessionId())) return;
+    // A separately constructed model SDK has a distinct tool registry/loadout.
+    if (process.env.PI_SCHEDULE_SERVICE_TOOL_PROFILE && stored.model) { this.stop(); return; }
     const job = this.prepareModel(stored);
     if (!job) return;
     if (isResilient(job)) {

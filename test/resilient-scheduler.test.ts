@@ -93,9 +93,39 @@ function modelPreparation(h: ReturnType<typeof fixture>) {
 const advance = (duration: number) => vi.advanceTimersByTimeAsync(duration);
 async function flush() { for (let i = 0; i < 6; i++) await Promise.resolve(); }
 beforeEach(() => { vi.mocked(planScheduledModel).mockReset(); vi.mocked(prepareScheduledModel).mockReset(); vi.mocked(readStoredModelSession).mockReset(); vi.useFakeTimers(); vi.setSystemTime(beginning); });
-afterEach(() => { for (const scheduler of schedulers.splice(0)) scheduler.stop(); vi.useRealTimers(); for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
+afterEach(() => { for (const scheduler of schedulers.splice(0)) scheduler.stop(); vi.unstubAllEnvs(); vi.useRealTimers(); for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
 
 describe("resilient native timer composition", () => {
+  it("checks actual required tool provenance before restoring a legally reconciled continuation or reserving a new attempt", async () => {
+    const h = fixture(); const first = h.newScheduler(); first.start(); await advance(60 * minute + 1000); h.runs[0].close("completed", "unknown"); await flush(); first.stop();
+    const original = h.row(); expect(h.storage.reconcileResilientAttempt("job", "owner", original.attemptHistory[0].id, "a".repeat(64), "continue")).toBe(true);
+    const before = fs.readFileSync(h.storage.getStorePath());
+    vi.stubEnv("PI_SCHEDULE_SERVICE_SESSION", "owner"); vi.stubEnv("PI_SCHEDULE_SERVICE_TOOL_PROFILE", "read-only");
+    const pi = h.pi as any; pi.getActiveTools = () => ["find", "grep", "ls", "read"];
+    pi.getAllTools = () => ["find", "grep", "ls", "read"].map(name => ({ name, exposure: "direct", sourceInfo: { source: name === "read" ? "sdk" : "builtin", path: "builtin:" + name } }));
+    const resumed = h.newScheduler(); resumed.start(); await advance(1000);
+    expect(resumed.isRunning()).toBe(false); expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledTimes(1); expect(h.row().attemptCount).toBe(1);
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(before); expect(h.row().attemptHistory).toEqual(original.attemptHistory);
+  });
+
+  it("rechecks the required registry at final admission so startup success cannot authorize a later override", async () => {
+    const h = fixture(); const pi = h.pi as any; let overridden = false;
+    pi.getActiveTools = () => ["find", "grep", "ls", "read"];
+    pi.getAllTools = () => ["find", "grep", "ls", "read"].map(name => ({ name, exposure: "direct", sourceInfo: { source: overridden && name === "read" ? "sdk" : "builtin", path: "builtin:" + name } }));
+    vi.stubEnv("PI_SCHEDULE_SERVICE_SESSION", "owner"); vi.stubEnv("PI_SCHEDULE_SERVICE_TOOL_PROFILE", "read-only");
+    const scheduler = h.newScheduler(); scheduler.start(); expect(scheduler.isRunning()).toBe(true); overridden = true;
+    await advance(60 * minute + 1000); expect(scheduler.isRunning()).toBe(false); expect(h.capability.start).not.toHaveBeenCalled(); expect(h.runs).toHaveLength(0); expect(h.row().attemptCount).toBe(0);
+  });
+
+  it("holds missing/throwing profile metadata before admission and does not apply a service profile to ordinary hosts", async () => {
+    const h = fixture(); vi.stubEnv("PI_SCHEDULE_SERVICE_SESSION", "owner"); vi.stubEnv("PI_SCHEDULE_SERVICE_TOOL_PROFILE", "read-only");
+    for (const getAllTools of [undefined, () => { throw new Error("synthetic unavailable metadata"); }]) {
+      (h.pi as any).getAllTools = getAllTools; const blocked = h.newScheduler(); blocked.start(); await advance(1000); expect(blocked.isRunning()).toBe(false);
+    }
+    expect(h.row().attemptCount).toBe(0); expect(h.capability.start).not.toHaveBeenCalled();
+    vi.unstubAllEnvs(); const ordinary = h.newScheduler(); ordinary.start(); await advance(60 * minute); expect(h.runs).toHaveLength(1);
+  });
+
   it("refuses a missing capability before admission without disabling user intent", async () => {
     const h = fixture({}, {}, false); h.newScheduler().start(); await advance(2 * 60 * minute);
     expect(h.row()).toMatchObject({ enabled: true, attemptCount: 0, runtime: { slot: { kind: "idle", phase: "attention-required", reason: "runtime_unavailable" } } });

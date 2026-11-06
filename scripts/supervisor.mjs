@@ -219,7 +219,7 @@ export async function run(config) {
     // Core filters the registry, including restored/late/deferred tools; this is not a prompt or shell whitelist.
     if (config.toolProfile === 'read-only') args.push('--tools', readOnlyTools.join(','), '--exclude-tools', 'mcp__*');
     if (config.thinkingLevel !== undefined) args.push('--thinking', config.thinkingLevel);
-    rpc = new NativeRpc(config.piCli, args, { cwd: config.cwd, env: { ...process.env, PI_SCHEDULE_SERVICE_SESSION: config.sessionId },
+    rpc = new NativeRpc(config.piCli, args, { cwd: config.cwd, env: { ...process.env, PI_SCHEDULE_SERVICE_SESSION: config.sessionId, PI_SCHEDULE_SERVICE_TOOL_PROFILE: config.toolProfile ?? '' },
       onExit: () => { if (!stopping) void shutdown('native-exited'); },
       onFatal: () => { if (!stopping) void shutdown('rpc-unavailable'); } });
     record = { ...record, childPid: rpc.child.pid }; atomic(recordFile, record);
