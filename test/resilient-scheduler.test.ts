@@ -267,6 +267,33 @@ describe("resilient native timer composition", () => {
     expect(prepared.dispose).toHaveBeenCalledOnce(); expect(h.row().attemptHistory[0].checkpoint?.sessionId).toBe(h.runs[0].request.binding.ownerSessionId);
   });
 
+  it.each(["busy", "pending"])("starts an explicit-model child while the unrelated parent is %s, retaining exact closure and limits", async parent => {
+    const h = fixture({ model: "fixture/model", maxRuns: 1, intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute });
+    const prepared = modelPreparation(h);
+    if (parent === "busy") h.busy(true);
+    else h.ctx.hasPendingMessages = () => true;
+    h.newScheduler().start(); await advance(minute + 1000); await flush();
+    expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(h.runs).toHaveLength(1);
+    expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { slot: { kind: "owned" } } });
+    expect(h.ctx.scheduledExecution!.start).not.toHaveBeenCalled(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
+    await advance(2 * minute); expect(prepareScheduledModel).toHaveBeenCalledOnce();
+    h.runs[0].close(); await flush(); await flush();
+    expect(prepared.dispose).toHaveBeenCalledOnce();
+    expect(h.row()).toMatchObject({ enabled: true, attemptCount: 1, runtime: { slot: { kind: "idle", phase: "finished" } }, attemptHistory: [{ outcome: "completed", modelSdkClose: { runId: "run-0" } }] });
+    await advance(2 * minute); expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(h.ctx.abort).not.toHaveBeenCalled();
+  });
+
+  it.each(["busy", "pending"])("keeps inline resilient work uncharged while the parent is %s", async parent => {
+    const h = fixture({ intervalMs: minute, schedule: "1m" });
+    if (parent === "busy") h.busy(true);
+    else h.ctx.hasPendingMessages = () => true;
+    h.newScheduler().start(); await advance(minute + 1000); await flush();
+    expect(h.runs).toHaveLength(0); expect(h.row().attemptCount).toBe(0);
+    expect(h.row().runtime.pending).toBeDefined(); expect(h.ctx.abort).not.toHaveBeenCalled();
+    h.busy(false); h.ctx.hasPendingMessages = () => false;
+    await advance(1000); expect(h.runs).toHaveLength(1);
+  });
+
   it("does not charge or use the old model runner when a prepared child lacks the native capability", async () => {
     const h = fixture({ model: "fixture/model" }); modelPreparation(h);
     vi.mocked(planScheduledModel).mockImplementationOnce(() => { throw new Error("Scheduled model SDK lacks native capability v1"); });

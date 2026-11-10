@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.20 (2026-11-10; activation separate)
+- Admit independent explicit-model work while its parent is busy or has pending messages; a queued inline intent cannot starve a later model job. Inline work still waits for an idle parent, and existing single-flight, claim/UNKNOWN, attempt/expiry and SDK-close boundaries remain.
+- Make legacy model start/completion markers explicitly non-triggering unless completion notification was requested, preventing accidental extra parent inference while it is streaming.
+- Route a model start-persistence failure only to that child controller, retaining its exact hold until release rather than aborting unrelated parent work. Inline failure handling is unchanged.
+- Cover durable timers, ordinary/durable events, resilient model/inline paths and exact failure routing with synthetic regressions; an actual SDK/faux-provider case verifies child completion before the parent tool returns, then normal parent completion without an extra request. No existing job/store migration, real provider call or forced active-session reload.
+
 ### Maintained fork 0.4.1-fork.19 (2026-11-06; activation separate)
 - Add an explicit `pull-request-checks` GitHub event selector over one PR’s current exact head, bounded latest check runs and legacy status contexts, with a final PR-binding recheck.
 - Fingerprint closed metadata only; reject incomplete/oversized/foreign/changing snapshots, ignore response ordering and comment/output text, and preserve existing seed/quiet/ownership/pause/budget behavior.

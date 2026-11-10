@@ -81,7 +81,7 @@ describe("CronScheduler — subagent path marker delivery", () => {
     mockRunSubagentOnce.mockReset();
   });
 
-  it("posts a subagent_start marker with brief status text (no delivery options)", async () => {
+  it("posts a non-triggering subagent_start marker with brief status text", async () => {
     mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "result text" });
     const pi = makePi();
     const job = exampleJob({ model: "haiku" });
@@ -98,7 +98,7 @@ describe("CronScheduler — subagent path marker delivery", () => {
     // by pi-ai, leaving conversation ending on assistant — Anthropic 400s).
     expect(startMsg.content.length).toBeGreaterThan(0);
     expect(startMsg.content[0].text.length).toBeGreaterThan(0);
-    expect(startOpts).toBeUndefined();
+    expect(startOpts).toEqual({ triggerTurn: false });
   });
 
   it("posts a subagent_done marker with non-empty content when notify is unset (prevents session poisoning)", async () => {
@@ -113,12 +113,12 @@ describe("CronScheduler — subagent path marker delivery", () => {
     const [doneMsg, doneOpts] = pi.sendMessage.mock.calls[1];
     expect(doneMsg.details.mode).toBe("subagent_done");
     expect(doneMsg.details.output).toBe("OK");
-    // notify=false: no delivery options so parent isn't woken, but content
-    // is non-empty to prevent session poisoning (empty content gets filtered
-    // by pi-ai, leaving conversation ending on assistant — Anthropic 400s).
+    // Omitted options steer a streaming parent. Explicit false retains the
+    // marker without another parent request; non-empty content still prevents
+    // session poisoning (empty content is filtered by pi-ai).
     expect(doneMsg.content.length).toBeGreaterThan(0);
     expect(doneMsg.content[0].text).toBe("OK");
-    expect(doneOpts).toBeUndefined();
+    expect(doneOpts).toEqual({ triggerTurn: false });
   });
 
   it("posts a wake-up subagent_done marker when notify is true (followUp + triggerTurn, snippet in content)", async () => {

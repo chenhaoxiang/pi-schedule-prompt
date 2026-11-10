@@ -16,7 +16,7 @@ This is [chenhaoxiang/pi-schedule-prompt](https://github.com/chenhaoxiang/pi-sch
 Install the maintained source only after reviewing its changes:
 
 ```sh
-pi install git:github.com/chenhaoxiang/pi-schedule-prompt@main
+pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.20
 ```
 
 Pin a reviewed commit for reproducibility. Installation does not hot-upgrade active Pi sessions. This change does not install itself or start monitoring other sessions.
@@ -87,6 +87,8 @@ Settings merge global `~/.pi/agent/schedule-prompts-settings.json` defaults with
 Schedules fire only in a compatible live Pi session. Legacy offline ticks are not replayed; past legacy one-shots are disabled with an error. Print/JSON batch sessions do not arm timers. The optional dedicated service below maintains its own native Pi; it is not a permission system, arbitrary-terminal controller or OS sleep wake guarantee.
 
 ## Explicit model jobs
+
+As of **0.4.1-fork.20**, an explicit-model timer/event (including durable and resilient paths) can start while its unrelated parent is busy or has pending messages; older queued inline work does not block it. Inline turns still require an idle parent. Existing single-flight/ownership, spending/expiry, UNKNOWN and SDK-close rules remain. Non-notifying legacy model markers are retained without steering or starting another parent request; `notify:true` completion keeps its explicit follow-up behavior. A child start-record failure cancels only that child, not its busy parent.
 
 The upstream `model` option remains available: it creates a fresh in-process session. Default tools are bash/read/edit/write/grep/find/ls, with no extensions or skills. Explicit options can load additional resources and the default host toolset. Provider-qualified fuzzy requests never switch provider. Current host provider configuration is inherited where available, thinking level is preserved, overlapping runs for one local job are suppressed, and sessions are disposed afterward. These are powerful unattended jobs, not a sandbox.
 

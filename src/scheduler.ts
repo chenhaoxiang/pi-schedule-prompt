@@ -513,60 +513,63 @@ export class CronScheduler {
 
   private drain(): void {
     if (this.stopped || !this.pending.size) return;
-    if ((this.ctx.isIdle && !this.ctx.isIdle()) || this.ctx.hasPendingMessages?.()) {
+    const parentBusy = (this.ctx.isIdle && !this.ctx.isIdle()) || this.ctx.hasPendingMessages?.();
+    if (this.durable.busy()) { this.armDrain(); return; }
+    for (const id of this.pending) {
+      if (this.activeJobs.has(id) || this.resilient.isOwned(id)) continue;
+      let admitted = false;
+      let selected: CronJob | undefined;
+      try {
+        const eligible = this.eligible(id);
+        selected = eligible;
+        // Only inline work needs the parent turn; keep it queued without starving
+        // later independent model jobs or spending an inline attempt.
+        if (eligible && parentBusy && !eligible.model) continue;
+        this.pending.delete(id);
+        if (eligible && isResilient(eligible)) {
+          this.resilient.execute(id);
+          this.armDrain();
+          return;
+        }
+        if (eligible?.durable && eligible.type !== "event" && !eligible.pendingIntent) this.storage.queueTime(id, this.ctx.sessionManager.getSessionId(), this.getNextRun(id)?.toISOString());
+        if (eligible?.model) {
+          this.executeJobInSubagent(eligible);
+          this.armDrain();
+          return;
+        }
+        if (eligible?.durable && this.activeJobs.size) { this.pending.add(id); this.armDrain(); return; }
+        const job = eligible && (eligible.durable ? this.durable.begin(id) : this.storage.admitJob(id, this.ctx.sessionManager.getSessionId()));
+        if (!job && eligible?.durable && this.storage.getAllJobs().some(other => other.claim && other.claim.sessionId === eligible.session && other.claim.phase !== "settled")) this.pending.add(id);
+        if (job) {
+          admitted = true;
+          this.contention.delete(id);
+          const attempts = job.attemptCount!;
+          if (job.followUp && job.claim) {
+            this.dispatchFollowUp(job);
+          } else {
+            // Admission is persisted before a potentially effectful send.
+            this.pi.sendMessage({
+              customType: "scheduled_prompt", content: promptFor(job), display: true,
+              details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline", ...(job.claim ? { claimId: job.claim.id } : {}) },
+            }, { triggerTurn: true, deliverAs: "followUp" });
+          }
+          if (!job.durable) this.storage.updateJob(id, {
+            lastRun: new Date().toISOString(), lastStatus: "dispatched", runCount: job.runCount + 1,
+            ...(job.type === "once" || (job.maxRuns !== undefined && attempts >= job.maxRuns) ? { enabled: false } : {}),
+            nextRun: this.getNextRun(id)?.toISOString(),
+          });
+          if (this.storage.getJob(id)?.enabled === false) this.unscheduleJob(id);
+          this.emitChange({ type: "fire", job: this.storage.getJob(id) });
+        }
+      } catch (error) {
+        if (!admitted && error instanceof ScheduleStoreBusyError) this.deferContention(id);
+        else {
+          if (selected && !isResilient(selected)) this.durable.finish("unknown");
+          this.fail(id, error);
+        }
+      }
       this.armDrain();
       return;
-    }
-    if (this.durable.busy()) { this.armDrain(); return; }
-    const id = [...this.pending].find(candidate => !this.activeJobs.has(candidate) && !this.resilient.isOwned(candidate));
-    if (!id) { this.armDrain(); return; }
-    this.pending.delete(id);
-    let admitted = false;
-    let selected: CronJob | undefined;
-    try {
-      const eligible = this.eligible(id);
-      selected = eligible;
-      if (eligible && isResilient(eligible)) {
-        this.resilient.execute(id);
-        this.armDrain();
-        return;
-      }
-      if (eligible?.durable && eligible.type !== "event" && !eligible.pendingIntent) this.storage.queueTime(id, this.ctx.sessionManager.getSessionId(), this.getNextRun(id)?.toISOString());
-      if (eligible?.model) {
-        this.executeJobInSubagent(eligible);
-        this.armDrain();
-        return;
-      }
-      if (eligible?.durable && this.activeJobs.size) { this.pending.add(id); this.armDrain(); return; }
-      const job = eligible && (eligible.durable ? this.durable.begin(id) : this.storage.admitJob(id, this.ctx.sessionManager.getSessionId()));
-      if (!job && eligible?.durable && this.storage.getAllJobs().some(other => other.claim && other.claim.sessionId === eligible.session && other.claim.phase !== "settled")) this.pending.add(id);
-      if (job) {
-        admitted = true;
-        this.contention.delete(id);
-        const attempts = job.attemptCount!;
-        if (job.followUp && job.claim) {
-          this.dispatchFollowUp(job);
-        } else {
-          // Admission is persisted before a potentially effectful send.
-          this.pi.sendMessage({
-            customType: "scheduled_prompt", content: promptFor(job), display: true,
-            details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline", ...(job.claim ? { claimId: job.claim.id } : {}) },
-          }, { triggerTurn: true, deliverAs: "followUp" });
-        }
-        if (!job.durable) this.storage.updateJob(id, {
-          lastRun: new Date().toISOString(), lastStatus: "dispatched", runCount: job.runCount + 1,
-          ...(job.type === "once" || (job.maxRuns !== undefined && attempts >= job.maxRuns) ? { enabled: false } : {}),
-          nextRun: this.getNextRun(id)?.toISOString(),
-        });
-        if (this.storage.getJob(id)?.enabled === false) this.unscheduleJob(id);
-        this.emitChange({ type: "fire", job: this.storage.getJob(id) });
-      }
-    } catch (error) {
-      if (!admitted && error instanceof ScheduleStoreBusyError) this.deferContention(id);
-      else {
-        if (selected && !isResilient(selected)) this.durable.finish("unknown");
-        this.fail(id, error);
-      }
     }
     this.armDrain();
   }
@@ -637,7 +640,7 @@ export class CronScheduler {
     this.emitChange({ type: "fire", job });
     this.pi.sendMessage({ customType: "scheduled_prompt", display: true,
       content: [{ type: "text", text: "Scheduled model run: " + job.name }],
-      details: { jobId: job.id, jobName: job.name, prompt: job.prompt, mode: "subagent_start", model } });
+      details: { jobId: job.id, jobName: job.name, prompt: job.prompt, mode: "subagent_start", model } }, { triggerTurn: false });
     const controller = new AbortController();
     this.activeSubagents.add(controller);
     this.activeJobs.set(job.id, controller);
@@ -664,7 +667,7 @@ export class CronScheduler {
               jobId: job.id, jobName: job.name, prompt: job.prompt, model,
               mode: result.ok ? "subagent_done" : "subagent_error",
               ...(result.ok ? { output: text } : { error: text }),
-            } }, job.notify ? { deliverAs: "followUp", triggerTurn: true } : undefined);
+            } }, job.notify ? { deliverAs: "followUp", triggerTurn: true } : { triggerTurn: false });
         } catch (error) {
           console.error("Failed to post " + (result.ok ? "subagent_done" : "subagent_error") + " marker for job " + job.id + ":", error);
         }

@@ -1,9 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRegistry, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import scheduleExtension from "../src/index.js";
+import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
 import { runSubagentOnce } from "../src/subagent.js";
 
@@ -56,6 +58,57 @@ describe("Pi 1.3 native host integration", () => {
       fs.rmSync(cwd, { recursive: true, force: true });
     }
   });
+  it("finishes a durable model event before the real parent tool/turn becomes idle", async () => {
+    const root = path.resolve("tmp/sdk-fixtures"); fs.mkdirSync(root, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(root, "busy-parent-"));
+    const agentDir = path.join(cwd, "agent"); fs.mkdirSync(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const manager = SessionManager.inMemory(cwd), storage = new CronStorage(cwd);
+    const faux = fauxProvider({ provider: "busy-parent-fixture" });
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("hold_parent", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage("CHILD_FINISHED_WHILE_PARENT_BUSY"),
+      fauxAssistantMessage("PARENT_FINISHED_NORMALLY"),
+    ]);
+    const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+    runtime.registerNativeProvider(faux.provider); await runtime.setRuntimeApiKey("busy-parent-fixture", "synthetic-only"); await runtime.getAvailable();
+    const settings = SettingsManager.inMemory({ packages: [], compaction: { enabled: false }, retry: { enabled: false } });
+    storage.addJob({ id: "child", name: "child", type: "event", schedule: "local:fixture", prompt: "Synthetic child, no tools",
+      enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: manager.getSessionId(),
+      model: "busy-parent-fixture/" + faux.getModel().id, durable: true, deadlineMs: 10_000, maxRuns: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    let scheduler: CronScheduler | undefined, observedBusy = false;
+    const errors: string[] = [];
+    const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [pi => {
+        pi.on("session_start", (_event, ctx) => { scheduler = new CronScheduler(storage, pi, ctx); scheduler.start(); });
+        pi.on("session_shutdown", () => { scheduler?.stop(); });
+        pi.registerTool({ name: "hold_parent", label: "Synthetic parent barrier", description: "Synthetic fixture only", parameters: Type.Object({}),
+          async execute(_id, _args, _signal, _update, ctx) {
+            expect(ctx.isIdle()).toBe(false);
+            scheduler!.receiveEvent("child", "local:fixture", "one");
+            await vi.waitFor(() => expect(storage.getJob("child")?.lastStatus).toBe("success"), { timeout: 3000 });
+            observedBusy = !ctx.isIdle();
+            expect(observedBusy).toBe(true);
+            expect(storage.getJob("child")).toMatchObject({ attemptCount: 1, runCount: 1, claim: { phase: "settled", outcome: "success" } });
+            return { content: [{ type: "text", text: "Parent barrier released after child closure" }], details: {} };
+          } });
+      }] });
+    await loader.reload();
+    const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off", tools: ["hold_parent"], settingsManager: settings, sessionManager: manager, resourceLoader: loader });
+    try {
+      await session.bindExtensions({ mode: "rpc", onError: error => { errors.push(error.message); } });
+      await session.prompt("Synthetic parent task"); await session.waitForIdle();
+      expect(observedBusy).toBe(true);
+      expect(session.getLastAssistantText(), JSON.stringify({ calls: faux.state.callCount, messages: session.messages.map(message => ({ role: message.role, ...("stopReason" in message ? { stopReason: message.stopReason, errorMessage: message.errorMessage } : {}) })) })).toBe("PARENT_FINISHED_NORMALLY");
+      expect(faux.state.callCount).toBe(3); expect(errors).toEqual([]);
+      expect(session.messages.filter(message => message.role === "user")).toHaveLength(1);
+      expect(storage.getJob("child")?.attemptCount).toBe(1);
+    } finally {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("runs an explicit model job with the real SDK and a native faux provider", async () => {
     const root = path.resolve("tmp/sdk-fixtures");
     fs.mkdirSync(root, { recursive: true });
