@@ -173,6 +173,18 @@ describe("native execution envelope", () => {
     await vi.advanceTimersByTimeAsync(1100); expect(h.ctx.abort).not.toHaveBeenCalled();
     expect(h.storage.getJob("one")?.enabled).toBe(false);
   });
+  it.each([false, true])("routes a start-persistence failure only to the owned execution, model=%s", model => {
+    const h = fixture(model ? { model: "synthetic/model" } : {}); h.storage.queueTime("one", "owner");
+    const job = h.durable.begin("one")!; const abortChild = vi.fn(); h.durable.setAbort(job.claim!.id, abortChild);
+    vi.spyOn(h.storage, "markClaim").mockImplementationOnce(() => { throw new Error("synthetic start persistence failure"); });
+    h.durable.started(job.claim!.id);
+    expect(h.ctx.abort).toHaveBeenCalledTimes(model ? 0 : 1);
+    expect(abortChild).toHaveBeenCalledTimes(model ? 1 : 0);
+    expect(h.durable.busy()).toBe(model);
+    if (model) { h.durable.release("foreign"); expect(h.durable.busy()).toBe(true); h.durable.release(job.claim!.id); expect(h.durable.busy()).toBe(false); }
+    expect(h.storage.getJob("one")).toMatchObject({ enabled: false, lastStatus: "unknown", attemptCount: 1, claim: { outcome: "unknown", outcomeReason: "claim_changed" } });
+  });
+
   it("keeps a model deadline hold through unrelated parent settlement until the exact child releases", async () => {
     const h = fixture({ model: "synthetic/model", deadlineMs: 1000 }); h.storage.queueTime("one", "owner"); const job = h.durable.begin("one")!; h.durable.started(job.claim!.id);
     const abort = vi.fn(); h.durable.setAbort(job.claim!.id, abort);

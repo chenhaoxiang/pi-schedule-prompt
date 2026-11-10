@@ -122,7 +122,13 @@ export class DurableExecution {
     if (!current || current.job.claim?.id !== claimId) return;
     current.started = true;
     try { this.storage.markClaim(current.job.id, current.job.claim!.id, "started"); }
-    catch { this.ctx.abort(); this.finish("unknown", "claim_changed"); }
+    catch {
+      if (current.job.model) {
+        this.heldClaim = { id: current.job.claim!.id, started: true, model: true };
+        current.abort?.();
+      } else this.ctx.abort();
+      this.finish("unknown", "claim_changed");
+    }
   }
 
   deferInput(toolCallId: string): boolean {
