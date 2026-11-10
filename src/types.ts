@@ -111,6 +111,8 @@ export interface AttemptResolution {
   evidenceFingerprint: string;
   at: string;
   disposition: "continue" | "waiting-input" | "unknown" | "native-closure";
+  /** Minimum wait from this exact resolution time; absent retains immediate continuation. */
+  resumeAfterMs?: number;
   /** Required for a preserved legacy claim resolution, which has no fabricated native checkpoint. */
   legacyClaimBinding?: string;
   checkpoint?: NativeCheckpointReference;
@@ -357,7 +359,8 @@ export const CronToolParams = Type.Object({
   latenessMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 86400000, description: "Resilient occurrence freshness window, independent of cadence and execution budgets; default 300000." })),
   workBudgetMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 86400000, description: "Resilient soft work/drain target, strictly below deadlineMs; never a cadence timeout or a renewed authority." })),
   attemptId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Required for reconcile: exact finalized resilient attempt id/checkpoint. Native/SDK resource closure must already be acknowledged." })),
-  resolution: Type.Optional(StringEnum(["continue", "waiting-input", "unknown"], { description: "Required for reconcile. Records the owning operator's verified evidence, not business success or new authorization." })),
+  resolution: Type.Optional(StringEnum(["continue", "continue-delayed", "waiting-input", "unknown"], { description: "Required for reconcile. continue resumes the checkpoint immediately; continue-delayed requires resumeAfterMs and respects future cadence. Old runtimes reject the new resolution. Neither grants effect clearance without verified owner evidence." })),
+  resumeAfterMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86400000, description: "Only reconcile with resolution=continue-delayed and an exact native attempt. Minimum delay from the first recorded resolution, not a deadline extension; repeats do not renew it. Cadence/provider/day/expiry limits can delay further." })),
   safeScopes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]+$" }), { maxItems: 32, description: "Optional bounded scopes of reconciliation evidence; scoped evidence does not release the whole job's conflicting writes." })),
   claimId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Exact settled UNKNOWN/aborted legacy claim ID for resume or migrated-legacy reconcile; never a native attempt alias." })),
   claimBinding: Type.Optional(Type.String({ minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$", description: "Required with claimId for migrated-legacy reconcile: exact retained claim binding. External effect evidence is separate." })),

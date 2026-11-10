@@ -459,7 +459,8 @@ export class CronStorage {
   }
 
   /** Exact owner evidence is the only transition out of an unknown-effect barrier. */
-  reconcileResilientAttempt(id: string, sessionId: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): boolean {
+  reconcileResilientAttempt(id: string, sessionId: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = [], resumeAfterMs?: number): boolean {
+    if (resumeAfterMs !== undefined && (disposition !== "continue" || !Number.isSafeInteger(resumeAfterMs) || resumeAfterMs < 1000 || resumeAfterMs > 86400000)) throw new Error("Invalid minimum continuation delay");
     if (!validEvidenceFingerprint(evidenceFingerprint) || !Array.isArray(safeScopes) || safeScopes.length > 32 || !safeScopes.every(scope => validEventId(scope))) throw new Error("Reconciliation requires bounded SHA-256 evidence and safe scopes");
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
@@ -470,19 +471,23 @@ export class CronStorage {
       if (record.effectStatus !== "unknown" && job.runtime.continuation?.attemptId !== attemptId) return false;
       const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint);
       if (prior) {
-        if (prior.disposition !== disposition || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution");
+        if (prior.disposition !== disposition || prior.resumeAfterMs !== resumeAfterMs || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution or timing");
         return false;
       }
-      const resolution = { attemptId, evidenceFingerprint, at: new Date().toISOString(), disposition, checkpoint: structuredClone(record.checkpoint), ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}) };
+      const now = Date.now();
+      const resolution = { attemptId, evidenceFingerprint, at: new Date(now).toISOString(), disposition, checkpoint: structuredClone(record.checkpoint), ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}), ...(resumeAfterMs !== undefined ? { resumeAfterMs } : {}) };
       job.attemptResolutions.push(resolution);
       if (disposition === "continue") {
         job.runtime.continuation = { attemptId, checkpoint: structuredClone(record.checkpoint), evidenceFingerprint };
         const blocked = requiresReconciliation(job);
-        const exhausted = !job.enabled || Date.parse(job.expiresAt!) <= Date.now() || job.attemptCount! >= job.maxRuns!;
+        const providerNotBefore = record.nativeProof.retryNotBefore;
+        const notBefore = Math.max(now + (resumeAfterMs ?? 0), Date.parse(job.runtime.notBefore ?? "") || 0, Date.parse(providerNotBefore ?? "") || 0);
+        // A delayed resolution may remain paused until an explicit enable;
+        // preserve the legacy immediate-continue stop projection when omitted.
+        const exhausted = (resumeAfterMs === undefined && !job.enabled) || Date.parse(job.expiresAt!) <= notBefore || job.attemptCount! >= job.maxRuns!;
         job.runtime.slot = { kind: "idle", phase: blocked ? "reconciling" : exhausted ? "finished" : "waiting", reason: blocked ? "scope_or_effect_unresolved" : exhausted ? "authorization_bound" : "reconciled" };
         job.runtime.nextEligibleAt = undefined;
-        const providerNotBefore = record.nativeProof.retryNotBefore;
-        if (providerNotBefore && (!job.runtime.notBefore || Date.parse(providerNotBefore) > Date.parse(job.runtime.notBefore))) job.runtime.notBefore = providerNotBefore;
+        if (resumeAfterMs !== undefined || notBefore > now) job.runtime.notBefore = new Date(notBefore).toISOString();
       } else if (disposition === "waiting-input") {
         job.runtime.slot = { kind: "idle", phase: "waiting-input", reason: "reconciled_waiting_input" };
       } else {

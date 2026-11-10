@@ -17,7 +17,7 @@ created: 2026-10-20
 - main：经过审查的维护整合主线。
 - upstream-main：纯社区镜像，不作为安装源；upstream 远端只读。
 - 版本使用 0.4.1-fork.N，禁止误发至社区 npm 身份。源码、GitHub Release、本机安装和运行中的 session 分别验真。
-- 安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.20`；需要复现时锁定受审提交。
+- 安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.21`；需要复现时锁定受审提交。
 - 要求 Node 22.19+、Pi 1.3.x。本次源码改动不自动安装、不强制重启旧会话、不启动真实监控。
 
 ## 定时与管理
@@ -46,6 +46,12 @@ created: 2026-10-20
 投递前的存储锁竞争保留一次待执行记录，稍后重试且不消耗尝试次数；结果不明的投递异常会暂停任务。暂停未来触发不能撤回已投递消息，也不能中止已经执行的工具。
 
 **0.4.1-fork.20** 修复了独立模型任务被父会话忙碌或待处理消息挡住的问题，覆盖计时、事件、durable 和 resilient 路径；排在前面的内联任务不会拖住后面的独立模型任务。内联任务仍等待父会话空闲，原单次在途、归属、次数/到期、UNKNOWN 和 SDK 关闭确认不变。未请求通知的旧式模型状态标记会保留，但不插入父会话的执行流程或增加请求；显式 `notify:true` 的完成跟进行为保留。子任务启动记录写入失败时只取消该子任务，不中止无关父任务。本次不迁移真实任务存储、不强制重载活动会话。
+
+## 对账后按节奏续接
+
+**0.4.1-fork.21** 新增精确 native attempt 的 `resolution:"continue-delayed"`，必须配 `resumeAfterMs`（1000–86400000毫秒）。例如3600000表示从首次记录该证据的时刻起至少等一小时，再按原 cadence 及更强的供应商冷却、每日/总次数、到期和副作用门禁调度；fixed-rate 可能等待更后的锚点。重试、重启不续长等待，不重置花费或原 UNKNOWN。暂停时可记录延迟对账，但仍须显式 enable 才允许未来执行。
+
+普通 `continue` 仍是立即接续 checkpoint；`schedule` 仅属于 add/update，在 reconcile 中会明确拒绝，不再静默忽略。先用现有 status 核实实际 loaded 的 `runtime.loadedSchedule.reconcileDelayedVersion:1`，不能从磁盘安装推断。旧工具会拒绝新 resolution，旧状态读取沿既有 schema4/notBefore 约束，不迁移真实任务或强 reload。例子与边界见[可靠调度设计](reliable-scheduling.md#delayed-native-continuation)。
 
 ## 多会话与存储
 
