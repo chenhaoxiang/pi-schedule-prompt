@@ -75,6 +75,20 @@ These are source/fixture examples, not an instruction to activate an existing UN
 
 `status`/`preview` are metadata reads and never model wakes. A drain request checkpoints/yields but is not closure acknowledgement. Reconciliation consumes the exact retained checkpoint after native/SDK resources have closed; inspect original results/external effects first, never manufacture evidence from a summary. Repeating identical evidence is idempotent, scoped evidence does not release global conflicting writes, and no operation rewrites old UNKNOWN to business success, renews authority, resets spending or removes an existing expiry. Required-input waits and provider Retry-After/cooldown/UTC limits remain explicit unblock conditions. Scheduled turns cannot self-create, renew/change resilient definitions or self-certify reconciliation through this tool.
 
+## Delayed native continuation
+
+A plain `resolution:"continue"` remains an immediate checkpoint continuation, separate from the recurring cadence. `schedule` and other definition fields are rejected on reconciliation before any resolution is persisted; use add/update to change a definition.
+
+With an actual loaded `runtime.loadedSchedule.reconcileDelayedVersion:1`, the owning ordinary context can instead request:
+
+```json
+{"action":"reconcile","jobId":"EXACT_JOB_ID","attemptId":"EXACT_FINALIZED_ATTEMPT","evidenceFingerprint":"REPLACE_WITH_VERIFIED_LOWERCASE_SHA256","resolution":"continue-delayed","resumeAfterMs":3600000}
+```
+
+The distinct resolution fails closed on older tools. It normalizes to the existing exact-effect continue record plus an optional `resumeAfterMs`, preserving schema4. The original resolution timestamp determines the minimum notBefore barrier; idempotent repeats do not renew it, and conflicting timing with the same evidence fails. Current scheduling and storage admission enforce that barrier across config updates/enable/restart. A delayed continuation remains cadence-bound even after its minimum wait has elapsed; metadata-only holds/recovery cannot erase or shorten timing, and timing/admission re-derive the original minimum from immutable resolution metadata if a projection is lost. Schema4 readability is not execution qualification for an older writer: do not run delayed jobs through an older scheduler runtime lacking this capability. Normal cadence can delay further (especially the next fixed-rate anchor), as can provider Retry-After, UTC limits, expiry and unresolved effect scopes. Delay is not a new work/deadline/authorization budget.
+
+The attempt must already have exact native and, for model work, SDK closure. Its immutable UNKNOWN record and all spending remain; scoped evidence cannot release global effects. A disabled delayed reconciliation does not turn pause into exhaustion: it remains disabled/waiting and only explicit enable can arm future work. Legacy immediate-continue stop projection and migrated legacy-claim future-only behavior remain unchanged. No pending or owned execution is replayed, and no automatic real-store migration or active-session reload follows from installation.
+
 ## Composition
 
 Intercom owns peer messaging and explicit wake requests. Subagents owns independent delegated workflow execution, schedules and mission recovery. Messenger owns Crew dependencies where already adopted. This fork does not clone their records or interpret observations as permission. Future event/daemon work must earn its scope and use these existing public interfaces. No raw prompt is sent to Vista; cron:change is a local observational event, not a public sanitized protocol.

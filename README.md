@@ -16,7 +16,7 @@ This is [chenhaoxiang/pi-schedule-prompt](https://github.com/chenhaoxiang/pi-sch
 Install the maintained source only after reviewing its changes:
 
 ```sh
-pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.20
+pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.21
 ```
 
 Pin a reviewed commit for reproducibility. Installation does not hot-upgrade active Pi sessions. This change does not install itself or start monitoring other sessions.
@@ -85,6 +85,12 @@ Mutations use an exclusive local lock and unique atomic replacements. Task files
 Settings merge global `~/.pi/agent/schedule-prompts-settings.json` defaults with project `.pi/schedule-prompts-settings.json`. The UI only writes project settings: `widgetVisible` and `defaultJobScope` (session/workdir). Runtime store faults display an unavailable state without escaping UI refresh callbacks or replacing corrupt bytes.
 
 Schedules fire only in a compatible live Pi session. Legacy offline ticks are not replayed; past legacy one-shots are disabled with an error. Print/JSON batch sessions do not arm timers. The optional dedicated service below maintains its own native Pi; it is not a permission system, arbitrary-terminal controller or OS sleep wake guarantee.
+
+## Reconcile without an immediate continuation loop
+
+**0.4.1-fork.21** adds explicit `resolution:"continue-delayed"` plus `resumeAfterMs` (1000–86400000) for an exact finalized native attempt. For a one-hour minimum wait, use3600000. The wait starts at the first recorded resolution, survives retry/restart and enable/update, and cannot weaken provider cooldown, configured cadence, UTC limits, lifetime spending, expiry or unresolved scopes. Fixed-rate cadence can move execution to a later anchor; fixed-delay remains completion-based with the stronger explicit minimum. A disabled delayed job stays paused until explicitly enabled.
+
+`resolution:"continue"` retains immediate checkpoint continuation. `schedule` belongs to add/update and is rejected on reconcile, not used as a delay. Check actual loaded `runtime.loadedSchedule.reconcileDelayedVersion:1` before using the new mode; older tools reject its distinct resolution. The store retains schema4, but format readability does not certify older scheduler writers: do not execute a delayed job through an older runtime lacking this capability. Current hold/recovery preserves timing, and timing/admission re-derive the minimum from its immutable resolution if a projection is lost. No outcome becomes business success and no previous UNKNOWN action is replayed. See [the exact management example](docs/reliable-scheduling.md#delayed-native-continuation).
 
 ## Explicit model jobs
 

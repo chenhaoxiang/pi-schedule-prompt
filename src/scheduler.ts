@@ -172,23 +172,23 @@ export class CronScheduler {
     } catch { native = { state: "unknown" }; }
     return {
       version: 1, observedAt: new Date().toISOString(), pid: process.pid, sessionId: this.ctx.sessionManager.getSessionId(), sessionFile: this.ctx.sessionManager.getSessionFile?.() ?? null, storePath: this.storage.getStorePath(), tools: toolReadback(this.pi),
-      loadedSchedule: { name: loadedPackage.name, version: loadedPackage.version, sourceSha: loadedInstall?.sourceSha ?? null, boundSdkVersion: loadedInstall?.hostVersion ?? null, moduleUrl: import.meta.url, commandPath: this.pi.getCommands?.().find(command => command.name === "schedule-host-status")?.sourceInfo?.path ?? null, readerSchemas: [1, 2, 3, 4] },
+      loadedSchedule: { name: loadedPackage.name, version: loadedPackage.version, sourceSha: loadedInstall?.sourceSha ?? null, boundSdkVersion: loadedInstall?.hostVersion ?? null, moduleUrl: import.meta.url, commandPath: this.pi.getCommands?.().find(command => command.name === "schedule-host-status")?.sourceInfo?.path ?? null, readerSchemas: [1, 2, 3, 4], reconcileDelayedVersion: 1 },
       actualCoreVersion: "not-exposed", nativeCapabilityVersion: capability?.version ?? null, unattendedInputGuardVersion: capability?.unattendedInputGuardVersion ?? null, native,
       coreIdle: this.ctx.isIdle?.() ?? null, pendingMessages: this.ctx.hasPendingMessages?.() ?? null, effectiveTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       registered: { running: !this.stopped, scheduledTurn: this.scheduledTurn, legacyDurableBusy: this.durable.busy(), activeLegacyJobCount: this.activeJobs.size, activeLegacyModelControllerCount: this.activeSubagents.size, resilientJobIds: this.resilient.registeredJobIds().slice(0, 20), pendingJobCount: this.pending.size },
       untrackedSdkHandles: "not-observed", closureEvidence: "This is registered scheduler/native metadata only, not proof that unrelated or untracked SDK/delegated handles closed.",
     };
   }
-  reconcileResilientJob(id: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): { job: CronJob; changed: boolean } {
+  reconcileResilientJob(id: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = [], resumeAfterMs?: number): { job: CronJob; changed: boolean } {
     const job = this.storage.getJob(id);
     if (!job || !isResilient(job) || job.session !== this.ctx.sessionManager.getSessionId()) throw new Error("Exact resilient reconciliation requires the owning session");
     if (!["continue", "waiting-input", "unknown"].includes(disposition)) throw new Error("Invalid exact checkpoint resolution");
-    const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && JSON.stringify(item.safeScopes ?? []) === JSON.stringify(safeScopes));
+    const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && item.resumeAfterMs === resumeAfterMs && JSON.stringify(item.safeScopes ?? []) === JSON.stringify(safeScopes));
     if (prior) return { job, changed: false };
     if (job.runtime.slot.kind === "owned") throw new Error("Wait for exact native/SDK resource closure before checkpoint/effect reconciliation");
-    const changed = this.storage.reconcileResilientAttempt(id, job.session!, attemptId, evidenceFingerprint, disposition, safeScopes);
+    const changed = this.storage.reconcileResilientAttempt(id, job.session!, attemptId, evidenceFingerprint, disposition, safeScopes, resumeAfterMs);
     const updated = this.storage.getJob(id);
-    if (!updated || !isResilient(updated) || !updated.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition)) throw new Error("No exact finalized checkpoint resolution was recorded; no old work was replayed");
+    if (!updated || !isResilient(updated) || !updated.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && item.resumeAfterMs === resumeAfterMs)) throw new Error("No exact finalized checkpoint resolution was recorded; no old work was replayed");
     if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated); this.drain(); }
     return { job: updated, changed };
   }

@@ -87,6 +87,7 @@ export function createCronTool(
         if (params.expiresAt !== undefined && (!Number.isFinite(Date.parse(params.expiresAt)) || Date.parse(params.expiresAt) <= Date.now())) {
           throw new Error("expiresAt must be an absolute future timestamp");
         }
+        if (params.resumeAfterMs !== undefined && action !== "reconcile") throw new Error("resumeAfterMs is only valid for reconcile with continue-delayed.");
         switch (action) {
           case "preview": {
             const preview = storage.previewSchema4Migration();
@@ -106,13 +107,21 @@ export function createCronTool(
             return { content: [{ type: "text", text: "Requested native checkpoint/drain for the exact handle. This is not an exit acknowledgement or business success." }], details };
           }
           case "reconcile": {
+            if (params.schedule !== undefined) throw new Error("schedule is only for add/update; reconcile does not reset cadence. Use resolution=continue-delayed with resumeAfterMs for a minimum wait, or continue for immediate checkpoint continuation.");
+            const allowed = new Set(["action", "jobId", "attemptId", "claimId", "claimBinding", "evidenceFingerprint", "resolution", "safeScopes", "resumeAfterMs"]);
+            const ignored = Object.entries(params).filter(([key, value]) => value !== undefined && !allowed.has(key)).map(([key]) => key);
+            if (ignored.length) throw new Error(`Unsupported reconcile fields: ${ignored.join(", ")}; no resolution was recorded.`);
+            const delayed = params.resolution === "continue-delayed";
+            if (delayed && (!params.attemptId || params.claimId || !Number.isSafeInteger(params.resumeAfterMs) || params.resumeAfterMs! < 1000 || params.resumeAfterMs! > 86400000)) throw new Error("continue-delayed requires an exact native attemptId and resumeAfterMs=1000..86400000; legacy claims keep their future-only contract.");
+            if (!delayed && params.resumeAfterMs !== undefined) throw new Error("resumeAfterMs requires resolution=continue-delayed; plain continue is immediate.");
+            const disposition = delayed ? "continue" : params.resolution;
             if (!params.jobId || !params.evidenceFingerprint || !params.resolution || (!params.attemptId && !params.claimId) || (params.attemptId && params.claimId)) throw new Error("reconcile requires jobId, either exact finalized attemptId or retained legacy claimId/binding, SHA-256 effect evidence and resolution");
             if (params.claimId && !params.claimBinding) throw new Error("Migrated legacy reconciliation requires the exact retained claimBinding");
             const result = params.claimId
-              ? scheduler.reconcileLegacyJob(params.jobId, params.claimId, params.claimBinding!, params.evidenceFingerprint, params.resolution, params.safeScopes)
-              : scheduler.reconcileResilientJob(params.jobId, params.attemptId!, params.evidenceFingerprint, params.resolution, params.safeScopes);
+              ? scheduler.reconcileLegacyJob(params.jobId, params.claimId, params.claimBinding!, params.evidenceFingerprint, disposition as "continue" | "waiting-input" | "unknown", params.safeScopes)
+              : scheduler.reconcileResilientJob(params.jobId, params.attemptId!, params.evidenceFingerprint, disposition as "continue" | "waiting-input" | "unknown", params.safeScopes, delayed ? params.resumeAfterMs : undefined);
             details.jobId = result.job.id; details.jobName = result.job.name; details.status = summarizeJobs([result.job], { nextRun: id => scheduler.getNextRun(id) });
-            return { content: [{ type: "text", text: `Exact checkpoint resolution ${result.changed ? "recorded" : "already recorded"}. Old execution/effect history is unchanged; this does not create new authority or business success.` }], details };
+            return { content: [{ type: "text", text: `Exact checkpoint resolution ${result.changed ? "recorded" : "already recorded"}.${delayed ? ` Minimum delay ${params.resumeAfterMs}ms from its original resolution; normal cadence and stronger bounds remain.` : disposition === "continue" ? " Immediate checkpoint continuation requested, not an interval reset." : ""} Old execution/effect history is unchanged; this does not create new authority or business success.` }], details };
           }
           case "resume": {
             if (!params.jobId || !params.claimId || !params.evidenceFingerprint) throw new Error("resume requires jobId, exact claimId and evidenceFingerprint");

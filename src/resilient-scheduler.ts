@@ -87,6 +87,14 @@ export class ResilientScheduling {
         return;
       }
       if (restoring && job.runtime.continuation && job.runtime.slot.phase === "waiting" && !job.runtime.nextEligibleAt) {
+        const continuation = job.runtime.continuation;
+        const resolution = job.attemptResolutions.find(item => item.attemptId === continuation.attemptId && item.evidenceFingerprint === continuation.evidenceFingerprint);
+        if (resolution?.resumeAfterMs !== undefined) {
+          // Expired minimum wait is not permission to skip the original cadence.
+          const next = nextEligibleAfter(job, now);
+          if (next) this.persistAndArm(job, next.getTime(), true);
+          return;
+        }
         this.queue(job, { id: `${job.revision}:continuation:${job.runtime.continuation.attemptId}`, dueAt: new Date(now).toISOString(), revision: job.revision!, source: "continuation" });
         return;
       }

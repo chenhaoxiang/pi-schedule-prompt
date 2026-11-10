@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
-import { instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
+import { continuationDelayNotBefore, instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
 import { nextDue, timingView } from "./timing.js";
 import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type LegacyOwnerHandover, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
 
@@ -295,7 +295,8 @@ export class CronStorage {
         runtime.pending = { ...occurrence, source: "overlap" };
         return { status: "queued", reason: "buffered-first" };
       }
-      if (runtime.notBefore && Date.parse(runtime.notBefore) > now) { runtime.missedCount++; return { status: "ignored", reason: "not-before" }; }
+      const minimumContinuation = continuationDelayNotBefore(job);
+      if ((minimumContinuation && Date.parse(minimumContinuation) > now) || (runtime.notBefore && Date.parse(runtime.notBefore) > now)) { runtime.missedCount++; return { status: "ignored", reason: "not-before" }; }
       if (runtime.pending) return { status: "duplicate" };
       if (occurrence.source === "continuation" && !runtime.continuation) return { status: "ignored", reason: "missing-checkpoint" };
       runtime.pending = { ...occurrence }; job.lastStatus = "queued";
@@ -330,7 +331,8 @@ export class CronStorage {
       if (job.attemptHistory.some(record => record.charged && record.occurrence.id === pending.id && record.occurrence.revision === pending.revision)) { runtime.pending = undefined; return; }
       if (now - Date.parse(pending.dueAt) > job.policy.latenessMs) { runtime.pending = undefined; runtime.missedCount++; return; }
       const day = new Date(now).toISOString().slice(0, 10);
-      if ((runtime.notBefore && Date.parse(runtime.notBefore) > now) || (job.dailyUsage && day < job.dailyUsage.day) || (job.maxRunsPerDay !== undefined && spentOnUtcDay(job, day) >= job.maxRunsPerDay)) return;
+      const minimumContinuation = continuationDelayNotBefore(job);
+      if ((minimumContinuation && Date.parse(minimumContinuation) > now) || (runtime.notBefore && Date.parse(runtime.notBefore) > now) || (job.dailyUsage && day < job.dailyUsage.day) || (job.maxRunsPerDay !== undefined && spentOnUtcDay(job, day) >= job.maxRunsPerDay)) return;
       if (Date.parse(job.expiresAt!) <= now || job.attemptCount! >= job.maxRuns!) {
         runtime.pending = undefined; runtime.nextEligibleAt = undefined; runtime.slot = { kind: "idle", phase: "finished", reason: "authorization_bound" }; return;
       }
@@ -459,7 +461,8 @@ export class CronStorage {
   }
 
   /** Exact owner evidence is the only transition out of an unknown-effect barrier. */
-  reconcileResilientAttempt(id: string, sessionId: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): boolean {
+  reconcileResilientAttempt(id: string, sessionId: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = [], resumeAfterMs?: number): boolean {
+    if (resumeAfterMs !== undefined && (disposition !== "continue" || !Number.isSafeInteger(resumeAfterMs) || resumeAfterMs < 1000 || resumeAfterMs > 86400000)) throw new Error("Invalid minimum continuation delay");
     if (!validEvidenceFingerprint(evidenceFingerprint) || !Array.isArray(safeScopes) || safeScopes.length > 32 || !safeScopes.every(scope => validEventId(scope))) throw new Error("Reconciliation requires bounded SHA-256 evidence and safe scopes");
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
@@ -470,19 +473,23 @@ export class CronStorage {
       if (record.effectStatus !== "unknown" && job.runtime.continuation?.attemptId !== attemptId) return false;
       const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint);
       if (prior) {
-        if (prior.disposition !== disposition || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution");
+        if (prior.disposition !== disposition || prior.resumeAfterMs !== resumeAfterMs || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution or timing");
         return false;
       }
-      const resolution = { attemptId, evidenceFingerprint, at: new Date().toISOString(), disposition, checkpoint: structuredClone(record.checkpoint), ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}) };
+      const now = Date.now();
+      const resolution = { attemptId, evidenceFingerprint, at: new Date(now).toISOString(), disposition, checkpoint: structuredClone(record.checkpoint), ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}), ...(resumeAfterMs !== undefined ? { resumeAfterMs } : {}) };
       job.attemptResolutions.push(resolution);
       if (disposition === "continue") {
         job.runtime.continuation = { attemptId, checkpoint: structuredClone(record.checkpoint), evidenceFingerprint };
         const blocked = requiresReconciliation(job);
-        const exhausted = !job.enabled || Date.parse(job.expiresAt!) <= Date.now() || job.attemptCount! >= job.maxRuns!;
+        const providerNotBefore = record.nativeProof.retryNotBefore;
+        const notBefore = Math.max(now + (resumeAfterMs ?? 0), Date.parse(job.runtime.notBefore ?? "") || 0, Date.parse(providerNotBefore ?? "") || 0);
+        // A delayed resolution may remain paused until an explicit enable;
+        // preserve the legacy immediate-continue stop projection when omitted.
+        const exhausted = (resumeAfterMs === undefined && !job.enabled) || Date.parse(job.expiresAt!) <= notBefore || job.attemptCount! >= job.maxRuns!;
         job.runtime.slot = { kind: "idle", phase: blocked ? "reconciling" : exhausted ? "finished" : "waiting", reason: blocked ? "scope_or_effect_unresolved" : exhausted ? "authorization_bound" : "reconciled" };
         job.runtime.nextEligibleAt = undefined;
-        const providerNotBefore = record.nativeProof.retryNotBefore;
-        if (providerNotBefore && (!job.runtime.notBefore || Date.parse(providerNotBefore) > Date.parse(job.runtime.notBefore))) job.runtime.notBefore = providerNotBefore;
+        if (resumeAfterMs !== undefined || notBefore > now) job.runtime.notBefore = new Date(notBefore).toISOString();
       } else if (disposition === "waiting-input") {
         job.runtime.slot = { kind: "idle", phase: "waiting-input", reason: "reconciled_waiting_input" };
       } else {
@@ -535,6 +542,7 @@ export class CronStorage {
 
   /** Metadata-only compatibility/wait state. UNKNOWN cannot be cleared by an unrelated status update. */
   setResilientDisposition(id: string, sessionId: string, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }): boolean {
+    if ((disposition.notBefore !== undefined && !instant(disposition.notBefore)) || (disposition.nextEligibleAt !== undefined && !instant(disposition.nextEligibleAt))) throw new Error("Invalid compatibility timing projection");
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind !== "idle") return false;
@@ -542,7 +550,9 @@ export class CronStorage {
       if (["waiting", "backoff"].includes(disposition.phase) && requiresReconciliation(job)) throw new Error("Reconciliation evidence is required before continuation");
       if (["reconciling", "waiting-input", "attention-required"].includes(before.phase) && ["waiting", "backoff"].includes(disposition.phase) && !["runtime_unavailable", "native_disposed", "native_model_route_unsupported"].includes(before.reason ?? "")) throw new Error("Reconciliation evidence is required before continuation");
       job.runtime.slot = { kind: "idle", phase: disposition.phase, ...(disposition.reason ? { reason: disposition.reason } : {}) };
-      job.runtime.notBefore = disposition.notBefore; job.runtime.nextEligibleAt = disposition.nextEligibleAt;
+      // Metadata-only compatibility holds must not erase or shorten timing.
+      if (disposition.notBefore !== undefined && (!job.runtime.notBefore || Date.parse(disposition.notBefore) > Date.parse(job.runtime.notBefore))) job.runtime.notBefore = disposition.notBefore;
+      if (disposition.nextEligibleAt !== undefined && (!job.runtime.nextEligibleAt || Date.parse(disposition.nextEligibleAt) > Date.parse(job.runtime.nextEligibleAt))) job.runtime.nextEligibleAt = disposition.nextEligibleAt;
       return true;
     });
   }

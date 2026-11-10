@@ -69,6 +69,14 @@ function latestEffectResolution(job: ResilientJob, attemptId: string | undefined
   return undefined;
 }
 
+/** Re-derive the immutable delay even if a metadata-only writer lost its projection. */
+export function continuationDelayNotBefore(job: ResilientJob): string | undefined {
+  const continuation = job.runtime.continuation;
+  if (!continuation) return;
+  const resolution = job.attemptResolutions.find(item => item.attemptId === continuation.attemptId && item.evidenceFingerprint === continuation.evidenceFingerprint);
+  if (resolution?.disposition === "continue" && resolution.resumeAfterMs !== undefined) return new Date(Date.parse(resolution.at) + resolution.resumeAfterMs).toISOString();
+}
+
 /** Execution closure is not effect reconciliation; immutable UNKNOWN, not a caller's waiting projection, owns the barrier. */
 export function requiresReconciliation(job: ResilientJob): boolean {
   const old = job.runtime.legacyUncertainty;
@@ -187,6 +195,7 @@ export function validateResilientJob(job: CronJob, storeVersion: number): void {
   for (const resolution of value.attemptResolutions) {
     const legacy = value.claim?.phase === "settled" && value.claim.id === resolution.attemptId;
     if ((!ids.has(resolution.attemptId) && !legacy) || !validEvidenceFingerprint(resolution.evidenceFingerprint) || !instant(resolution.at) || !["continue", "waiting-input", "unknown", "native-closure"].includes(resolution.disposition) || (resolution.safeScopes !== undefined && (!Array.isArray(resolution.safeScopes) || resolution.safeScopes.length > 32 || !resolution.safeScopes.every(scope => validEventId(scope))))) throw new Error("Invalid exact-attempt reconciliation");
+    if (resolution.resumeAfterMs !== undefined && (legacy || resolution.disposition !== "continue" || !safeInteger(resolution.resumeAfterMs, 1000) || resolution.resumeAfterMs > 86400000)) throw new Error("Invalid retained continuation timing");
     if (legacy && (resolution.legacyClaimBinding !== value.claim?.binding || resolution.checkpoint !== undefined || resolution.disposition === "native-closure")) throw new Error("Legacy resolution must bind its exact retained claim, not a fabricated native checkpoint");
     if (!legacy && resolution.legacyClaimBinding !== undefined) throw new Error("Native resolution cannot claim legacy identity");
     const resolvedRecord = value.attemptHistory.find(item => item.id === resolution.attemptId);

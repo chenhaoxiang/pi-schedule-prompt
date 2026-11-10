@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.21 (2026-11-10; activation separate)
+- Reject ignored reconcile fields, including schedule, before changing effect resolution. Plain continue still means immediate checkpoint continuation, not an interval reset.
+- Add explicit native continue-delayed with resumeAfterMs (1s–24h), bound to the original exact effect resolution. Existing persisted notBefore enforces the minimum wait before normal cadence/provider/day/expiry admission; retry/restart never renews it. Older tools reject the new resolution instead of silently dropping the delay.
+- Preserve cadence after a short delay expires before enable/update; compatibility holds cannot erase timing. Derive lost timing projections from the immutable resolution at planning and admission, without claiming old scheduler writers are upgraded.
+- Delayed reconciliation can remain disabled and later be explicitly enabled without misclassifying a pause as exhausted authority. Preserve legacy immediate-continue stop projection, exact closure/effect evidence, immutable UNKNOWN, counters and expiry; no real-job migration or forced reload.
+
 ### Maintained fork 0.4.1-fork.20 (2026-11-10; activation separate)
 - Admit independent explicit-model work while its parent is busy or has pending messages; a queued inline intent cannot starve a later model job. Inline work still waits for an idle parent, and existing single-flight, claim/UNKNOWN, attempt/expiry and SDK-close boundaries remain.
 - Make legacy model start/completion markers explicitly non-triggering unless completion notification was requested, preventing accidental extra parent inference while it is streaming.
