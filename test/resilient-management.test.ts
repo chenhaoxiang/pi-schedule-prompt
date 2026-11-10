@@ -183,6 +183,51 @@ describe("canonical resilient management", () => {
     expect(h.row(id).attemptCount).toBe(1); expect(h.ctx.scheduledExecution!.start).not.toHaveBeenCalled();
   });
 
+  it.each(["fixed-delay", "fixed-rate"])("review: short elapsed delay still honors cadence after enable/update: %s", async intervalMode => {
+    for (const operation of ["enable", "update"]) {
+      const h = fixture(); const id = (await h.add({ intervalMode })).details!.jobId!;
+      vi.advanceTimersByTime(7 * 60000); const first = closedUnknown(h, id);
+      if (operation === "enable") await h.call({ action: "disable", jobId: id });
+      vi.advanceTimersByTime(2 * 60000);
+      expect((await h.call({ action: "reconcile", jobId: id, attemptId: first.attempt.id, evidenceFingerprint: "a".repeat(64), resolution: "continue-delayed", resumeAfterMs: 1000 })).isError).not.toBe(true);
+      vi.advanceTimersByTime(60000); // delay elapsed, original cadence still in the future
+      expect((await h.call(operation === "enable" ? { action: "enable", jobId: id } : { action: "update", jobId: id, name: "renamed" })).isError).not.toBe(true);
+      const expected = intervalMode === "fixed-delay" ? Date.parse(h.row(id).runtime.lastFinishedAt!) + 3600000 : Date.parse(h.row(id).policy.anchorAt) + 3600000;
+      expect(h.row(id).runtime.pending).toBeUndefined(); expect(h.scheduler.getNextRun(id)!.getTime()).toBe(expected);
+      expect(h.row(id).attemptCount).toBe(1); h.scheduler.stop();
+    }
+  });
+
+  it("review: runtime-unavailable hold and recovery retain minimum delay and cannot shorten it", async () => {
+    const h = fixture(); const id = (await h.add()).details!.jobId!; const first = closedUnknown(h, id);
+    await h.call({ action: "reconcile", jobId: id, attemptId: first.attempt.id, evidenceFingerprint: "a".repeat(64), resolution: "continue-delayed", resumeAfterMs: 3600000 });
+    const barrier = h.row(id).runtime.notBefore; const eligibility = h.row(id).runtime.nextEligibleAt;
+    h.scheduler.stop(); vi.advanceTimersByTime(10 * 60000);
+    const { scheduledExecution: _capability, ...unsupportedCtx } = h.ctx;
+    const unsupported = new CronScheduler(h.storage, h.pi as any, unsupportedCtx as any); schedulers.push(unsupported); unsupported.start();
+    expect(h.row(id).runtime.slot).toMatchObject({ phase: "attention-required", reason: "runtime_unavailable" });
+    expect(h.row(id).runtime.notBefore).toBe(barrier); expect(h.row(id).runtime.nextEligibleAt).toBe(eligibility);
+    h.storage.setResilientDisposition(id, "owner", { phase: "attention-required", reason: "runtime_unavailable", notBefore: new Date(Date.now() + 1000).toISOString() });
+    expect(h.row(id).runtime.notBefore).toBe(barrier);
+    unsupported.stop(); h.scheduler.start();
+    expect(h.scheduler.getNextRun(id)?.toISOString()).toBe(barrier); expect(h.row(id).runtime.pending).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(Date.parse(barrier!) - Date.now() - 1);
+    expect(h.row(id).attemptCount).toBe(1); expect(h.ctx.scheduledExecution!.start).not.toHaveBeenCalled();
+  });
+
+  it("review: lost timing projection cannot bypass the exact immutable delayed resolution", async () => {
+    const h = fixture(); const id = (await h.add()).details!.jobId!; const first = closedUnknown(h, id);
+    await h.call({ action: "reconcile", jobId: id, attemptId: first.attempt.id, evidenceFingerprint: "a".repeat(64), resolution: "continue-delayed", resumeAfterMs: 3600000 });
+    const barrier = h.row(id).runtime.notBefore; h.scheduler.stop(); vi.advanceTimersByTime(10 * 60000);
+    const raw = JSON.parse(fs.readFileSync(h.storage.getStorePath(), "utf8"));
+    delete raw.jobs[0].runtime.notBefore; delete raw.jobs[0].runtime.nextEligibleAt;
+    fs.writeFileSync(h.storage.getStorePath(), JSON.stringify(raw)); // owned synthetic old-writer projection loss
+    h.scheduler.start(); expect(h.scheduler.getNextRun(id)?.toISOString()).toBe(barrier);
+    h.storage.queueResilient(id, "owner", { id: "early", dueAt: new Date().toISOString(), revision: h.row(id).revision!, source: "continuation" });
+    expect(h.storage.reserveResilient(id, "owner", "other-fixture", h.row(id).revision!, "early")).toBeUndefined();
+    expect(h.row(id).attemptCount).toBe(1);
+  });
+
   it.each([{ maxRuns: 1 }, { expiresAt: "2026-11-04T00:30:00.000Z" }])("retains exhausted lifetime/expiry bounds on delayed resolution %j", async bounds => {
     const h = fixture(); const id = (await h.add(bounds)).details!.jobId!; const first = closedUnknown(h, id); const history = h.row(id).attemptHistory;
     const result = await h.call({ action: "reconcile", jobId: id, attemptId: first.attempt.id, evidenceFingerprint: "a".repeat(64), resolution: "continue-delayed", resumeAfterMs: 3600000 });

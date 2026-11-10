@@ -1,5 +1,5 @@
 import { Cron } from "croner";
-import { effectiveTimezone, instant, isResilient, requiresReconciliation, spentOnUtcDay } from "./resilient-policy.js";
+import { continuationDelayNotBefore, effectiveTimezone, instant, isResilient, requiresReconciliation, spentOnUtcDay } from "./resilient-policy.js";
 import type { CronJob, ResilientJob, TimedOccurrence } from "./types.js";
 
 export type MisfireDecision =
@@ -105,7 +105,7 @@ export function nextEligibleAfter(job: ResilientJob, now = Date.now()): Date | u
   if (slot.kind === "owned" && (job.policy.intervalMode === "fixed-delay" || slot.phase === "attention-required")) return;
   if (slot.kind === "idle" && !["waiting", "backoff"].includes(slot.phase)) return;
   const day = new Date(now).toISOString().slice(0, 10);
-  let notBefore = job.runtime.notBefore ? Date.parse(job.runtime.notBefore) : now;
+  let notBefore = Math.max(job.runtime.notBefore ? Date.parse(job.runtime.notBefore) : now, Date.parse(continuationDelayNotBefore(job) ?? "") || 0);
   if (job.maxRunsPerDay !== undefined && spentOnUtcDay(job, day) >= job.maxRunsPerDay) notBefore = Math.max(notBefore, Date.parse(day + "T00:00:00.000Z") + 86_400_000);
   if (job.dailyUsage && day < job.dailyUsage.day) notBefore = Math.max(notBefore, Date.parse(job.dailyUsage.day + "T00:00:00.000Z"));
   const view = timingView(job);

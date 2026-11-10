@@ -69,6 +69,14 @@ function latestEffectResolution(job: ResilientJob, attemptId: string | undefined
   return undefined;
 }
 
+/** Re-derive the immutable delay even if a metadata-only writer lost its projection. */
+export function continuationDelayNotBefore(job: ResilientJob): string | undefined {
+  const continuation = job.runtime.continuation;
+  if (!continuation) return;
+  const resolution = job.attemptResolutions.find(item => item.attemptId === continuation.attemptId && item.evidenceFingerprint === continuation.evidenceFingerprint);
+  if (resolution?.disposition === "continue" && resolution.resumeAfterMs !== undefined) return new Date(Date.parse(resolution.at) + resolution.resumeAfterMs).toISOString();
+}
+
 /** Execution closure is not effect reconciliation; immutable UNKNOWN, not a caller's waiting projection, owns the barrier. */
 export function requiresReconciliation(job: ResilientJob): boolean {
   const old = job.runtime.legacyUncertainty;

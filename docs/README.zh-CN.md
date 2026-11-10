@@ -51,7 +51,7 @@ created: 2026-10-20
 
 **0.4.1-fork.21** 新增精确 native attempt 的 `resolution:"continue-delayed"`，必须配 `resumeAfterMs`（1000–86400000毫秒）。例如3600000表示从首次记录该证据的时刻起至少等一小时，再按原 cadence 及更强的供应商冷却、每日/总次数、到期和副作用门禁调度；fixed-rate 可能等待更后的锚点。重试、重启不续长等待，不重置花费或原 UNKNOWN。暂停时可记录延迟对账，但仍须显式 enable 才允许未来执行。
 
-普通 `continue` 仍是立即接续 checkpoint；`schedule` 仅属于 add/update，在 reconcile 中会明确拒绝，不再静默忽略。先用现有 status 核实实际 loaded 的 `runtime.loadedSchedule.reconcileDelayedVersion:1`，不能从磁盘安装推断。旧工具会拒绝新 resolution，旧状态读取沿既有 schema4/notBefore 约束，不迁移真实任务或强 reload。例子与边界见[可靠调度设计](reliable-scheduling.md#delayed-native-continuation)。
+普通 `continue` 仍是立即接续 checkpoint；`schedule` 仅属于 add/update，在 reconcile 中会明确拒绝，不再静默忽略。先用现有 status 核实实际 loaded 的 `runtime.loadedSchedule.reconcileDelayedVersion:1`，不能从磁盘安装推断。旧工具会拒绝新 resolution；状态格式仍为 schema4，但不能据此混用未经验证的旧调度写入者执行延迟任务。当前 hold/恢复保留屏障，投影丢失时仍从不可变 resolution 重建最小等待并在准入处检查，不迁移真实任务或强 reload。例子与边界见[可靠调度设计](reliable-scheduling.md#delayed-native-continuation)。
 
 ## 多会话与存储
 
