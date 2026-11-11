@@ -95,6 +95,6 @@ fork.22 提供独立的[显式维护 CLI](reliable-scheduling.md#expired-model-j
 
 ## 开发与验证
 
-执行 `npm ci --ignore-scripts --no-audit --no-fund`，再执行 `npm run check`。检查包含 lint、类型、有限并发无提供商回归和构建。真实 SDK 夹具使用内存 faux provider、隔离资源，不读取真实凭据或调用付费模型。
+执行 `npm ci --ignore-scripts --no-audit --no-fund`，再执行 `npm run check`。源码仓的 `.npmrc` 为 npm12 显式设置 `allow-remote=root`，仅允许根 package.json 直接声明的 URL 依赖；现有 pi-intercom 测试依赖仍固定完整 commit 和 lockfile SRI，传递 URL 依赖仍拒绝。不会修改用户/全局 npm 配置，也不启用生命周期脚本。Node26 CI 固定 npm12.2.2，并执行隔离回环的默认拒绝/根依赖允许/传递依赖拒绝验证；Node22 保留旧版兼容线。此修复仅针对源码开发安装，不重发已有固定 Release，不改变运行中的扩展。检查包含 lint、类型、有限并发无提供商回归和构建。真实 SDK 夹具使用内存 faux provider、隔离资源，不读取真实凭据或调用付费模型。
 
 详细行为见 [可靠调度设计](reliable-scheduling.md)。

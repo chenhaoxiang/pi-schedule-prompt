@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Development installation (source only)
+- Opt into npm12 root-declared URL dependencies at project scope for the existing exact-commit/SRI-pinned pi-intercom test dependency; retain transitive-URL denial and lifecycle-script suppression without modifying user/global config files; environment/CLI precedence remains.
+- Verify fresh dependency installation and synthetic default-deny/root-allow/transitive-deny cases; retain Node22 compatibility and pin npm12.2.2 for the Node26 CI lane. Existing runtime Release assets and installations are unchanged.
+
 ### Maintained fork 0.4.1-fork.22 (2026-11-11; retirement/activation separate)
 - Add a separate explicitly authorized offline operator preview/CAS CLI for an exact expired, idle model job with matching original native/SDK closure; preserve normal foreign-session guards.
 - Change only enabled intent after locked closure verification and a private backup; retain owner, UNKNOWN, attempts, budgets, limits and unrelated jobs. Never revive the retired session, reconcile effects or replay work.

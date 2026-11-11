@@ -22,7 +22,16 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      - name: Select pinned npm12 on Node26
+        if: matrix.node == 26
+        run: |
+          if [ "$(npm --version)" != "12.2.2" ]; then
+            npm install --global npm@12.2.2 --ignore-scripts --no-audit --no-fund
+          fi
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify root-only URL dependency policy
+        if: matrix.node == 26
+        run: node test/npm12-root-policy.mjs "$(npm root -g)/npm/bin/npm-cli.js"
       - run: npm run check
         env:
           PI_SCHEDULE_FIXTURE_ROOT: ${{ runner.temp }}/tmp/pi-schedule-online

@@ -7,7 +7,7 @@ This repository is chenhaoxiang/pi-schedule-prompt, maintained from tintinweb/pi
 - Keep the upstream MIT license and attribution. Versions use <community-version>-fork.<revision>. Never publish under the community npm identity. Releases/installations are separate from source delivery.
 - Target Pi 1.3 native custom turns. Scheduling is not user authorization, business completion, or a new child runner. Reuse Intercom for peers and Subagents for independently delegated workflows.
 - Preserve existing scheduling/UI/model-job features unless an approved change explicitly replaces them. Do not start real scheduled work, read private session history/credentials, or change global Pi settings during tests.
-- Run npm run check with synthetic fixtures and a bounded test pool. Temporary logs and packages belong in tmp/. Unix-socket fixtures may use an owned short OS temporary tmp/ subtree outside Git/node_modules ancestors and must clean only their own directory/processes. Tests may not call real providers. Pin dependency changes; install with lifecycle scripts disabled.
+- Run npm run check with synthetic fixtures and a bounded test pool. Temporary logs and packages belong in tmp/. Unix-socket fixtures may use an owned short OS temporary tmp/ subtree outside Git/node_modules ancestors and must clean only their own directory/processes. Tests may not call real providers. Pin dependency changes; install with lifecycle scripts disabled. Source development uses the tracked npm12 `allow-remote=root` policy only for explicitly root-declared pinned URLs; never widen it to all or change user/global npm policy. The manual loopback policy check is `test/npm12-root-policy.mjs`; it must not use real providers/credentials.
 
 ## Documentation map
 

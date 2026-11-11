@@ -129,6 +129,8 @@ mkdir -p tmp
 npm pack --ignore-scripts --pack-destination tmp
 ```
 
+For source development on npm12, the tracked `.npmrc` uses `allow-remote=root`: only URL dependencies explicitly declared by this root package are allowed. The existing pi-intercom test dependency remains pinned to its reviewed full commit and lockfile SRI; arbitrary transitive URL dependencies remain denied. This project-only opt-in does not change user/global npm policy or enable lifecycle scripts. Node26 CI pins npm12.2.2 and runs a synthetic loopback policy check; Node22 remains the legacy compatibility lane. Run that npm12-only check manually with `node test/npm12-root-policy.mjs "$(npm root -g)/npm/bin/npm-cli.js"`. It uses isolated credentials/config/cache, no real provider. The `.npmrc` is source-development configuration, not part of the fixed runtime package; existing Release assets and live installations are not changed.
+
 The check runs lint, typecheck, provider-free tests with bounded workers, and build. A real Pi lifecycle fixture uses an in-memory faux provider and isolated resources, not real credentials or paid inference. Source, installed-host fixtures, releases, installation and live activation remain distinct.
 
 See [reliability design](docs/reliable-scheduling.md) and [the scoped OpenSpec change](openspec/changes/reliable-prompt-scheduling/).
