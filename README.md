@@ -16,7 +16,7 @@ This is [chenhaoxiang/pi-schedule-prompt](https://github.com/chenhaoxiang/pi-sch
 Install the maintained source only after reviewing its changes:
 
 ```sh
-pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.21
+pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.22
 ```
 
 Pin a reviewed commit for reproducibility. Installation does not hot-upgrade active Pi sessions. This change does not install itself or start monitoring other sessions.
@@ -61,6 +61,8 @@ Schedule formats:
 Five-field cron is not accepted. Intervals are bounded by the host timer range (2147483647 ms); long one-shot waits are re-armed in bounded chunks. Cron uses the process timezone.
 
 `/schedule-prompt` opens Jobs and Settings. Jobs hotkeys: arrows select, `a` add, `t` enable/disable, `s` scope, `x` remove, `c` explicitly clean disabled jobs, `q` exit. Paused jobs survive shutdown and reload; cleanup is never automatic. Other sessions' bound jobs are read-only.
+
+For an explicitly authorized host-operator retirement of an expired, closed model job whose interactive owner is retired, fork.22 provides a separate [preview/CAS maintenance CLI](docs/reliable-scheduling.md#expired-model-job-retirement). Ordinary session tools still cannot mutate foreign jobs. This only disables future intent and retains UNKNOWN, history, owner and spending; it never resumes or reconciles work.
 
 ## Native dispatch and status
 
