@@ -73,3 +73,14 @@ Status SHALL report the exact job/attempt, execution phase, bounded reason, next
 #### Scenario: Unchanged unresolved status
 - **WHEN** repeated status checks find the same UNKNOWN effect and recovery condition
 - **THEN** they remain read-only, preserve evidence and do not wake another business execution
+
+### Requirement: Explicit offline retirement preserves expired execution evidence
+An explicitly authorized host operator MAY retire an exact expired resilient model definition through an offline CLI. It SHALL require idle/no-pending state, exact original closure and store SHA-256, use the existing lock and private backup, and change only enabled to false. Foreign-session tools SHALL remain read-only; retirement SHALL NOT execute, transfer ownership, reconcile effects, erase history or renew budgets.
+
+#### Scenario: The interactive owner is retired but the expired job retains UNKNOWN
+- **WHEN** the operator selects the original owner and exact closed model job, with no ambiguous imported legacy resources, and applies a matching preview
+- **THEN** future intent is disabled while the original owner, UNKNOWN, attempts, limits, continuation and unrelated jobs remain unchanged
+
+#### Scenario: Retirement input or original closure is no longer exact
+- **WHEN** the store changed, ownership is active/pending or the bounded original transcript lacks its matching checkpoint, native receipt and final SDK-close ACK, or has newer activity
+- **THEN** the operation refuses without overwriting state or reviving the old session

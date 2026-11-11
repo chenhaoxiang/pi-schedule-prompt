@@ -17,7 +17,7 @@ created: 2026-10-20
 - main：经过审查的维护整合主线。
 - upstream-main：纯社区镜像，不作为安装源；upstream 远端只读。
 - 版本使用 0.4.1-fork.N，禁止误发至社区 npm 身份。源码、GitHub Release、本机安装和运行中的 session 分别验真。
-- 安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.21`；需要复现时锁定受审提交。
+- 安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.22`；需要复现时锁定受审提交。
 - 要求 Node 22.19+、Pi 1.3.x。本次源码改动不自动安装、不强制重启旧会话、不启动真实监控。
 
 ## 定时与管理
@@ -52,6 +52,10 @@ created: 2026-10-20
 **0.4.1-fork.21** 新增精确 native attempt 的 `resolution:"continue-delayed"`，必须配 `resumeAfterMs`（1000–86400000毫秒）。例如3600000表示从首次记录该证据的时刻起至少等一小时，再按原 cadence 及更强的供应商冷却、每日/总次数、到期和副作用门禁调度；fixed-rate 可能等待更后的锚点。重试、重启不续长等待，不重置花费或原 UNKNOWN。暂停时可记录延迟对账，但仍须显式 enable 才允许未来执行。
 
 普通 `continue` 仍是立即接续 checkpoint；`schedule` 仅属于 add/update，在 reconcile 中会明确拒绝，不再静默忽略。先用现有 status 核实实际 loaded 的 `runtime.loadedSchedule.reconcileDelayedVersion:1`，不能从磁盘安装推断。旧工具会拒绝新 resolution；状态格式仍为 schema4，但不能据此混用未经验证的旧调度写入者执行延迟任务。当前 hold/恢复保留屏障，投影丢失时仍从不可变 resolution 重建最小等待并在准入处检查，不迁移真实任务或强 reload。例子与边界见[可靠调度设计](reliable-scheduling.md#delayed-native-continuation)。
+
+## 已过期模型任务退役
+
+fork.22 提供独立的[显式维护 CLI](reliable-scheduling.md#expired-model-job-retirement)，供用户已明确授权、原交互 owner 已退休的精确任务退役。它只处理已到期、idle、无 pending 且原 native/SDK 关闭证据可回读的模型任务；先只读预览，apply 绑定存储 SHA-256 并沿既有锁备份后仅关闭 enabled。UNKNOWN、执行历史、owner 和预算不变，不启动 SDK、不唤醒旧会话、不恢复或重放动作。普通 session 管理工具仍不能修改其他 owner 的任务；不支持的在途、legacy 或不完整证据场景保持拒绝。
 
 ## 多会话与存储
 

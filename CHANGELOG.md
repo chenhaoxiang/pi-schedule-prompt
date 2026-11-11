@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintained fork 0.4.1-fork.22 (2026-11-11; retirement/activation separate)
+- Add a separate explicitly authorized offline operator preview/CAS CLI for an exact expired, idle model job with matching original native/SDK closure; preserve normal foreign-session guards.
+- Change only enabled intent after locked closure verification and a private backup; retain owner, UNKNOWN, attempts, budgets, limits and unrelated jobs. Never revive the retired session, reconcile effects or replay work.
+- Accept npm12 keyed pack JSON as well as the preceding array format, requiring one exact package identity before producing provenance.
+
 ### Maintained fork 0.4.1-fork.21 (2026-11-10; activation separate)
 - Reject ignored reconcile fields, including schedule, before changing effect resolution. Plain continue still means immediate checkpoint continuation, not an interval reset.
 - Add explicit native continue-delayed with resumeAfterMs (1s–24h), bound to the original exact effect resolution. Existing persisted notBefore enforces the minimum wait before normal cadence/provider/day/expiry admission; retry/restart never renews it. Older tools reject the new resolution instead of silently dropping the delay.

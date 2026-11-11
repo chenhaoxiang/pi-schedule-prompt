@@ -11,6 +11,8 @@ This repository is chenhaoxiang/pi-schedule-prompt, maintained from tintinweb/pi
 
 ## Documentation map
 
+- `scripts/retire-expired.mjs` / `docs/reliable-scheduling.md#expired-model-job-retirement`: explicitly authorized offline operator preview/CAS retirement of exact expired/closed model definitions. Not a foreign-session management tool, owner impersonation, recovery or history cleanup.
+
 - docs/live-supervision-pilot.md: first real selected-game-peer wake/evidence/early-stop receipt; no new business implementation or always-on claim.
 
 - docs/durable-supervisor.md: stage D opt-in durable intent/claim/receipt reconciliation, bounded native RPC service and stop/install evidence.

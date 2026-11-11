@@ -75,6 +75,22 @@ These are source/fixture examples, not an instruction to activate an existing UN
 
 `status`/`preview` are metadata reads and never model wakes. A drain request checkpoints/yields but is not closure acknowledgement. Reconciliation consumes the exact retained checkpoint after native/SDK resources have closed; inspect original results/external effects first, never manufacture evidence from a summary. Repeating identical evidence is idempotent, scoped evidence does not release global conflicting writes, and no operation rewrites old UNKNOWN to business success, renews authority, resets spending or removes an existing expiry. Required-input waits and provider Retry-After/cooldown/UTC limits remain explicit unblock conditions. Scheduled turns cannot self-create, renew/change resilient definitions or self-certify reconciliation through this tool.
 
+## Expired model job retirement
+
+Run this CLI from a verified fixed-release installation (which includes `dist` and bound host peers), or a source checkout after installing its pinned dependencies and running `npm run build`. A raw Git installation without a build is not a runnable offline CLI.
+
+An interactive owner can be retired while an expired definition still records enabled intent. An explicitly authorized **host operator** may use `scripts/retire-expired.mjs` for that exact definition, without impersonating the old session. This is not a new model tool, timer, executor, transfer or general cross-owner management API. Ordinary `schedule_prompt`/TUI foreign-session guards remain unchanged.
+
+```sh
+node scripts/retire-expired.mjs --cwd /canonical/project --job EXACT_ID --expected-owner ORIGINAL_SESSION
+# Only after inspecting the returned exact snapshot, under the existing user authorization:
+node scripts/retire-expired.mjs --cwd /canonical/project --job EXACT_ID --expected-owner ORIGINAL_SESSION --apply --sha256 PREVIEW_SHA256
+```
+
+The narrow port requires schema4 resilient model work, an expired finite definition, idle/no-pending ownership and no ambiguous imported legacy resources. It reads only a bounded 1MiB tail of the original canonical native transcript plus its header; the latest attempt must be a charged, closed model attempt whose checkpoint/receipt and final SDK-close ACK match the store. A later transcript entry, missing/foreign closure or malformed tail refuses retirement. It never calls an SDK open/repair function, resolves credentials or sends a prompt.
+
+Apply uses the existing exclusive store lock, checks the exact preview SHA-256, rechecks native closure, saves a 0600 original-byte backup beside the store and changes **only enabled to false**. Other definitions, owner, continuation, native records, UNKNOWN effects, spending and limits remain intact. This does not release or cancel an owned handle, prove unrelated handles closed, settle effects, grant new work or replenish budgets. Preview/stale/invalid refusal does not write job state; lock contention never breaks the lock. Each apply, including a repeated no-op (`changed:false`), retains one original-byte backup; repeated apply is not background cleanup and should not be polled. The returned backup reference is a basename, not a portable authorization receipt. No background cleanup or automatic call is added.
+
 ## Delayed native continuation
 
 A plain `resolution:"continue"` remains an immediate checkpoint continuation, separate from the recurring cadence. `schedule` and other definition fields are rejected on reconciliation before any resolution is persisted; use add/update to change a definition.

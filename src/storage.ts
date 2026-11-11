@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
+import { inspectExpiredRetirement } from "./expired-retirement.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
 import { continuationDelayNotBefore, instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
 import { nextDue, timingView } from "./timing.js";
@@ -938,6 +939,29 @@ export class CronStorage {
       job.lastStatus = "unknown";
       return true;
     });
+  }
+
+  /** Explicit host-operator maintenance. Ordinary session tools retain their foreign-owner guard. */
+  previewExpiredRetirement(id: string, expectedOwner: string) {
+    const original = fs.readFileSync(this.storePath);
+    const parsed: unknown = JSON.parse(original.toString("utf8")); validate(parsed);
+    const metadata = inspectExpiredRetirement(path.dirname(this.piDir), parsed.jobs.find(job => job.id === id), expectedOwner);
+    return { ...metadata, expectedSha256: createHash("sha256").update(original).digest("hex") };
+  }
+
+  retireExpiredJob(id: string, expectedOwner: string, expectedSha256: string) {
+    if (!validEvidenceFingerprint(expectedSha256)) throw new Error("Retirement requires the exact preview SHA-256");
+    const preview = this.previewExpiredRetirement(id, expectedOwner);
+    if (preview.expectedSha256 !== expectedSha256) throw new Error("Retirement input changed; re-preview without overwriting newer activity");
+    const backupPath = `${this.storePath}.retired-${randomUUID()}.json`;
+    return this.mutate(store => {
+      const job = store.jobs.find(item => item.id === id);
+      // Re-read the original closure while holding the existing store lock.
+      const metadata = inspectExpiredRetirement(path.dirname(this.piDir), job, expectedOwner);
+      const changed = job!.enabled;
+      job!.enabled = false;
+      return { ...metadata, enabled: false, expectedSha256, changed, backupRef: path.basename(backupPath) };
+    }, { expectedSha256, backupPath });
   }
 
   removeJob(id: string, sessionId?: string): boolean {
