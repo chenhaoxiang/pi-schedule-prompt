@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Development installation (source only)
-- Opt into npm12 root-declared URL dependencies at project scope for the existing exact-commit/SRI-pinned pi-intercom test dependency; retain transitive-URL denial, lifecycle-script suppression and global/user policy.
+- Opt into npm12 root-declared URL dependencies at project scope for the existing exact-commit/SRI-pinned pi-intercom test dependency; retain transitive-URL denial and lifecycle-script suppression without modifying user/global config files; environment/CLI precedence remains.
 - Verify fresh dependency installation and synthetic default-deny/root-allow/transitive-deny cases; retain Node22 compatibility and pin npm12.2.2 for the Node26 CI lane. Existing runtime Release assets and installations are unchanged.
 
 ### Maintained fork 0.4.1-fork.22 (2026-11-11; retirement/activation separate)
