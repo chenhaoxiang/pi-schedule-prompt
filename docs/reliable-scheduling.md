@@ -77,6 +77,8 @@ These are source/fixture examples, not an instruction to activate an existing UN
 
 ## Expired model job retirement
 
+Run this CLI from a verified fixed-release installation (which includes `dist` and bound host peers), or a source checkout after installing its pinned dependencies and running `npm run build`. A raw Git installation without a build is not a runnable offline CLI.
+
 An interactive owner can be retired while an expired definition still records enabled intent. An explicitly authorized **host operator** may use `scripts/retire-expired.mjs` for that exact definition, without impersonating the old session. This is not a new model tool, timer, executor, transfer or general cross-owner management API. Ordinary `schedule_prompt`/TUI foreign-session guards remain unchanged.
 
 ```sh
@@ -85,9 +87,9 @@ node scripts/retire-expired.mjs --cwd /canonical/project --job EXACT_ID --expect
 node scripts/retire-expired.mjs --cwd /canonical/project --job EXACT_ID --expected-owner ORIGINAL_SESSION --apply --sha256 PREVIEW_SHA256
 ```
 
-The narrow port requires schema4 resilient model work, an expired finite definition, idle/no-pending ownership and no ambiguous imported legacy resources. It reads only a bounded 1MiB tail of the original canonical native transcript plus its header; the last charged attempt checkpoint/receipt and final SDK-close ACK must match the store. A later transcript entry, missing/foreign closure or malformed tail refuses retirement. It never calls an SDK open/repair function, resolves credentials or sends a prompt.
+The narrow port requires schema4 resilient model work, an expired finite definition, idle/no-pending ownership and no ambiguous imported legacy resources. It reads only a bounded 1MiB tail of the original canonical native transcript plus its header; the latest attempt must be a charged, closed model attempt whose checkpoint/receipt and final SDK-close ACK match the store. A later transcript entry, missing/foreign closure or malformed tail refuses retirement. It never calls an SDK open/repair function, resolves credentials or sends a prompt.
 
-Apply uses the existing exclusive store lock, checks the exact preview SHA-256, rechecks native closure, saves a 0600 original-byte backup beside the store and changes **only enabled to false**. Other definitions, owner, continuation, native records, UNKNOWN effects, spending and limits remain intact. This does not release or cancel an owned handle, prove unrelated handles closed, settle effects, grant new work or replenish budgets. Preview/stale/invalid refusal does not write job state; lock contention never breaks the lock. The returned backup reference is a basename, not a portable authorization receipt. No background cleanup or automatic call is added.
+Apply uses the existing exclusive store lock, checks the exact preview SHA-256, rechecks native closure, saves a 0600 original-byte backup beside the store and changes **only enabled to false**. Other definitions, owner, continuation, native records, UNKNOWN effects, spending and limits remain intact. This does not release or cancel an owned handle, prove unrelated handles closed, settle effects, grant new work or replenish budgets. Preview/stale/invalid refusal does not write job state; lock contention never breaks the lock. Each apply, including a repeated no-op (`changed:false`), retains one original-byte backup; repeated apply is not background cleanup and should not be polled. The returned backup reference is a basename, not a portable authorization receipt. No background cleanup or automatic call is added.
 
 ## Delayed native continuation
 

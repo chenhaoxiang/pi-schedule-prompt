@@ -39,7 +39,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   else try { console.log(JSON.stringify(await runRetirement(process.argv.slice(2)), null, 2)); }
   catch (error) {
     const message = error instanceof Error ? error.message : '';
-    const category = ['arguments', 'busy', 'changed', 'expired', 'scope', 'closure', 'pending'].find(label => message.toLowerCase().includes(label)) ?? 'input-or-closure';
+    const category = error?.code === 'ERR_MODULE_NOT_FOUND' ? 'package-not-built-or-bound'
+      : ['arguments', 'busy', 'changed', 'expired', 'scope', 'closure', 'pending'].find(label => message.toLowerCase().includes(label)) ?? 'input-or-closure';
     // Never echo a parser exception, source JSON, native message or prompt.
     console.error(`expired-retirement-refused (${category}); no recovery/replay or owner transfer attempted`);
     process.exitCode = 2;

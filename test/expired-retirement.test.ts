@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -140,6 +141,13 @@ describe("explicit offline expired-model retirement", () => {
     const result = await runRetirement([...args, "--apply", "--sha256", preview.expectedSha256], load);
     expect(result).toMatchObject({ action: "retire-expired", enabled: false, changed: true, historyRetained: true, ownerChanged: false, effectsReconciled: false, executionStarted: false, sdkCreated: false });
     expect(JSON.stringify(result)).not.toContain("synthetic secret");
+  });
+  it("distinguishes a raw unbuilt checkout from an original closure refusal", () => {
+    const h = fixture(), scripts = path.join(h.cwd, "scripts"); fs.mkdirSync(scripts);
+    fs.copyFileSync("scripts/retire-expired.mjs", path.join(scripts, "retire-expired.mjs"));
+    const run = spawnSync(process.execPath, [path.join(scripts, "retire-expired.mjs"), "--cwd", h.cwd, "--job", "job", "--expected-owner", "retired-owner"], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: h.cwd }, timeout: 15000 });
+    expect(run.status).toBe(2); expect(run.stderr).toContain("package-not-built-or-bound");
+    expect(run.stderr).not.toContain("synthetic secret"); expect(h.storage.getJob("job")?.enabled).toBe(true);
   });
   it.each([
     [], ["--cwd", "/synthetic", "--job", "job", "--expected-owner", "owner", "--apply"],

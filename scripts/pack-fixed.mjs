@@ -22,7 +22,11 @@ for (const [name, version] of Object.entries(pkg.dependencies)) {
   runtimePackages['node_modules/' + name] = production;
 }
 fs.writeFileSync(path.join(root, 'dist/runtime-lock.json'), JSON.stringify({ name: 'pi-schedule-fixed-runtime', version: '1.0.0', lockfileVersion: 3, requires: true, packages: runtimePackages }, null, 2));
-const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--pack-destination', output, '--json'], { cwd: root, encoding: 'utf8' }))[0];
+const response = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--pack-destination', output, '--json'], { cwd: root, encoding: 'utf8' }));
+// npm <=11 returns an array; npm12 keys records by package name. Both must identify one exact package.
+const records = Array.isArray(response) ? response : response && typeof response === 'object' ? Object.values(response) : [];
+if (records.length !== 1 || records[0]?.name !== pkg.name || records[0]?.version !== pkg.version || typeof records[0]?.filename !== 'string' || path.basename(records[0].filename) !== records[0].filename || !Array.isArray(records[0].files)) throw new Error('npm pack did not return one exact fixed package');
+const packed = records[0];
 const hash = data => createHash('sha256').update(data).digest('hex');
 const archive = path.join(output, packed.filename);
 const files = packed.files.map(entry => ({ path: entry.path, size: entry.size, sha256: hash(fs.readFileSync(path.join(root, entry.path))) }));
