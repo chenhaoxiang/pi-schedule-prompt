@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { dailyLimited } from "../src/events.js";
 import { CronScheduler, displaySchedule, formatLocal } from "../src/scheduler.js";
 import type { CronJob } from "../src/types.js";
 
@@ -35,10 +36,12 @@ function makeStorage(seedJobs: CronJob[] = []) {
     admitJob: (id: string) => {
       const job = jobs.get(id);
       if (!job?.enabled) return undefined;
-      if (job.maxRunsPerDay !== undefined && (job.dailyUsage?.attempts ?? 0) >= job.maxRunsPerDay) {
+      if (dailyLimited(job)) {
         job.lastStatus = "skipped";
         return undefined;
       }
+      const day = new Date().toISOString().slice(0, 10);
+      job.dailyUsage = { day, attempts: (job.dailyUsage?.day === day ? job.dailyUsage.attempts : 0) + 1 };
       job.attemptCount = (job.attemptCount ?? job.runCount) + 1;
       job.lastStatus = "unknown";
       return { ...job };
@@ -143,10 +146,57 @@ describe("CronScheduler — idle job lifecycle", () => {
     scheduler.start();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(pi.sendMessage).not.toHaveBeenCalled();
-    storage.updateJob("idle-cap", { dailyUsage: { day: "2026-11-18", attempts: 0 } });
-    await vi.advanceTimersByTimeAsync(2_000);
+    expect(storage.getJob("idle-cap").attemptCount).toBeUndefined();
+    const midnight = new Date("2026-11-19T00:00:00.000Z");
+    expect(scheduler.getNextRun("idle-cap")).toEqual(midnight);
+    // No new user activity is needed. An unrelated turn does not clear the cap.
+    scheduler.onBusy();
+    scheduler.onAgentSettled();
+    expect(scheduler.getNextRun("idle-cap")).toEqual(midnight);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(storage.getJob("idle-cap")).toMatchObject({ attemptCount: 1, dailyUsage: { day: "2026-11-19", attempts: 1 } });
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     scheduler.stop();
+  });
+
+  it("does not consume a stretch when an out-of-band disable makes the deadline ineligible", async () => {
+    const job = exampleJob({ type: "idle", schedule: "1s", intervalMs: 1_000 });
+    const storage = makeStorage([job]);
+    const pi = makePi();
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+    scheduler.start();
+    storage.updateJob(job.id, { enabled: false });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(scheduler.getNextRun(job.id)).toBeNull();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    storage.updateJob(job.id, { enabled: true });
+    scheduler.onBusy();
+    scheduler.onAgentSettled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it.each([undefined, "fixture"]) ("defers a rejected atomic admission in the same stretch (model=%s)", async model => {
+    mockRunSubagentOnce.mockResolvedValue({ ok: true, text: "synthetic result" });
+    const job = exampleJob({ type: "idle", schedule: "1s", intervalMs: 1_000, model });
+    const storage = makeStorage([job]);
+    const admit = vi.spyOn(storage, "admitJob").mockReturnValueOnce(undefined);
+    const pi = makePi();
+    const scheduler = new CronScheduler(storage, pi, makeCtx());
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(admit).toHaveBeenCalledOnce();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(admit).toHaveBeenCalledTimes(2);
+    expect(storage.getJob(job.id).attemptCount).toBe(1);
+    expect(scheduler.getNextRun(job.id)).toBeNull();
+    await scheduler.stop();
   });
 
   it("pauses a due idle job while a blocking dialog is open", async () => {

@@ -111,14 +111,19 @@ export async function run(config) {
   privateDir(config.stateDir);
   const project = validatePins(config);
   const identityFile = path.join(config.stateDir, 'identity.json');
-  try { fs.writeFileSync(identityFile, JSON.stringify({ fingerprint: config.fingerprint }), { flag: 'wx', mode: 0o600 }); }
-  catch (error) { if (error.code !== 'EEXIST' || JSON.parse(fs.readFileSync(identityFile, 'utf8')).fingerprint !== config.fingerprint) throw new Error('State directory already belongs to a different fixed config'); }
+  const identity = { fingerprint: config.fingerprint, agentEnv: project.agentEnv, agentDir: project.agentDir, storePath: project.storePath };
+  try { fs.writeFileSync(identityFile, JSON.stringify(identity), { flag: 'wx', mode: 0o600 }); }
+  catch (error) {
+    let previous;
+    try { previous = JSON.parse(fs.readFileSync(identityFile, 'utf8')); } catch { previous = undefined; }
+    if (error.code !== 'EEXIST' || !previous || previous.fingerprint !== identity.fingerprint || previous.agentEnv !== identity.agentEnv || previous.agentDir !== identity.agentDir || previous.storePath !== identity.storePath) throw new Error('State directory already belongs to a different fixed config/profile/store');
+  }
   const recordFile = path.join(config.stateDir, 'host.json');
   const token = randomBytes(32).toString('hex');
   let owned = false;
   let record = { version: 1, pid: process.pid, childPid: null, fingerprint: config.fingerprint, token };
   const stateFile = path.join(config.stateDir, 'status.json');
-  const state = { version: 1, state: 'starting', ready: false, sessionId: config.sessionId, sourceCommit: config.sourceCommit, packageRoot: config.packageRoot, stateDir: config.stateDir, childPid: null, toolProfile: config.toolProfile ?? 'host-default', toolProfileVerified: null, uiDenied: 0, stderrBytes: 0, jobStatusFresh: false, healthAlerts: [] };
+  const state = { version: 1, state: 'starting', ready: false, sessionId: config.sessionId, sourceCommit: config.sourceCommit, packageRoot: config.packageRoot, stateDir: config.stateDir, agentEnv: project.agentEnv, agentDir: project.agentDir, storePath: project.storePath, childPid: null, toolProfile: config.toolProfile ?? 'host-default', toolProfileVerified: null, uiDenied: 0, stderrBytes: 0, jobStatusFresh: false, healthAlerts: [] };
   try {
     const previous = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     if (previous.sessionId === config.sessionId && previous.sourceCommit === config.sourceCommit && Array.isArray(previous.healthAlerts)) state.healthAlerts = previous.healthAlerts.slice(-20);
