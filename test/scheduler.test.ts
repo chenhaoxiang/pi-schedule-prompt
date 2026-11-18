@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { CronScheduler } from "../src/scheduler.js";
+import { CronScheduler, displaySchedule, formatLocal } from "../src/scheduler.js";
 import type { CronJob } from "../src/types.js";
 
 // Mock the subagent runner: scheduler tests don't actually want to spin up an
@@ -75,6 +75,26 @@ function exampleJob(overrides: Partial<CronJob> = {}): CronJob {
     ...overrides,
   };
 }
+
+describe("Schedule v0.5.1-compatible safety fixes", () => {
+  it("renders one-shot times in local time with an explicit UTC offset", () => {
+    vi.stubEnv("TZ", "Asia/Kolkata");
+    try {
+      const instant = "2026-11-16T12:00:00.000Z";
+      expect(displaySchedule({ type: "once", schedule: instant })).toBe("2026-11-16 17:30:00 +05:30");
+      expect(displaySchedule({ type: "cron", schedule: "0 0 9 * * *" })).toBe("0 0 9 * * *");
+      process.env.TZ = "America/New_York";
+      // The same wall-clock minute occurs twice when DST ends.
+      expect(formatLocal("2026-11-01T05:30:00.000Z")).toBe("2026-11-01 01:30:00 -04:00");
+      expect(formatLocal("2026-11-01T06:30:00.000Z")).toBe("2026-11-01 01:30:00 -05:00");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("accepts 24d and rejects 25d with actionable interval guidance", () => {
+    expect(CronScheduler.validateSchedule("interval", "24d")).toMatchObject({ ok: true });
+    expect(CronScheduler.validateSchedule("interval", "25d")).toMatchObject({ ok: false, error: expect.stringContaining("use a cron expression") });
+  });
+});
 
 describe("CronScheduler — subagent path marker delivery", () => {
   beforeEach(() => {

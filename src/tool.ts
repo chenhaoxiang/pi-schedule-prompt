@@ -5,7 +5,7 @@ import { validateGithub, validEventId, validEvidenceFingerprint } from "./events
 import { nativeCapability } from "./native.js";
 import { isResilient, resilientDefinition } from "./resilient-policy.js";
 import { planScheduledModel } from "./scheduled-model.js";
-import { CronScheduler } from "./scheduler.js";
+import { CronScheduler, displaySchedule, formatLocal } from "./scheduler.js";
 import type { JobScope } from "./settings.js";
 import { summarizeJobs } from "./status.js";
 import { type CronStorage, canCleanupJob } from "./storage.js";
@@ -43,7 +43,9 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Type event uses 1-4 comma-separated event names, not cron. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup, trigger (needs jobId,eventName,eventId), resume (needs jobId, exact settled UNKNOWN/aborted claimId and SHA-256 evidenceFingerprint). Resume creates only a FUTURE continuation; it never replays or marks the old claim successful. maxRunsPerDay counts UTC attempts. Explicit mode=resilient requires native v1, finite maxRuns/expiresAt and a new/prepared schema4 store for session-bound recurring jobs. New resilient intervals default fixed-delay (N after exact safe finish), never silently replacing legacy cadence. Read-only status/preview; drain checkpoints the exact owned handle; reconcile requires either an exact finalized attemptId or migrated legacy claimId/claimBinding, separate SHA-256 effect evidenceFingerprint and resolution from the ordinary owning operator context, not new authority.",
+      "Schedule authorized work for a future time or configured event while Pi is running. This is not an immediate or parallel worker launcher. Without model, dispatch a custom turn in the owning session; with model, use a separate in-process session, not a delegated workflow. Scheduled turns cannot create schedules. " +
+      "add needs both schedule and prompt. Match type: cron (default) uses 6 fields including seconds; once takes +10s or ISO; interval takes a duration such as 5m; event takes 1–4 comma-separated event names. list shows job IDs; status and preview are read-only. remove/enable/disable/update need jobId; trigger needs jobId,eventName,eventId. " +
+      "maxRunsPerDay counts UTC attempts. Explicit mode=resilient requires native v1, finite maxRuns/expiresAt and a prepared schema4 store for session-bound recurring jobs. New resilient intervals default fixed-delay after safe finish; legacy cadence is unchanged. drain addresses the exact owned handle. resume needs jobId, exact settled UNKNOWN/aborted claimId and SHA-256 evidenceFingerprint; it creates future-only continuation. reconcile needs an exact finalized attemptId or migrated claimId/claimBinding, separate SHA-256 effect evidenceFingerprint and the owning operator's resolution; neither action grants new authority or replays old work.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -229,7 +231,7 @@ export function createCronTool(
               content: [
                 {
                   type: "text",
-                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${job.schedule}\nPrompt: ${job.prompt}${modelLine}${policyLine}`,
+                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${displaySchedule(job)}\nPrompt: ${job.prompt}${modelLine}${policyLine}`,
                 },
               ],
               details,
@@ -368,7 +370,10 @@ export function createCronTool(
             if (params.catchUp !== undefined) updates.catchUp = params.catchUp;
             if (params.github !== undefined) updates.github = params.github;
             if (params.expiresAt !== undefined) updates.expiresAt = params.expiresAt;
-            if (params.name) updates.name = params.name;
+            if (params.name && params.name !== job.name) {
+              if (storage.hasJobWithName(params.name)) throw new Error(`A job named "${params.name}" already exists. Please use a different name.`);
+              updates.name = params.name;
+            }
             if (params.prompt) updates.prompt = params.prompt;
             if (params.description !== undefined) updates.description = params.description;
             const model = canonicalModel(params.model ?? (job.enabled ? job.model : undefined));
@@ -428,11 +433,11 @@ export function createCronTool(
             for (const job of jobs) {
               const status = job.enabled ? "✓" : "✗";
               const nextRun = scheduler.getNextRun(job.id);
-              const nextStr = nextRun ? `Next: ${nextRun.toISOString()}` : "";
-              const lastStr = job.lastRun ? `Last: ${job.lastRun}` : "Never run";
+              const nextStr = nextRun ? `Next: ${formatLocal(nextRun)}` : "";
+              const lastStr = job.lastRun ? `Last: ${formatLocal(job.lastRun)}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);
-              lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
+              lines.push(`  Type: ${job.type} | Schedule: ${displaySchedule(job)}`);
               if (isResilient(job)) {
                 lines.push(`  Native ${job.policy.intervalMode ?? "cron / " + job.policy.timezone} | Phase: ${job.runtime.slot.phase} | Reason: ${job.runtime.slot.reason ?? "none"} | Overlap: ${job.policy.overlapPolicy} | Misfire: ${job.policy.misfirePolicy}`);
                 lines.push(`  Work target ms: ${job.policy.workBudgetMs} | Hard elapsed ms: ${job.deadlineMs} | Next cadence: ${job.runtime.nextEligibleAt ?? "none"} | Not before: ${job.runtime.notBefore ?? "none"} | Business outcome: unverified`);
@@ -443,7 +448,7 @@ export function createCronTool(
               if (job.type === "event") lines.push(`  Event restore: ${job.catchUp ?? "none"} | Pending: ${!!job.pendingEvent}`);
               if (job.github) lines.push(`  Selected GitHub: ${JSON.stringify(job.github)}`);
               if (job.model) {
-                lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
+                lines.push(`  Model: ${job.model} (runs in separate session${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
               }
               lines.push(`  Prompt: ${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
@@ -534,7 +539,7 @@ export function createCronTool(
           const status = job.enabled ? theme.fg("success", "✓") : theme.fg("muted", "✗");
           lines.push(`${status} ${theme.fg("text", job.name)} ${theme.fg("dim", `(${job.id})`)}`);
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${job.schedule}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${displaySchedule(job)}`
           );
           if (job.model) {
             const subagentTag = job.notify ? "(subagent, notifies parent)" : "(subagent)";
@@ -546,7 +551,7 @@ export function createCronTool(
           }
           lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
           if (job.lastRun) {
-            lines.push(`  ${theme.fg("dim", "Last run:")} ${job.lastRun}`);
+            lines.push(`  ${theme.fg("dim", "Last run:")} ${formatLocal(job.lastRun)}`);
           }
           lines.push(`  ${theme.fg("dim", "Runs:")} ${job.runCount}`);
         }

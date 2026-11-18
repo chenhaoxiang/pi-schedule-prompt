@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.4.1-fork.23] - 2026-11-18 (selective community v0.5.1 backports; release/activation separate)
+
+- Backport the safe community protections already compatible with the maintained schema4 fork: exact duplicate-name rejection on job update, bounded far-future one-shot re-arming, and actionable interval range validation.
+- Show one-shot/next/last timestamps in local wall-clock time with an explicit UTC offset while retaining UTC ISO persistence.
+- Improve schedule tool guidance without enabling community v0.5.1 idle jobs or changing the fork's per-project store, native guard, UNKNOWN/reconcile or task lifecycle contracts.
+- Defer community v0.5.1 per-project store migration, idle scheduling and broad scheduler lifecycle changes pending a separate compatibility/migration change; no real store or job was migrated.
+
 
 ### Development installation (source only)
 - Opt into npm12 root-declared URL dependencies at project scope for the existing exact-commit/SRI-pinned pi-intercom test dependency; retain transitive-URL denial and lifecycle-script suppression without modifying user/global config files; environment/CLI precedence remains.
