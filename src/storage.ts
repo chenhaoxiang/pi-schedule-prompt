@@ -203,12 +203,14 @@ export class CronStorage {
   private readonly storeDir: string;
   private readonly projectPath: string;
   private readonly legacyStorePath: string;
+  private readonly projectTrusted: boolean;
 
-  constructor(cwd: string, agentDir = getAgentDir()) {
+  constructor(cwd: string, agentDir = getAgentDir(), projectTrusted = true) {
     this.projectPath = canonicalProjectPath(cwd);
     this.storeDir = path.resolve(agentDir, "schedule-prompts", "projects");
     this.storePath = path.join(this.storeDir, `${projectKey(this.projectPath)}.json`);
     this.legacyStorePath = path.join(this.projectPath, CONFIG_DIR_NAME, LEGACY_FILE);
+    this.projectTrusted = projectTrusted;
   }
 
   private readTarget() {
@@ -219,7 +221,7 @@ export class CronStorage {
   }
 
   private assertLegacyResolved(store: CronStore): void {
-    if (!present(this.legacyStorePath)) return;
+    if (!this.projectTrusted || !present(this.legacyStorePath)) return;
     if (!store.legacySourceSha256) throw new Error("Legacy schedule store requires an explicit offline project-store migration; scheduling is held");
     const bytes = readSnapshot(this.legacyStorePath);
     if (!bytes || sha256(bytes) !== store.legacySourceSha256) throw new Error("Legacy schedule store changed after cutover; scheduling is held for reconciliation");

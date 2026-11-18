@@ -118,7 +118,7 @@ export default async function (pi: ExtensionAPI) {
     projectTrusted = ctx.isProjectTrusted?.() === true;
     settings = loadSettings(ctx.cwd, projectTrusted);
     currentSessionId = ctx.sessionManager.getSessionId();
-    storage = new CronStorage(ctx.cwd);
+    storage = new CronStorage(ctx.cwd, undefined, projectTrusted);
     // Do not silently copy a live legacy store during startup. Phase 1 only
     // builds/tests the candidate; phase 2 performs the explicit previewed
     // import after all old writers and native handles are confirmed stopped.
