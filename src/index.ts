@@ -126,6 +126,8 @@ export default async function (pi: ExtensionAPI) {
     widget = new CronWidget(storage, scheduler, pi, isWidgetVisible, ctx.sessionManager.getSessionId());
 
     const serviceSession = process.env.PI_SCHEDULE_SERVICE_SESSION;
+    const serviceStore = process.env.PI_SCHEDULE_SERVICE_STORE_PATH;
+    if (serviceSession && serviceStore && serviceStore !== storage.getStorePath()) throw new Error("Dedicated service selected a different project store; no jobs armed");
     if (serviceSession && (serviceSession !== ctx.sessionManager.getSessionId() || storage.getAllJobs().some(job => job.enabled && (!job.session || (job.session === serviceSession && (!job.durable || !job.maxRuns || !job.expiresAt)))))) {
       throw new Error("Dedicated service requires finite exact session-bound durable schedules");
     }
