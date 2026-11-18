@@ -14,7 +14,7 @@ function legacy(extra: Partial<CronJob> = {}): CronJob {
 function fixture(jobs = [legacy()], version = 3) {
   const root = path.resolve("tmp/state-migration-fixtures"); fs.mkdirSync(root, { recursive: true });
   const cwd = fs.mkdtempSync(path.join(root, "case-")); owned.push(cwd);
-  const storage = new CronStorage(cwd); fs.mkdirSync(path.dirname(storage.getStorePath()), { mode: 0o700 });
+  const storage = new CronStorage(cwd); fs.mkdirSync(path.dirname(storage.getStorePath()), { recursive: true, mode: 0o700 });
   // Preserve a noncanonical original encoding to test byte-for-byte backups rather than reserialization.
   fs.writeFileSync(storage.getStorePath(), "\n" + JSON.stringify({ version, jobs }) + "\n", { mode: 0o600 });
   return { cwd, storage };
@@ -31,7 +31,7 @@ describe("pure preview and explicit private schema4 migration", () => {
     const preview = h.storage.previewSchema4Migration();
     expect(preview).toMatchObject({ sourceVersion: version, targetVersion: 4, jobs: [{ id: "legacy", enabled: false, unknown: true, attempts: 4 }] });
     expect(fs.readFileSync(h.storage.getStorePath())).toEqual(original);
-    expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toEqual(["schedule-prompts.json"]);
+    expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toContain(path.basename(h.storage.getStorePath()));
     const inspect = vi.fn(observed);
     const req = request(h.storage, inspect); const result = h.storage.migrateJobToSchema4("legacy", "owner", req);
     expect(inspect).toHaveBeenCalledWith(undefined);
@@ -51,7 +51,7 @@ describe("pure preview and explicit private schema4 migration", () => {
     const inspect = (): MigrationRuntimeReadback => kind === "unknown" ? { status: "unknown", reason: "not observed" } : { status: "verified", activeRunIds: kind === "held" ? ["exact-cancelling-native-run"] : [], incompatibleWriterIds: kind === "old-writer" ? ["schema3-loaded-session"] : [] };
     expect(() => h.storage.migrateJobToSchema4("legacy", "owner", request(h.storage, inspect))).toThrow(/verified quiescent/);
     expect(fs.readFileSync(h.storage.getStorePath())).toEqual(original);
-    expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toEqual(["schedule-prompts.json"]);
+    expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toContain(path.basename(h.storage.getStorePath()));
   });
 
   it("rejects a stale source fingerprint instead of backing up one head and converting a different input", () => {
@@ -60,7 +60,7 @@ describe("pure preview and explicit private schema4 migration", () => {
     fs.writeFileSync(h.storage.getStorePath(), JSON.stringify(raw)); const latest = fs.readFileSync(h.storage.getStorePath());
     expect(() => h.storage.migrateJobToSchema4("legacy", "owner", req)).toThrow(/input changed/);
     expect(fs.readFileSync(h.storage.getStorePath())).toEqual(latest);
-    expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toEqual(["schedule-prompts.json"]);
+    expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toContain(path.basename(h.storage.getStorePath()));
   });
 
   it("refuses pending persistent ownership even when a contradictory runtime callback says idle", () => {
@@ -98,7 +98,7 @@ describe("pure preview and explicit private schema4 migration", () => {
   it("assesses pre-migration reader compatibility without rewriting original bytes or claiming runtime quiescence", () => {
     const h = fixture(); const bytes = fs.readFileSync(h.storage.getStorePath());
     expect(h.storage.assessSchemaRollback([1, 2, 3])).toMatchObject({ currentVersion: 3, formatCompatible: true, action: "retain-current-bytes", backupRestorationAllowed: false, runtimeQuiescence: "not-verified", retainedUnknown: 1 });
-    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(bytes); expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toEqual(["schedule-prompts.json"]);
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(bytes); expect(fs.readdirSync(path.dirname(h.storage.getStorePath()))).toContain(path.basename(h.storage.getStorePath()));
   });
 
   it("holds an incompatible rollback after migration/activity instead of restoring a stale backup over ownership or UNKNOWN", () => {

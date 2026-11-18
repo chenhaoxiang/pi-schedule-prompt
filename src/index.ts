@@ -5,7 +5,7 @@
  * - A `schedule_prompt` tool for managing scheduled prompts
  * - A widget displaying all scheduled prompts with status
  * - /schedule-prompt command for interactive management
- * - Persistence via .pi/schedule-prompts.json (jobs) and .pi/schedule-prompts-settings.json (settings)
+ * - Persistence: per-project jobs in <agentDir>/schedule-prompts/projects/<sha256(realpath(cwd))>.json; settings in the agent dir and trusted project .pi override
  */
 
 import { randomUUID } from "node:crypto";
@@ -28,6 +28,17 @@ import { runAddFlow } from "./ui/add-flow.js";
 import { CronWidget } from "./ui/cron-widget.js";
 import { JobsView } from "./ui/jobs-view.js";
 
+const SHUTDOWN_TEARDOWN_TIMEOUT_MS = 10_000;
+
+export async function waitForTeardowns(pending: Set<Promise<void>>, ms: number): Promise<void> {
+  if (!pending.size) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), ms); });
+  const outcome = await Promise.race([Promise.allSettled([...pending]).then(() => "done" as const), timeout]);
+  clearTimeout(timer);
+  if (outcome === "timeout") console.warn(`[pi-schedule-prompt] Subagent teardown did not finish within ${ms}ms; exiting anyway.`);
+}
+
 export default async function (pi: ExtensionAPI) {
   let storage: CronStorage;
   let scheduler: CronScheduler;
@@ -35,6 +46,9 @@ export default async function (pi: ExtensionAPI) {
   let eventServer: Server | undefined;
   let generation = 0;
   let currentSessionId = "";
+  const pendingTeardowns = new Set<Promise<void>>();
+  let projectTrusted = false;
+  const notPersistedReason = () => (projectTrusted ? "failed to persist" : "project not trusted");
   // Refreshed in initializeSession; mutated by Settings submenu. The tool and
   // widget read via closure so toggles take effect without re-registering.
   let settings: ScheduleSettings = {};
@@ -101,13 +115,19 @@ export default async function (pi: ExtensionAPI) {
     // accumulating duplicate fires for every recurring job over time.
     cleanupSession(ctx);
 
-    settings = loadSettings(ctx.cwd);
+    projectTrusted = ctx.isProjectTrusted?.() === true;
+    settings = loadSettings(ctx.cwd, projectTrusted);
     currentSessionId = ctx.sessionManager.getSessionId();
-    storage = new CronStorage(ctx.cwd);
+    storage = new CronStorage(ctx.cwd, undefined, projectTrusted);
+    // Do not silently copy a live legacy store during startup. Phase 1 only
+    // builds/tests the candidate; phase 2 performs the explicit previewed
+    // import after all old writers and native handles are confirmed stopped.
     scheduler = new CronScheduler(storage, pi, ctx);
     widget = new CronWidget(storage, scheduler, pi, isWidgetVisible, ctx.sessionManager.getSessionId());
 
     const serviceSession = process.env.PI_SCHEDULE_SERVICE_SESSION;
+    const serviceStore = process.env.PI_SCHEDULE_SERVICE_STORE_PATH;
+    if (serviceSession && serviceStore && serviceStore !== storage.getStorePath()) throw new Error("Dedicated service selected a different project store; no jobs armed");
     if (serviceSession && (serviceSession !== ctx.sessionManager.getSessionId() || storage.getAllJobs().some(job => job.enabled && (!job.session || (job.session === serviceSession && (!job.durable || !job.maxRuns || !job.expiresAt)))))) {
       throw new Error("Dedicated service requires finite exact session-bound durable schedules");
     }
@@ -129,7 +149,9 @@ export default async function (pi: ExtensionAPI) {
     eventServer = undefined;
     // Stop scheduler
     if (scheduler) {
-      scheduler.stop();
+      const stopped = scheduler.stop();
+      pendingTeardowns.add(stopped);
+      void stopped.finally(() => pendingTeardowns.delete(stopped));
     }
 
     // Hide widget
@@ -172,6 +194,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     cleanupSession(ctx);
+    await waitForTeardowns(pendingTeardowns, SHUTDOWN_TEARDOWN_TIMEOUT_MS);
   });
 
   // Only our legacy hook is detached, and only after actual native input/budget protection is negotiated.
@@ -207,6 +230,13 @@ export default async function (pi: ExtensionAPI) {
     scheduler?.setScheduledTurn(scheduled);
     scheduler?.onScheduledStart(details?.claimId);
   });
+  // A run is not idle at agent_end: Core can retry or drain queued prompts
+  // before agent_settled. Extension-generated input isn't user activity.
+  pi.on("agent_start", () => { scheduler?.onBusy(); });
+  pi.on("input", event => { if (event.source !== "extension") scheduler?.onUserInput(); });
+  pi.on("user_bash", () => { scheduler?.onUserActivity(); });
+  pi.on("ui_prompt_start", event => { scheduler?.onPromptStart(event.kind); });
+  pi.on("ui_prompt_end", event => { scheduler?.onPromptEnd(event.kind); });
   pi.on("message_end", event => { scheduler?.onMessageEnd(event.message); });
   pi.on("agent_settled", event => {
     // Core commits/closes the exact native receipt before agent_settled; restoration cannot taint that run.
@@ -404,10 +434,14 @@ export default async function (pi: ExtensionAPI) {
           // otherwise it sits on top of them and steals input.
           let jobsOverlay: OverlayHandle | undefined;
           const wrappedRunAdd = async () => {
+            const ownScheduler = scheduler;
             jobsOverlay?.setHidden(true);
+            // Pi reports dialogs nested within a custom overlay as part of it.
+            ownScheduler.pauseForDialog();
             try {
-              await runAddFlow(ctx, storage, scheduler, settings, mySessionId);
+              await runAddFlow(ctx, storage, ownScheduler, settings, mySessionId);
             } finally {
+              ownScheduler.resumeAfterDialog();
               jobsOverlay?.setHidden(false);
               jobsOverlay?.focus();
             }
@@ -450,10 +484,10 @@ export default async function (pi: ExtensionAPI) {
               const next = !isWidgetVisible();
               settings = { ...settings, widgetVisible: next };
               next ? widget.show(ctx) : widget.hide(ctx);
-              const persisted = saveSettings(ctx.cwd, { widgetVisible: next });
+              const persisted = saveSettings(ctx.cwd, { widgetVisible: next }, projectTrusted);
               if (!persisted) {
                 ctx.ui.notify(
-                  `Widget ${next ? "shown" : "hidden"} (session only; failed to persist)`,
+                  `Widget ${next ? "shown" : "hidden"} (session only; ${notPersistedReason()})`,
                   "warning",
                 );
               }
@@ -461,10 +495,10 @@ export default async function (pi: ExtensionAPI) {
               // Affects newly-created jobs only; existing jobs keep their binding.
               const next = bound ? "workdir" : "session";
               settings = { ...settings, defaultJobScope: next };
-              const persisted = saveSettings(ctx.cwd, { defaultJobScope: next });
+              const persisted = saveSettings(ctx.cwd, { defaultJobScope: next }, projectTrusted);
               if (!persisted) {
                 ctx.ui.notify(
-                  `Bind new jobs to session: ${next === "session" ? "yes" : "no"} (session only; failed to persist)`,
+                  `Bind new jobs to session: ${next === "session" ? "yes" : "no"} (session only; ${notPersistedReason()})`,
                   "warning",
                 );
               }

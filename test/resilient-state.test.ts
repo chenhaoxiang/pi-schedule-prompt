@@ -15,7 +15,7 @@ function fixture(jobs: CronJob[] = [seed()], version = 4) {
   fs.mkdirSync(root, { recursive: true });
   const cwd = fs.mkdtempSync(path.join(root, "case-")); ownedDirs.push(cwd);
   const storage = new CronStorage(cwd);
-  fs.mkdirSync(path.dirname(storage.getStorePath()), { mode: 0o700 });
+  fs.mkdirSync(path.dirname(storage.getStorePath()), { recursive: true, mode: 0o700 });
   // Deliberate synthetic schema4 input. No production migration or live store is touched.
   fs.writeFileSync(storage.getStorePath(), JSON.stringify({ version, jobs }, null, 2), { mode: 0o600 });
   return { cwd, storage };
@@ -289,7 +289,7 @@ describe("versioned resilient store and exact ownership", () => {
     fs.writeFileSync(script, `import { CronStorage } from ${JSON.stringify(fileURLToPath(new URL("../src/storage.ts", import.meta.url)))};\nconst store = new CronStorage(process.argv[2]);\nprocess.send({ready:true});\nprocess.once('message', () => { let status; try { status = store.reserveResilient('job','owner',process.argv[3],1,'tick-1',Number(process.argv[4])) ? 'owned' : 'held'; } catch (e) { status = e.constructor.name === 'ScheduleStoreBusyError' ? 'busy' : 'error:' + e.message; } process.send({status}, () => process.exit(0)); });\n`);
     fs.mkdirSync(path.join(h.cwd, "home")); fs.mkdirSync(path.join(h.cwd, "os-tmp"));
     const loader = fileURLToPath(new URL("../node_modules/tsx/dist/loader.mjs", import.meta.url));
-    const workers = ["worker-a", "worker-b"].map(instance => fork(script, [h.cwd, instance, String(now)], { execArgv: ["--import", loader], stdio: ["ignore", "ignore", "pipe", "ipc"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: path.join(h.cwd, "home"), TMPDIR: path.join(h.cwd, "os-tmp"), TZ: "UTC" } }));
+    const workers = ["worker-a", "worker-b"].map(instance => fork(script, [h.cwd, instance, String(now)], { execArgv: ["--import", loader], stdio: ["ignore", "ignore", "pipe", "ipc"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: path.join(h.cwd, "home"), PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, TMPDIR: path.join(h.cwd, "os-tmp"), TZ: "UTC" } }));
     try {
       const readiness = workers.map(worker => new Promise<void>((resolve, reject) => { worker.once("error", reject); worker.once("message", () => resolve()); worker.once("exit", code => { if (code !== 0) reject(new Error("fixture worker startup failed")); }); }));
       await Promise.all(readiness);

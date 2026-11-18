@@ -76,6 +76,8 @@ export class JobsView implements Component {
 
   handleInput(data: string): void {
     try {
+      // A passive overlay doesn't pause idle jobs. Actual keys postpone the due time.
+      this.scheduler.onUserPresent?.();
       this.operationError = undefined;
       if (this.confirm) this.handleConfirmInput(data);
       else this.handleNormalInput(data);

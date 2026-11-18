@@ -21,7 +21,7 @@ function fixture(extra: Partial<CronJob> = {}, policy: Partial<ResilientPolicy> 
   const root = path.resolve("tmp/resilient-scheduler-fixtures"); fs.mkdirSync(root, { recursive: true });
   const cwd = fs.mkdtempSync(path.join(root, "case-")); directories.push(cwd);
   const storage = new CronStorage(cwd); const job = seed(extra, policy);
-  fs.mkdirSync(path.dirname(storage.getStorePath()), { mode: 0o700 });
+  fs.mkdirSync(path.dirname(storage.getStorePath()), { recursive: true, mode: 0o700 });
   fs.writeFileSync(storage.getStorePath(), JSON.stringify({ version: 4, jobs: [job] }), { mode: 0o600 });
   const entries = new Map<string, any>();
   const runs: Array<{ request: Parameters<NativeCapability["start"]>[0]; handle: NativeRunHandle; state: NativeRunSnapshot; close: (execution?: NativeExecutionProof["execution"], effectStatus?: NativeExecutionProof["effectStatus"], reason?: string, retryNotBefore?: string) => void }> = [];

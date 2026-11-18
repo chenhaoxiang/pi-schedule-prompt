@@ -22,11 +22,12 @@ function job(overrides: Partial<CronJob> = {}): CronJob {
     runCount: 0, session: "owner", ...overrides };
 }
 function harness(seed = job()) {
-  const storage = new CronStorage(fixture());
+  const cwd = fixture();
+  const storage = new CronStorage(cwd);
   storage.addJob(seed);
   let idle = false;
   const pi = { sendMessage: vi.fn(), sendUserMessage: vi.fn(), events: { emit: vi.fn() } };
-  const ctx = { cwd: path.dirname(path.dirname(storage.getStorePath())),
+  const ctx = { cwd,
     isIdle: () => idle, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "owner" } };
   const scheduler = new CronScheduler(storage, pi as any, ctx as any);
@@ -199,7 +200,7 @@ describe("storage and session management", () => {
 
   it("preserves corrupted bytes instead of silently overwriting an empty store", () => {
     const storage = new CronStorage(fixture());
-    fs.mkdirSync(path.dirname(storage.getStorePath()));
+    fs.mkdirSync(path.dirname(storage.getStorePath()), { recursive: true });
     fs.writeFileSync(storage.getStorePath(), "not-json");
     expect(() => storage.addJob(job())).toThrow();
     expect(fs.readFileSync(storage.getStorePath(), "utf8")).toBe("not-json");

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, UIPromptKind } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import { budgetPrompt, DurableExecution } from "./durable.js";
 import { dailyLimited, eventBinding, eventNames } from "./events.js";
@@ -17,6 +17,9 @@ type ValidateScheduleResult =
   | { ok: true; schedule: string; intervalMs?: number }
   | { ok: false; error: string };
 const MAX_DELAY = 2_147_483_647;
+const IDLE_RETRY_MS = 5_000;
+const USER_TURN_START_WINDOW_MS = 5_000;
+type IdleRegistration = { job: CronJob; since: number; retryAfter?: number };
 // Captured when this module actually loads, not inferred from a later disk selection.
 const loadedPackage = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
 const receiptUrl = new URL("../.install-receipt.json", import.meta.url);
@@ -61,6 +64,18 @@ export class CronScheduler {
   private scheduledTurn = false;
   private durable: DurableExecution;
   private resilient: ResilientScheduling;
+  /** Enabled idle jobs and the time each was scheduled. */
+  private idleJobs = new Map<string, IdleRegistration>();
+  /** Armed idle timers; empty while Pi is busy or a blocking prompt is open. */
+  private idleTimers = new Map<string, { timer: NodeJS.Timeout; fireAt: number }>();
+  private lastUserActivity = Date.now();
+  private userTurnPendingUntil = 0;
+  private userRun = false;
+  private busy = false;
+  private blockingDialogs = 0;
+  private firedThisStretch = new Set<string>();
+  private inlineFireAt = Number.NEGATIVE_INFINITY;
+  private inflightSubagents = new Set<Promise<void>>();
 
   constructor(
     private readonly storage: CronStorage,
@@ -142,10 +157,169 @@ export class CronScheduler {
     }
   }
 
+  /** User/host lifecycle signals used only by community idle jobs. */
+  onBusy(): void {
+    this.busy = true;
+    this.inlineFireAt = Number.NEGATIVE_INFINITY;
+    if (!this.scheduledTurn && this.userTurnPendingUntil && Date.now() <= this.userTurnPendingUntil) this.userRun = true;
+    this.userTurnPendingUntil = 0;
+    this.disarmIdleJobs();
+  }
+
+  onAgentSettled(aborted = false): void {
+    this.busy = false;
+    this.inlineFireAt = Number.NEGATIVE_INFINITY;
+    if (this.userRun || aborted) this.lastUserActivity = Date.now();
+    this.userRun = false;
+    this.rearmIdleJobs();
+    this.durable.settled(aborted);
+    this.drain();
+  }
+
+  onUserInput(): void {
+    if (this.busy) this.userRun = true;
+    else this.userTurnPendingUntil = Date.now() + USER_TURN_START_WINDOW_MS;
+    this.onUserActivity();
+  }
+
+  onUserActivity(): void {
+    this.firedThisStretch.clear();
+    this.onUserPresent();
+  }
+
+  /** UI activity/possible dialog timeout postpone without rearming a job that already fired. */
+  onUserPresent(): void {
+    this.lastUserActivity = Date.now();
+    this.rearmIdleJobs();
+  }
+
+  onPromptStart(kind: UIPromptKind): void {
+    if (kind !== "custom") this.pauseForDialog();
+  }
+
+  pauseForDialog(): void {
+    this.blockingDialogs++;
+    this.disarmIdleJobs();
+  }
+
+  resumeAfterDialog(): void {
+    this.blockingDialogs = Math.max(0, this.blockingDialogs - 1);
+    this.onUserPresent();
+  }
+
+  onPromptEnd(kind: UIPromptKind): void {
+    if (kind === "custom") this.onUserPresent();
+    else this.resumeAfterDialog();
+  }
+
+  private rearmIdleJobs(): void {
+    const before = this.idleTimerSnapshot();
+    for (const entry of this.idleJobs.values()) this.armIdleJob(entry);
+    if (this.idleTimerSnapshot() !== before) this.emitChange({ type: "update" });
+  }
+
+  private disarmIdleJobs(): void {
+    if (!this.idleTimers.size) return;
+    this.clearIdleTimers();
+    this.emitChange({ type: "update" });
+  }
+
+  private idleTimerSnapshot(): string {
+    return [...this.idleTimers].map(([id, value]) => `${id}@${value.fireAt}`).join(",");
+  }
+
+  private idleDue(entry: IdleRegistration): number {
+    return Math.max(Math.max(this.lastUserActivity, entry.since) + entry.job.intervalMs!, entry.retryAfter ?? 0);
+  }
+
+  private armIdleJob(entry: IdleRegistration): void {
+    const { job } = entry;
+    if (this.stopped || this.busy || this.blockingDialogs || !job.intervalMs || this.firedThisStretch.has(job.id)) return;
+    const fireAt = this.idleDue(entry);
+    if (this.idleTimers.get(job.id)?.fireAt === fireAt) return;
+    this.clearIdleTimer(job.id);
+    this.setIdleTimer(job, fireAt, fireAt - Date.now());
+  }
+
+  private canSubmitIdle(id: string): boolean {
+    return !this.stopped && !this.busy && !this.blockingDialogs && (this.ctx.isIdle?.() ?? true) && !this.ctx.hasPendingMessages?.() &&
+      !this.durable.busy() && !this.activeJobs.has(id) && Date.now() - this.inlineFireAt >= IDLE_RETRY_MS;
+  }
+
+  private setIdleTimer(job: CronJob, fireAt: number, delay: number): void {
+    const timer = setTimeout(() => {
+      if (this.stopped || this.idleTimers.get(job.id)?.timer !== timer) return;
+      this.idleTimers.delete(job.id);
+      // Also protect against a backward clock jump and Pi preflight/compaction without agent_start.
+      if (fireAt > Date.now()) { this.setIdleTimer(job, fireAt, fireAt - Date.now()); return; }
+      if (!this.canSubmitIdle(job.id)) { this.setIdleTimer(job, fireAt, IDLE_RETRY_MS); return; }
+      this.pending.add(job.id);
+      this.drain();
+    }, Math.min(MAX_DELAY, Math.max(1, delay)));
+    timer.unref?.();
+    this.idleTimers.set(job.id, { timer, fireAt });
+  }
+
+  /** A deferred/locked idle intent must still belong to this inactivity stretch at admission. */
+  private idleAdmissible(id: string, entry: IdleRegistration): boolean {
+    const fireAt = this.idleDue(entry);
+    if (this.canSubmitIdle(id) && fireAt <= Date.now() && !this.firedThisStretch.has(id)) return true;
+    this.pending.delete(id);
+    if (!this.stopped && !this.busy && !this.blockingDialogs && !this.firedThisStretch.has(id)) {
+      this.clearIdleTimer(id);
+      this.setIdleTimer(entry.job, fireAt, fireAt > Date.now() ? fireAt - Date.now() : IDLE_RETRY_MS);
+    }
+    return false;
+  }
+
+  private clearIdleTimer(id: string): void {
+    const idle = this.idleTimers.get(id);
+    if (idle) { clearTimeout(idle.timer); this.idleTimers.delete(id); }
+  }
+
+  private consumeIdle(id: string): void {
+    if (this.idleJobs.has(id)) {
+      this.firedThisStretch.add(id);
+      this.clearIdleTimer(id);
+    }
+  }
+
+  private retryIdleAdmission(id: string): void {
+    this.pending.delete(id);
+    const entry = this.idleJobs.get(id);
+    if (!entry || this.firedThisStretch.has(id)) return;
+    this.clearIdleTimer(id);
+    const job = this.storage.getJob(id);
+    if (job?.type !== "idle" || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) {
+      this.unscheduleJob(id);
+      return;
+    }
+    if (!job.enabled || job.lastStatus === "unknown" || job.lastStatus === "running") {
+      // No pending timer and no consumption. A live re-enable can be observed
+      // on the next lifecycle signal; UNKNOWN is never automatically replayed.
+      this.emitChange({ type: "update", job });
+      return;
+    }
+    if (job.schedule !== entry.job.schedule || job.intervalMs !== entry.job.intervalMs) {
+      this.updateJob(id, job);
+      return;
+    }
+    const now = Date.now();
+    const quietUntil = job.quietOnNoChange ? Date.parse(job.quietUntil ?? "") : NaN;
+    entry.retryAfter = dailyLimited(job, now) ? new Date(now).setUTCHours(24, 0, 0, 0)
+      : quietUntil > now ? quietUntil : now + IDLE_RETRY_MS;
+    this.armIdleJob(entry);
+    this.emitChange({ type: "update", job });
+  }
+
+  private clearIdleTimers(): void {
+    for (const { timer } of this.idleTimers.values()) clearTimeout(timer);
+    this.idleTimers.clear();
+  }
+
   setScheduledTurn(value: boolean): void { this.scheduledTurn = value; }
   isScheduledTurn(): boolean { return this.scheduledTurn; }
   isRunning(): boolean { return !this.stopped; }
-  onAgentSettled(aborted = false): void { this.durable.settled(aborted); this.drain(); }
   onScheduledStart(claimId: unknown): void { this.durable.started(claimId); }
   recordProgress(progress: { jobId: string; claimId: string; progress: "advanced" | "unchanged" | "unknown"; evidenceFingerprint: string; waitingReason?: string }): boolean {
     return this.durable.recordProgress(progress);
@@ -175,7 +349,7 @@ export class CronScheduler {
       loadedSchedule: { name: loadedPackage.name, version: loadedPackage.version, sourceSha: loadedInstall?.sourceSha ?? null, boundSdkVersion: loadedInstall?.hostVersion ?? null, moduleUrl: import.meta.url, commandPath: this.pi.getCommands?.().find(command => command.name === "schedule-host-status")?.sourceInfo?.path ?? null, readerSchemas: [1, 2, 3, 4], reconcileDelayedVersion: 1 },
       actualCoreVersion: "not-exposed", nativeCapabilityVersion: capability?.version ?? null, unattendedInputGuardVersion: capability?.unattendedInputGuardVersion ?? null, native,
       coreIdle: this.ctx.isIdle?.() ?? null, pendingMessages: this.ctx.hasPendingMessages?.() ?? null, effectiveTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      registered: { running: !this.stopped, scheduledTurn: this.scheduledTurn, legacyDurableBusy: this.durable.busy(), activeLegacyJobCount: this.activeJobs.size, activeLegacyModelControllerCount: this.activeSubagents.size, resilientJobIds: this.resilient.registeredJobIds().slice(0, 20), pendingJobCount: this.pending.size },
+      registered: { running: !this.stopped, scheduledTurn: this.scheduledTurn, legacyDurableBusy: this.durable.busy(), activeLegacyJobCount: this.activeJobs.size, activeLegacyModelControllerCount: this.activeSubagents.size, legacyModelRunsIncludingTeardown: this.inflightSubagents.size, idleJobCount: this.idleJobs.size, armedIdleCount: this.idleTimers.size, resilientJobIds: this.resilient.registeredJobIds().slice(0, 20), pendingJobCount: this.pending.size },
       untrackedSdkHandles: "not-observed", closureEvidence: "This is registered scheduler/native metadata only, not proof that unrelated or untracked SDK/delegated handles closed.",
     };
   }
@@ -204,8 +378,15 @@ export class CronScheduler {
     return { job: updated, changed };
   }
 
-  stop(): void {
+  stop(): Promise<void> {
     this.stopped = true;
+    this.clearIdleTimers();
+    this.idleJobs.clear();
+    this.firedThisStretch.clear();
+    this.lastUserActivity = Date.now();
+    this.userRun = this.busy = false;
+    this.blockingDialogs = this.userTurnPendingUntil = 0;
+    this.inlineFireAt = Number.NEGATIVE_INFINITY;
     this.resilient.stop();
     this.durable.stop();
     for (const cron of this.jobs.values()) cron.stop();
@@ -224,6 +405,7 @@ export class CronScheduler {
     this.activeSubagents.clear();
     this.activeJobs.clear();
     this.scheduledTurn = false;
+    return Promise.allSettled([...this.inflightSubagents]).then(() => {});
   }
 
   resumeFutureJob(id: string, claimId: string, evidenceFingerprint: string): { job: CronJob; created: boolean } {
@@ -248,11 +430,16 @@ export class CronScheduler {
   updateJob(id: string, updated: CronJob): void {
     const source = this.githubSources.get(id);
     const seedOnly = source?.seedOnly === true && source.binding === eventBinding(updated);
+    const idleSince = this.idleJobs.get(id)?.since;
+    const alreadyFired = this.firedThisStretch.has(id);
     this.unscheduleJob(id);
     if (this.activeJobs.has(id)) this.storage.updateJob(id, { lastStatus: "unknown" });
     const prepared = this.prepareModel(updated);
     if (!prepared) return;
-    if (!this.stopped && prepared.enabled && CronScheduler.isLoadedFor(prepared, this.ctx.sessionManager.getSessionId())) this.scheduleJob(prepared, seedOnly);
+    if (!this.stopped && prepared.enabled && CronScheduler.isLoadedFor(prepared, this.ctx.sessionManager.getSessionId())) {
+      if (prepared.type === "idle" && alreadyFired) this.firedThisStretch.add(id);
+      this.scheduleJob(prepared, seedOnly, idleSince);
+    }
     this.emitChange({ type: "update", job: prepared });
   }
 
@@ -291,7 +478,8 @@ export class CronScheduler {
   }
 
   getNextRun(id: string): Date | null {
-    return this.jobs.get(id)?.nextRun() || this.nextRuns.get(id) || this.resilient.nextRun(id) || null;
+    const idle = this.idleTimers.get(id);
+    return idle ? new Date(Math.max(idle.fireAt, Date.now())) : this.jobs.get(id)?.nextRun() || this.nextRuns.get(id) || this.resilient.nextRun(id) || null;
   }
 
   // A persisted interval deadline can be far away after a clock rollback even
@@ -307,12 +495,19 @@ export class CronScheduler {
     this.intervals.set(id, timer);
   }
 
-  private scheduleJob(job: CronJob, seedGithubOnly = false): void {
+  private scheduleJob(job: CronJob, seedGithubOnly = false, idleSince?: number): void {
     if (isResilient(job)) { this.resilient.schedule(job); return; }
     try {
       if (job.type === "event") {
         eventNames(job.schedule);
         if (job.github) this.scheduleGithub(job.id, 0, seedGithubOnly);
+        return;
+      }
+      if (job.type === "idle") {
+        if (!job.intervalMs || !Number.isSafeInteger(job.intervalMs) || job.intervalMs > MAX_DELAY) throw new Error("Idle duration must be positive and at most 2147483647 milliseconds");
+        const entry = { job, since: idleSince ?? Date.now() };
+        this.idleJobs.set(job.id, entry);
+        this.armIdleJob(entry);
         return;
       }
       if (job.type === "interval") {
@@ -408,6 +603,9 @@ export class CronScheduler {
     const timer = this.intervals.get(id);
     if (timer) clearTimeout(timer);
     this.intervals.delete(id);
+    this.clearIdleTimer(id);
+    this.idleJobs.delete(id);
+    this.firedThisStretch.delete(id);
     this.resilient.stopJob(id);
     this.nextRuns.delete(id);
     this.pending.delete(id);
@@ -448,6 +646,7 @@ export class CronScheduler {
     if (this.stopped || !this.profileAllowsAdmission()) return;
     const stored = this.storage.getJob(id);
     if (!stored?.enabled || !CronScheduler.isLoadedFor(stored, this.ctx.sessionManager.getSessionId())) return;
+    if (stored.type === "idle" && (stored.lastStatus === "unknown" || stored.lastStatus === "running")) return;
     // A separately constructed model SDK has a distinct tool registry/loadout.
     if (process.env.PI_SCHEDULE_SERVICE_TOOL_PROFILE && stored.model) { this.stop(); return; }
     const job = this.prepareModel(stored);
@@ -520,11 +719,21 @@ export class CronScheduler {
     if (this.durable.busy()) { this.armDrain(); return; }
     for (const id of this.pending) {
       if (this.activeJobs.has(id) || this.resilient.isOwned(id)) continue;
+      const idle = this.idleJobs.get(id);
       let admitted = false;
       let selected: CronJob | undefined;
       try {
+        if (idle && !this.idleAdmissible(id, idle)) continue;
         const eligible = this.eligible(id);
         selected = eligible;
+        if (idle && eligible && (eligible.type !== "idle" || eligible.schedule !== idle.job.schedule || eligible.intervalMs !== idle.job.intervalMs)) {
+          this.updateJob(id, eligible);
+          continue;
+        }
+        if (idle && !eligible) {
+          this.retryIdleAdmission(id);
+          continue;
+        }
         // Only inline work needs the parent turn; keep it queued without starving
         // later independent model jobs or spending an inline attempt.
         if (eligible && parentBusy && !eligible.model) continue;
@@ -541,16 +750,20 @@ export class CronScheduler {
           return;
         }
         if (eligible?.durable && this.activeJobs.size) { this.pending.add(id); this.armDrain(); return; }
-        const job = eligible && (eligible.durable ? this.durable.begin(id) : this.storage.admitJob(id, this.ctx.sessionManager.getSessionId()));
+        const job = eligible && (eligible.durable ? this.durable.begin(id) : this.storage.admitJob(id, this.ctx.sessionManager.getSessionId(), idle ? eligible.revision ?? 0 : undefined));
+        if (!job && idle) this.retryIdleAdmission(id);
         if (!job && eligible?.durable && this.storage.getAllJobs().some(other => other.claim && other.claim.sessionId === eligible.session && other.claim.phase !== "settled")) this.pending.add(id);
         if (job) {
           admitted = true;
+          if (idle) this.consumeIdle(id);
           this.contention.delete(id);
           const attempts = job.attemptCount!;
           if (job.followUp && job.claim) {
             this.dispatchFollowUp(job);
           } else {
-            // Admission is persisted before a potentially effectful send.
+            // Admission is persisted before a potentially effectful send. Idle
+            // timers must not inject a second prompt while this one is in preflight.
+            this.inlineFireAt = Date.now();
             this.pi.sendMessage({
               customType: "scheduled_prompt", content: promptFor(job), display: true,
               details: { jobId: id, jobName: job.name, prompt: job.prompt, mode: "inline", ...(job.claim ? { claimId: job.claim.id } : {}) },
@@ -631,9 +844,21 @@ export class CronScheduler {
   private executeJobInSubagent(snapshot: CronJob): void {
     if (this.activeJobs.has(snapshot.id) || this.stopped) return;
     const eligible = this.eligible(snapshot.id);
-    if (!eligible?.model) return;
-    const job = eligible.durable ? this.durable.begin(eligible.id) : this.storage.admitJob(eligible.id, this.ctx.sessionManager.getSessionId());
-    if (!job) return;
+    const idle = snapshot.type === "idle";
+    if (!eligible?.model || (idle && eligible.type !== "idle")) {
+      if (idle) this.retryIdleAdmission(snapshot.id);
+      return;
+    }
+    if (idle && (eligible.intervalMs !== snapshot.intervalMs || eligible.schedule !== snapshot.schedule)) {
+      this.updateJob(snapshot.id, eligible);
+      return;
+    }
+    const job = eligible.durable ? this.durable.begin(eligible.id) : this.storage.admitJob(eligible.id, this.ctx.sessionManager.getSessionId(), idle ? eligible.revision ?? 0 : undefined);
+    if (!job) {
+      if (idle) this.retryIdleAdmission(eligible.id);
+      return;
+    }
+    if (idle) this.consumeIdle(eligible.id);
     const model = job.model!;
     const attempts = job.attemptCount!;
     if (!job.durable) this.storage.updateJob(job.id, { lastStatus: "running", attemptCount: attempts,
@@ -648,7 +873,7 @@ export class CronScheduler {
     this.activeSubagents.add(controller);
     this.activeJobs.set(job.id, controller);
     if (job.claim) { this.durable.setAbort(job.claim.id, () => controller.abort()); this.durable.started(job.claim.id); }
-    void (async () => {
+    const run = (async () => {
       try {
         const result = await runSubagentOnce(this.ctx, promptFor(job), model, controller.signal,
           { extensions: job.extensions, skills: job.skills });
@@ -674,14 +899,23 @@ export class CronScheduler {
         } catch (error) {
           console.error("Failed to post " + (result.ok ? "subagent_done" : "subagent_error") + " marker for job " + job.id + ":", error);
         }
-      } catch (error) { if (job.durable) this.durable.finish("unknown"); this.fail(job.id, error); }
-      finally {
+      } catch (error) {
+        if (!controller.signal.aborted && !this.stopped && generation === (this.generations.get(job.id) ?? 0)) {
+          if (job.durable) this.durable.finish("unknown");
+          this.fail(job.id, error);
+        }
+      } finally {
         this.activeSubagents.delete(controller);
         if (this.activeJobs.get(job.id) === controller) this.activeJobs.delete(job.id);
         if (job.claim) this.durable.release(job.claim.id);
         this.drain();
       }
     })();
+    this.inflightSubagents.add(run);
+    void run.then(() => this.inflightSubagents.delete(run), () => {
+      this.inflightSubagents.delete(run);
+      console.error("Scheduled model teardown could not be confirmed");
+    });
   }
 
   private deferContention(id: string): void {
@@ -793,16 +1027,17 @@ export class CronScheduler {
    * - `cron`: validates the 6-field expression
    * - `once`: accepts ISO timestamps and relative time (`+10s`); rejects past
    *   timestamps and ones <5s away (the agent should use relative time instead)
-   * - `interval`: accepts duration strings (`5m`, `1h`, `30s`)
+   * - `interval` and `idle`: accept duration strings (`5m`, `1h`, `30s`)
    */
   static validateSchedule(type: CronJobType, schedule: string): ValidateScheduleResult {
     if (type === "event") {
       try { return { ok: true, schedule: eventNames(schedule).join(",") }; }
       catch (error) { return { ok: false, error: error instanceof Error ? error.message : "Invalid event schedule" }; }
     }
-    if (type === "interval") {
+    if (type === "interval" || type === "idle") {
       const intervalMs = CronScheduler.parseInterval(schedule);
       if (!intervalMs) {
+        if (type === "idle") return { ok: false, error: "Idle duration must be positive (e.g. '30s', '5m', '1h') and at most 2147483647 milliseconds" };
         return {
           ok: false,
           error: `Invalid interval format or range: ${schedule}. Use a positive duration such as '5m', '1h', '30s' (max 2147483647 ms); use a cron expression for longer calendar repeats.`,
@@ -853,6 +1088,7 @@ export class CronScheduler {
    */
   static describeSchedule(type: CronJobType, schedule: string): string {
     if (type === "interval") return `every ${schedule}`;
+    if (type === "idle") return `after ${schedule} idle`;
     if (type === "once") {
       return formatISOShort(schedule);
     }

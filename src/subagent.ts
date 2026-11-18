@@ -23,6 +23,24 @@ import { scheduledToolCallBlock } from "./input-guard.js";
 import { nativeCapability } from "./native.js";
 
 const DEFAULT_TOOL_NAMES = ["bash", "read", "edit", "write", "grep", "find", "ls"];
+const TEARDOWN_STEP_TIMEOUT_MS = 5_000;
+const ABORTED = "Scheduled model run was aborted";
+
+/** Legacy children are best-effort. Their cleanup never supplies a native SDK-close ACK. */
+async function settleLegacyStep(action: () => unknown, name: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), TEARDOWN_STEP_TIMEOUT_MS); });
+  try { await Promise.race([Promise.resolve().then(action), timeout]); }
+  catch { console.warn(`[pi-schedule-prompt] Legacy model ${name} did not close cleanly; resource closure is not verified.`); }
+  finally { clearTimeout(timer); }
+}
+
+async function closeLegacySession(session: AgentSession, bound: boolean): Promise<void> {
+  await settleLegacyStep(() => session.abort(), "abort");
+  if (bound) await settleLegacyStep(() => session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }), "extension shutdown");
+  try { session.dispose(); }
+  catch { console.warn("[pi-schedule-prompt] Legacy model session dispose failed; resource closure is not verified."); }
+}
 
 export type SubagentResult =
   | { ok: true; text: string }
@@ -123,6 +141,15 @@ export function getLastAssistantText(session: AgentSession): string {
   return "";
 }
 
+/** Pi exposes no public ModelRuntime accessor; this is the bounded compatibility readback used by 0.5.1. */
+export function parentModelRuntime(ctx: ExtensionContext): ModelRuntime | undefined {
+  const runtime = (ctx.modelRegistry as unknown as { runtime?: Partial<ModelRuntime> }).runtime;
+  if (runtime && typeof runtime.getAuth === "function" && typeof runtime.getModel === "function" && typeof runtime.registerProvider === "function") {
+    return runtime as ModelRuntime;
+  }
+  return undefined;
+}
+
 export function describeAvailableModels(
   registry: ExtensionContext["modelRegistry"],
 ): string {
@@ -140,6 +167,7 @@ export async function prepareModelSession(
   options: RunSubagentOptions,
   sessionManager: SessionManager,
   scheduled = false,
+  signal?: AbortSignal,
 ): Promise<AgentSession> {
     const resolution = resolveModelRoute(ctx.modelRegistry, modelStr);
     if (!resolution.ok) throw new Error(resolution.error);
@@ -198,13 +226,21 @@ export async function prepareModelSession(
         }),
       }),
     });
+    if (signal?.aborted) throw new Error(ABORTED);
     await loader.reload();
+    if (signal?.aborted) throw new Error(ABORTED);
 
-    const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
-    const native = ctx.modelRegistry.getRegisteredNativeProvider?.(model.provider);
-    const configured = ctx.modelRegistry.getRegisteredProviderConfig?.(model.provider);
-    if (native) modelRuntime.registerNativeProvider(native);
-    else if (configured) modelRuntime.registerProvider(model.provider, configured);
+    // Only legacy jobs with no child extensions can use the live parent runtime.
+    // Native persistent jobs retain the fork's isolated SDK and exact closure contract.
+    const sharedRuntime = !scheduled && !isEnabled(options.extensions) ? parentModelRuntime(ctx) : undefined;
+    const modelRuntime = sharedRuntime ?? await ModelRuntime.create({ allowModelNetwork: false });
+    if (!sharedRuntime) {
+      const native = ctx.modelRegistry.getRegisteredNativeProvider?.(model.provider);
+      const configured = ctx.modelRegistry.getRegisteredProviderConfig?.(model.provider);
+      if (native) modelRuntime.registerNativeProvider(native);
+      else if (configured) modelRuntime.registerProvider(model.provider, configured);
+    }
+    if (signal?.aborted) throw new Error(ABORTED);
     const { session } = await createAgentSession({
       cwd: ctx.cwd,
       agentDir,
@@ -217,11 +253,24 @@ export async function prepareModelSession(
       resourceLoader: loader,
     });
 
-    if (isEnabled(options.extensions)) {
-      try { await session.bindExtensions({}); }
-      catch (error) { session.dispose(); throw error; }
+    let bound = false;
+    try {
+      if (signal?.aborted) throw new Error(ABORTED);
+      if (isEnabled(options.extensions)) {
+        // bindExtensions can emit session_start and then throw rebuilding resources.
+        bound = true;
+        await session.bindExtensions({});
+      }
+      return session;
+    } catch (error) {
+      if (!scheduled) await closeLegacySession(session, bound);
+      else {
+        // This is not a closure ACK. A failed native SDK setup remains the caller's exact hold.
+        try { if (bound) await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
+        finally { session.dispose(); }
+      }
+      throw error;
     }
-    return session;
 }
 
 export async function runSubagentOnce(
@@ -232,49 +281,35 @@ export async function runSubagentOnce(
   options: RunSubagentOptions = {},
 ): Promise<SubagentResult> {
   try {
-    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
-    const session = await prepareModelSession(ctx, modelStr, options, SessionManager.inMemory(ctx.cwd));
+    if (signal?.aborted) return { ok: false, error: ABORTED };
+    const session = await prepareModelSession(ctx, modelStr, options, SessionManager.inMemory(ctx.cwd), false, signal);
+    const bound = options.extensions === true || (Array.isArray(options.extensions) && options.extensions.length > 0);
+    const onAbort = () => {
+      // Call synchronously: in preflightResult a microtask would lose the race to model start.
+      try { void Promise.resolve(session.abort()).catch(() => {}); }
+      catch { /* Teardown retries abort and reports an unconfirmed closure. */ }
+    };
+    let unsubscribe: (() => void) | undefined;
     try {
-    // Setup can finish after a stop/shutdown. Aborting an idle SDK session
-    // does not prevent the subsequent prompt from starting a new run.
-    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
-    let onAbort: (() => void) | undefined;
-    if (signal) {
-      onAbort = () => session.abort();
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-
-    let buffered = "";
-    const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-      if (event.type === "message_start") {
-        buffered = "";
-      } else if (
-        event.type === "message_update" &&
-        event.assistantMessageEvent.type === "text_delta"
-      ) {
-        buffered += event.assistantMessageEvent.delta;
-      }
-    });
-
-    try {
-      await session.prompt(prompt);
+      if (signal?.aborted) return { ok: false, error: ABORTED };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      let buffered = "";
+      unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "message_start") buffered = "";
+        else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") buffered += event.assistantMessageEvent.delta;
+      });
+      await session.prompt(prompt, {
+        // Pi resets a preflight abort at agent start. Re-apply it before the model call.
+        preflightResult: disposition => { if (disposition === "started" && signal?.aborted) onAbort(); },
+      });
+      if (signal?.aborted) return { ok: false, error: ABORTED };
+      const last = session.messages.filter(message => message.role === "assistant").at(-1);
+      if (last?.stopReason === "error" || last?.stopReason === "aborted") return { ok: false, error: last.errorMessage || "Scheduled model run did not complete" };
+      return { ok: true, text: buffered.trim() || getLastAssistantText(session) };
     } finally {
-      unsubscribe();
-      if (signal && onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
-    }
-
-    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
-    const last = session.messages.filter(message => message.role === "assistant").at(-1);
-    if (last?.stopReason === "error" || last?.stopReason === "aborted") {
-      return { ok: false, error: last.errorMessage || "Scheduled model run did not complete" };
-    }
-    const text = buffered.trim() || getLastAssistantText(session);
-    return { ok: true, text };
-    } finally {
-      try { await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
-      finally { session.dispose(); }
+      signal?.removeEventListener("abort", onAbort);
+      try { unsubscribe?.(); }
+      finally { await closeLegacySession(session, bound); }
     }
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };

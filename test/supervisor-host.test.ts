@@ -115,6 +115,34 @@ describe("dedicated native RPC supervisor service", () => {
     expect(JSON.parse((await command("status", h.file)).data)).toMatchObject({ active: false, state: "stopped" });
     expect(running.stderr()).not.toContain("synthetic consent");
   }, 40000);
+  it("binds the supervisor state identity to the selected profile/store", async () => {
+    const h = await fixture();
+    const profileA = path.join(h.cwd, "profile-a");
+    const profileB = path.join(h.cwd, "profile-b");
+    fs.mkdirSync(profileA, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(profileB, { recursive: true, mode: 0o700 });
+    const alias = path.join(h.cwd, "selected-profile");
+    fs.symlinkSync(profileA, alias, "dir");
+    const first = start(h.file, { PI_CODING_AGENT_DIR: alias });
+    await ready(h, first);
+    const boundPath = new CronStorage(h.cwd, profileA).getStorePath();
+    expect(JSON.parse((await command("status", h.file)).data)).toMatchObject({ agentDir: profileA, storePath: boundPath, runtime: { storePath: boundPath } });
+    expect((await command("stop", h.file)).code).toBe(0);
+    await vi.waitFor(() => expect(first.child.exitCode).toBe(0), { timeout: 12000 });
+    const identity = path.join(h.stateDir, "identity.json");
+    const original = fs.readFileSync(identity);
+    expect(JSON.parse(original.toString("utf8"))).toMatchObject({ agentDir: profileA, storePath: boundPath });
+    // Even an unchanged environment string cannot redirect state by retargeting its alias.
+    fs.unlinkSync(alias);
+    fs.symlinkSync(profileB, alias, "dir");
+    const second = start(h.file, { PI_CODING_AGENT_DIR: alias });
+    await vi.waitFor(() => expect(second.child.exitCode).toBe(1), { timeout: 10000 });
+    expect(second.stderr()).toContain("different fixed config/profile/store");
+    expect(fs.readFileSync(identity)).toEqual(original);
+    expect(fs.existsSync(path.join(h.stateDir, "host.json"))).toBe(false);
+    expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(false);
+  }, 35000);
+
   it("reports enabled resilient attention once without inferring a wake or requesting a model", async () => {
     const h = await fixture(); h.storage.addJob(resilientDefinition({ id: "native-unavailable", name: "native-unavailable", type: "interval", schedule: "1h", intervalMs: 3600000, prompt: "PRIVATE_NATIVE_PROMPT_MUST_NOT_LEAK", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: h.config.sessionId, maxRuns: 2, expiresAt: new Date(Date.now() + 60000).toISOString(), deadlineMs: 10000 }));
     const running = start(h.file); await ready(h, running);
