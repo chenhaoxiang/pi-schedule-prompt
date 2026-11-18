@@ -12,7 +12,6 @@ async function fixture(scheduled = true) {
   const agentDir = path.join(cwd, "agent"); fs.mkdirSync(agentDir);
   const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
   const storage = new CronStorage(cwd);
-  if (scheduled) storage.addJob({ id: "input", name: "input", type: "once", schedule: new Date(Date.now() + 1000).toISOString(), prompt: "Finish independent work; missing email is a local blocker", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: manager.getSessionId(), durable: true, maxRuns: 1, deadlineMs: 3000 });
   const question = vi.fn(async () => ({ content: [{ type: "text" as const, text: "Synthetic answer" }], details: undefined }));
   const faux = fauxProvider({ provider: "scheduled-input-fixture" });
   faux.setResponses([
@@ -27,6 +26,8 @@ async function fixture(scheduled = true) {
   const customQuestion = { name: "ask_user_question", label: "Synthetic question", description: "Synthetic question", parameters: Type.Object({}), execute: question };
   const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off", tools: ["ask_user_question"], customTools: [customQuestion], sessionManager: manager, settingsManager: settings, resourceLoader: loader });
   const errors: string[] = [];
+  // Start the timer after SDK construction, not before provider/loader setup.
+  if (scheduled) storage.addJob({ id: "input", name: "input", type: "once", schedule: new Date(Date.now() + 500).toISOString(), prompt: "Finish independent work; missing email is a local blocker", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: manager.getSessionId(), durable: true, catchUp: "latest", maxRuns: 1, deadlineMs: 5_000 });
   await session.bindExtensions({ mode: "rpc", onError: error => { errors.push(error.message); } });
   const cleanup = async () => { try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); } finally { session.dispose(); fs.rmSync(cwd, { recursive: true, force: true }); } };
   return { session, manager, storage, question, faux, errors, cleanup };
@@ -37,8 +38,9 @@ describe("scheduled input through the real Pi tool boundary", () => {
     const h = await fixture();
     try {
       expect(h.session.getActiveToolNames()).toContain("ask_user_question");
-      await vi.waitFor(() => expect(h.session.getLastAssistantText()).toContain("ROUND_FINISHED"));
+      await vi.waitFor(() => expect(h.storage.getJob("input")?.claim?.phase).toBe("settled"), { timeout: 8_000 });
       await h.session.waitForIdle();
+      expect(h.session.getLastAssistantText()).toContain("ROUND_FINISHED");
       expect(h.question.mock.calls.length).toBe(0);
       expect(h.storage.getJob("input")).toMatchObject({ attemptCount: 1, runCount: 1, waitingReason: "user_input_required", claim: { phase: "settled", outcome: "success" } });
       const receipt = h.manager.getEntries().find(entry => entry.type === "custom" && entry.customType === "schedule_execution") as any;
@@ -49,7 +51,7 @@ describe("scheduled input through the real Pi tool boundary", () => {
       expect(h.faux.state.callCount).toBe(2);
       expect(h.errors).toEqual([]);
     } finally { await h.cleanup(); }
-  });
+  }, 12_000);
 
   it("still executes the question tool during an ordinary user turn", async () => {
     const h = await fixture(false);
