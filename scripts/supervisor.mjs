@@ -2,6 +2,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
+import { homedir } from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NativeRpc } from './supervisor-rpc.mjs';
@@ -60,18 +61,32 @@ export function readConfig(file) {
   return { ...config, fingerprint: sha(JSON.stringify(config)) };
 }
 
+function selectProjectStore(config, host) {
+  const configDir = host.piConfig?.configDir || '.pi';
+  const agentEnv = (host.piConfig?.name || 'pi').toUpperCase() + '_CODING_AGENT_DIR';
+  const configured = process.env[agentEnv];
+  const agentDir = path.resolve(config.cwd, !configured ? path.join(homedir(), configDir, 'agent') : configured === '~' || configured.startsWith('~/') ? path.join(homedir(), configured.slice(1)) : configured);
+  return { agentDir, agentEnv, storePath: path.join(agentDir, 'schedule-prompts', 'projects', sha(config.cwd) + '.json'), legacyPath: path.join(config.cwd, configDir, 'schedule-prompts.json') };
+}
 function validatePins(config) {
   if (sha(fs.readFileSync(config.piCli)) !== config.piCliSha256) throw new Error('Pi CLI pin mismatch');
   const receipt = JSON.parse(fs.readFileSync(path.join(config.packageRoot, '.install-receipt.json'), 'utf8'));
   if (receipt.sourceSha !== config.sourceCommit || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
-  if (typeof receipt.hostPath !== 'string' || fs.realpathSync(path.join(path.dirname(config.piCli), 'node_modules/@earendil-works/pi-coding-agent')) !== receipt.hostPath || JSON.parse(fs.readFileSync(path.join(receipt.hostPath, 'package.json'), 'utf8')).version !== receipt.hostVersion) throw new Error('CLI and fixed installer host bindings differ');
+  if (typeof receipt.hostPath !== 'string' || fs.realpathSync(path.join(path.dirname(config.piCli), 'node_modules/@earendil-works/pi-coding-agent')) !== receipt.hostPath) throw new Error('CLI and fixed installer host bindings differ');
+  const host = JSON.parse(fs.readFileSync(path.join(receipt.hostPath, 'package.json'), 'utf8'));
+  if (host.version !== receipt.hostVersion) throw new Error('CLI and fixed installer host bindings differ');
   if (fs.realpathSync(config.packageRoot) !== config.packageRoot || fs.realpathSync(config.cwd) !== config.cwd) throw new Error('Use canonical cwd/package paths');
   validateSessionFile(config);
-  const storePath = path.join(config.cwd, '.pi/schedule-prompts.json');
-  if (fs.existsSync(storePath)) {
-    const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+  const project = selectProjectStore(config, host);
+  // The extension performs identical path, source and format checks before arming in the child.
+  const legacyExists = fs.existsSync(project.legacyPath);
+  if (fs.existsSync(project.storePath)) {
+    const store = JSON.parse(fs.readFileSync(project.storePath, 'utf8'));
+    if (store.cwd !== undefined && store.cwd !== config.cwd) throw new Error('Dedicated host project store identity mismatch');
+    if (legacyExists && (!/^[a-f0-9]{64}$/.test(store.legacySourceSha256 ?? '') || sha(fs.readFileSync(project.legacyPath)) !== store.legacySourceSha256)) throw new Error('Legacy schedule store requires explicit previewed cutover before dedicated host start');
     if (![1, 2, 3, 4].includes(store.version) || !Array.isArray(store.jobs) || store.jobs.some(job => job.enabled && (!job.session || (job.session === config.sessionId && (!job.durable || !job.maxRuns || !job.expiresAt || (config.toolProfile === 'read-only' && job.model)))))) throw new Error('Dedicated host requires finite durable session-bound schedules; read-only profile requires inline jobs');
-  }
+  } else if (legacyExists) throw new Error('Legacy schedule store requires explicit previewed cutover before dedicated host start');
+  return project;
 }
 
 async function control(config, op, jobId) {
@@ -94,7 +109,7 @@ async function control(config, op, jobId) {
 
 export async function run(config) {
   privateDir(config.stateDir);
-  validatePins(config);
+  const project = validatePins(config);
   const identityFile = path.join(config.stateDir, 'identity.json');
   try { fs.writeFileSync(identityFile, JSON.stringify({ fingerprint: config.fingerprint }), { flag: 'wx', mode: 0o600 }); }
   catch (error) { if (error.code !== 'EEXIST' || JSON.parse(fs.readFileSync(identityFile, 'utf8')).fingerprint !== config.fingerprint) throw new Error('State directory already belongs to a different fixed config'); }
@@ -219,7 +234,7 @@ export async function run(config) {
     // Core filters the registry, including restored/late/deferred tools; this is not a prompt or shell whitelist.
     if (config.toolProfile === 'read-only') args.push('--tools', readOnlyTools.join(','), '--exclude-tools', 'mcp__*');
     if (config.thinkingLevel !== undefined) args.push('--thinking', config.thinkingLevel);
-    rpc = new NativeRpc(config.piCli, args, { cwd: config.cwd, env: { ...process.env, PI_SCHEDULE_SERVICE_SESSION: config.sessionId, PI_SCHEDULE_SERVICE_TOOL_PROFILE: config.toolProfile ?? '' },
+    rpc = new NativeRpc(config.piCli, args, { cwd: config.cwd, env: { ...process.env, [project.agentEnv]: project.agentDir, PI_SCHEDULE_SERVICE_STORE_PATH: project.storePath, PI_SCHEDULE_SERVICE_SESSION: config.sessionId, PI_SCHEDULE_SERVICE_TOOL_PROFILE: config.toolProfile ?? '' },
       onExit: () => { if (!stopping) void shutdown('native-exited'); },
       onFatal: () => { if (!stopping) void shutdown('rpc-unavailable'); } });
     record = { ...record, childPid: rpc.child.pid }; atomic(recordFile, record);
@@ -246,6 +261,7 @@ export async function run(config) {
     state.step = 'readiness-handshake'; persist();
     const ready = await readJobs(undefined, 30000);
     state.runtime = ready.runtime; state.step = 'verify-tool-profile'; persist();
+    if (ready.runtime?.storePath !== project.storePath) throw new Error('Native scheduler selected a different project store');
     if (config.toolProfile === 'read-only') { verifyReadOnlyTools(ready.runtime); state.toolProfileVerified = true; }
     if (!ready.ready) throw new Error('Scheduler not ready in the owned native process');
     const current = await rpc.request('get_state');

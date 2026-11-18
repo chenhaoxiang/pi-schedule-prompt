@@ -11,12 +11,12 @@ This is [chenhaoxiang/pi-schedule-prompt](https://github.com/chenhaoxiang/pi-sch
 - `main`: reviewed maintenance/integration line.
 - `upstream-main`: exact community mirror, never an installation source.
 - `upstream`: fetch-only community remote; its push URL is disabled.
-- Fork versions use `0.4.1-fork.N`. Source delivery is separate from a GitHub Release or local installation. This package is private-to-npm to prevent publication under the community identity.
+- Fork versions use `0.5.1-fork.N`. Source delivery is separate from a GitHub Release or local installation. This package is private-to-npm to prevent publication under the community identity.
 
 Install the maintained source only after reviewing its changes:
 
 ```sh
-pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.23
+pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.5.1-fork.1
 ```
 
 Pin a reviewed commit for reproducibility. Installation does not hot-upgrade active Pi sessions. This change does not install itself or start monitoring other sessions.
@@ -37,7 +37,7 @@ The agent uses `schedule_prompt`. Actions: `add`, `list`, `remove`, `enable`, `d
 | --- | --- |
 | `action` | Operation; required |
 | `name` | Unique display name; generated when omitted |
-| `type` | `cron` (default), `interval`, or `once` |
+| `type` | `cron` (default), `interval`, `once`, `event`, or `idle` |
 | `schedule` | Required on add: six-field cron, interval or one-shot time |
 | `prompt` | Required on add; the authorized work to request |
 | `jobId` | Required for remove/enable/disable/update |
@@ -56,11 +56,12 @@ Schedule formats:
 | --- | --- |
 | Once | `+30s`, `+5m`, `2026-12-01T09:00:00Z` |
 | Interval | `30s`, `5m`, `1h` |
+| Idle | `10m`, `1h` — once per user inactivity stretch |
 | Cron, with seconds | `0 */5 * * * *`, `0 0 9 * * 1-5` |
 
 Five-field cron is not accepted. Intervals are bounded by the host timer range (2147483647 ms); long one-shot waits are re-armed in bounded chunks. User-facing one-shot times include the local UTC offset; persisted values remain UTC ISO. Cron uses the process timezone.
 
-`/schedule-prompt` opens Jobs and Settings. Jobs hotkeys: arrows select, `a` add, `t` enable/disable, `s` scope, `x` remove, `c` explicitly clean disabled jobs, `q` exit. Paused jobs survive shutdown and reload; cleanup is never automatic. Other sessions' bound jobs are read-only.
+`/schedule-prompt` opens Jobs and Settings. Jobs hotkeys: arrows select, `a` add, `t` enable/disable, `s` scope, `x` remove, `c` explicitly clean disabled jobs, `q` exit. Paused jobs survive shutdown and reload; cleanup is never automatic. Idle jobs fire once after the user has been inactive for their duration and re-arm only after new user activity. Other sessions' bound jobs are read-only.
 
 For an explicitly authorized host-operator retirement of an expired, closed model job whose interactive owner is retired, fork.22 provides a separate [preview/CAS maintenance CLI](docs/reliable-scheduling.md#expired-model-job-retirement). Ordinary session tools still cannot mutate foreign jobs. This only disables future intent and retains UNKNOWN, history, owner and spending; it never resumes or reconciles work.
 
@@ -80,11 +81,11 @@ Pre-admission store contention retains one pending intent and retries without co
 
 ## Scope, persistence and safety
 
-Jobs live in `<cwd>/.pi/schedule-prompts.json`. New jobs bind to the creating session by default. Unbound/shared jobs deliberately broadcast to every Pi in that cwd; do not use shared mode to elect a supervisor. Storage serialization protects cooperating writers, not single execution of shared jobs.
+Jobs live in `<agentDir>/schedule-prompts/projects/<sha256(realpath(cwd))>.json`, keyed per Pi profile and canonical project path. New jobs bind to the creating session by default. Unbound/shared jobs deliberately broadcast to every Pi in that cwd; do not use shared mode to elect a supervisor. Storage serialization protects cooperating writers, not single execution of shared jobs. A legacy `<cwd>/.pi/schedule-prompts.json` is retained as a backup and requires an explicit previewed, single-writer cutover through `CronStorage.importProjectStore` or the provider-free `scripts/migrate-project-store.mjs`; startup never silently copies or rewrites it.
 
 Mutations use an exclusive local lock and unique atomic replacements. Task files use mode 0600; prompts must not contain secrets. Corrupt stores are not replaced with an empty file. Contention fails visibly instead of blocking Pi. A leftover lock after a crash requires confirming the writer is gone before removing that exact lock. This is a same-user/local-filesystem contract, not adversarial or NFS isolation.
 
-Settings merge global `~/.pi/agent/schedule-prompts-settings.json` defaults with project `.pi/schedule-prompts-settings.json`. The UI only writes project settings: `widgetVisible` and `defaultJobScope` (session/workdir). Runtime store faults display an unavailable state without escaping UI refresh callbacks or replacing corrupt bytes.
+Settings merge global `<agentDir>/schedule-prompts-settings.json` defaults with trusted project `.pi/schedule-prompts-settings.json`. The UI only writes project settings: `widgetVisible` and `defaultJobScope` (session/workdir); untrusted project overrides are ignored. Runtime store faults display an unavailable state without escaping UI refresh callbacks or replacing corrupt bytes.
 
 Schedules fire only in a compatible live Pi session. Legacy offline ticks are not replayed; past legacy one-shots are disabled with an error. Print/JSON batch sessions do not arm timers. The optional dedicated service below maintains its own native Pi; it is not a permission system, arbitrary-terminal controller or OS sleep wake guarantee.
 
@@ -112,7 +113,7 @@ Stage C adds session-bound `type: "event"` jobs. `schedule` is 1–4 comma-separ
 
 Optional `github` selects `{repo, kind: "pull-request", number}`, `{repo, kind: "workflow", branch?}`, or `{repo, kind: "pull-request-checks", number}` with at least60 seconds between metadata-only GET polls. The opt-in check selector follows that PR’s exact current head across check runs and legacy commit statuses, rejects a changing PR binding or incomplete collections, and ignores comment/output text. Its first valid snapshot also notifies the owner once, so enrollment after CI already finished does not wait forever; subsequent unchanged snapshots stay quiet. It only wakes the original owner to recheck evidence; it does not decide required checks, approval or merge readiness. Existing PR/workflow modes are unchanged; older runtimes reject the new selector rather than silently observing the latest unrelated workflow. It is off unless the task explicitly configures it. Optional project `eventApi: {enabled:true,port,tokenEnv}` binds only127.0.0.1 and requires a separately supplied bearer token; POST `/events` accepts only `{jobId,eventName,eventId}`, and HTTP names must start with `api:`. No listener starts by default.
 
-See [event admission](docs/event-admission.md) for dedup bounds, source restrictions, expiry/pause and evidence limits. This version writes schema3 and reads1/2/3; older writers refuse schema3, so do not mix runtimes on one state file. These are not hard financial budgets or live external-source acceptance.
+See [event admission](docs/event-admission.md) for dedup bounds, source restrictions, expiry/pause and evidence limits. The maintained line reads schema1–4 and preserves schema4 UNKNOWN/claim/effect evidence. Older schema3-only writers must not be pointed at a schema4 store; keep one active writer/version per project store during cutover. These are not hard financial budgets or live external-source acceptance.
 
 ## Optional durable native supervisor
 

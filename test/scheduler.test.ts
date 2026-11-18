@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CronScheduler, displaySchedule, formatLocal } from "../src/scheduler.js";
 import type { CronJob } from "../src/types.js";
 
@@ -42,6 +42,7 @@ function makeStorage(seedJobs: CronJob[] = []) {
     getJob: (id: string) => jobs.get(id),
     getAllJobs: () => Array.from(jobs.values()),
     getStorePath: () => ":memory:",
+    previewProjectMigration: () => ({ state: "no-legacy" }),
   } as any;
 }
 
@@ -93,6 +94,57 @@ describe("Schedule v0.5.1-compatible safety fixes", () => {
   it("accepts 24d and rejects 25d with actionable interval guidance", () => {
     expect(CronScheduler.validateSchedule("interval", "24d")).toMatchObject({ ok: true });
     expect(CronScheduler.validateSchedule("interval", "25d")).toMatchObject({ ok: false, error: expect.stringContaining("use a cron expression") });
+  });
+});
+
+describe("CronScheduler — idle job lifecycle", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("fires once per inactivity stretch and re-arms only after user activity", async () => {
+    const job = exampleJob({ id: "idle", name: "idle-check", type: "idle", schedule: "10s", intervalMs: 10_000 });
+    const storage = makeStorage([job]);
+    const pi = makePi();
+    const ctx = makeCtx();
+    ctx.isIdle = () => true;
+    ctx.hasPendingMessages = () => false;
+    const scheduler = new CronScheduler(storage, pi, ctx);
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    scheduler.onUserInput();
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  it("pauses a due idle job while a blocking dialog is open", async () => {
+    const job = exampleJob({ id: "idle-dialog", name: "idle-dialog", type: "idle", schedule: "5s", intervalMs: 5_000 });
+    const storage = makeStorage([job]);
+    const pi = makePi();
+    const ctx = makeCtx();
+    ctx.isIdle = () => true;
+    ctx.hasPendingMessages = () => false;
+    const scheduler = new CronScheduler(storage, pi, ctx);
+    scheduler.start();
+    scheduler.pauseForDialog();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    scheduler.resumeAfterDialog();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    scheduler.stop();
   });
 });
 

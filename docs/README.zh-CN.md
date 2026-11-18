@@ -16,8 +16,8 @@ created: 2026-10-20
 
 - main：经过审查的维护整合主线。
 - upstream-main：纯社区镜像，不作为安装源；upstream 远端只读。
-- 版本使用 0.4.1-fork.N，禁止误发至社区 npm 身份。源码、GitHub Release、本机安装和运行中的 session 分别验真。
-- 安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.23`；需要复现时锁定受审提交。
+- 版本使用 0.5.1-fork.N，禁止误发至社区 npm 身份。源码、GitHub Release、本机安装和运行中的 session 分别验真。
+- 候选安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.5.1-fork.1`；需要复现时锁定受审提交。候选阶段不改变现有本机选择或活动 session。
 - 要求 Node 22.19+、Pi 1.3.x。本次源码改动不自动安装、不强制重启旧会话、不启动真实监控。
 
 ## 定时与管理
@@ -59,7 +59,7 @@ fork.22 提供独立的[显式维护 CLI](reliable-scheduling.md#expired-model-j
 
 ## 多会话与存储
 
-任务存于 cwd 下 .pi/schedule-prompts.json，新任务默认只绑定创建 session。其他 session 的绑定任务只读；共享任务明确向同目录每个 session 广播，可能重复执行，不应拿它选举总控。
+任务存于 `<agentDir>/schedule-prompts/projects/<sha256(realpath(cwd))>.json`，按 Pi profile 和规范化项目路径隔离；新任务默认只绑定创建 session。其他 session 的绑定任务只读；共享任务明确向同目录每个 session 广播，可能重复执行，不应拿它选举总控。旧 `<cwd>/.pi/schedule-prompts.json` 仅作为保留备份，必须在维护窗口做 fresh preview、确认 writer/句柄关闭后，通过 `CronStorage.importProjectStore` 或 `scripts/migrate-project-store.mjs` 显式导入；启动不会静默迁移。
 
 存储采用互斥本地锁、唯一临时文件和原子替换；任务文件权限 0600，不写凭据。冲突立即报告，不阻塞会话；坏 JSON 不会被当空文件覆盖。崩溃遗留锁需先确认原写入者已退出，再处理该精确锁文件，不自动猜测接管。
 

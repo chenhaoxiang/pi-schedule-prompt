@@ -16,7 +16,7 @@ function fixture() {
   const storage = new CronStorage(cwd);
   const now = Date.now();
   const job = resilientDefinition({ id: "job", name: "job", type: "interval", schedule: "1s", intervalMs: 1000, prompt: "synthetic secret must not appear in metadata", enabled: true, createdAt: new Date(now).toISOString(), session: "retired-owner", model: "fixture/model", runCount: 0, maxRuns: 4, deadlineMs: 10_000, expiresAt: new Date(now + 60_000).toISOString() }, { workBudgetMs: 5000 });
-  fs.mkdirSync(path.dirname(storage.getStorePath()), { mode: 0o700 });
+  fs.mkdirSync(path.dirname(storage.getStorePath()), { recursive: true, mode: 0o700 });
   fs.writeFileSync(storage.getStorePath(), JSON.stringify({ version: 4, jobs: [job, { id: "other", name: "other", type: "once", schedule: "+1h", prompt: "unrelated private fixture", enabled: false, createdAt: new Date(now).toISOString(), runCount: 0 }] }), { mode: 0o600 });
   const tick = { id: "tick", dueAt: new Date(now).toISOString(), revision: job.revision!, source: "timer" as const };
   storage.queueResilient(job.id, job.session!, tick);
@@ -25,7 +25,7 @@ function fixture() {
   const attempt = claimed.runtime.slot.attempt;
   const sessionId = attempt.nativeSessionId!, runId = "synthetic-native-run";
   storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId, sessionId, startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 10_000).toISOString() });
-  const nativeDir = path.join(cwd, ".pi/schedule-native"); fs.mkdirSync(nativeDir);
+  const nativeDir = path.join(cwd, ".pi/schedule-native"); fs.mkdirSync(nativeDir, { recursive: true });
   const nativeFile = path.join(nativeDir, "synthetic.jsonl");
   const checkpoint = { sessionId, runId, entryId: "checkpoint", sessionFile: nativeFile };
   const native: NativeExecutionProof = { version: 1, runId, binding: { jobId: job.id, attemptId: attempt.id, ownerSessionId: sessionId, ownerEpoch: attempt.owner.epoch, revision: attempt.revision }, finishedAt: new Date(now).toISOString(), execution: "completed", checkpointEntryId: checkpoint.entryId, effectStatus: "unknown", businessOutcome: "unverified", failedRecoveryMs: 0 };

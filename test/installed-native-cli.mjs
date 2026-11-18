@@ -37,7 +37,7 @@ const receipt = JSON.parse(fs.readFileSync(path.join(root, '.install-receipt.jso
 const config = { version: 1, cwd, piCli: cli, piCliSha256: createHash('sha256').update(fs.readFileSync(cli)).digest('hex'), packageRoot: root, sourceCommit: receipt.sourceSha, sessionId: 'fixed-native-cli-fixture', model: 'fixed-cli-fixture/fixture', thinkingLevel: 'off', stateDir, controlPort: port };
 const file = path.join(cwd, 'host.json'); fs.writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
 const { CronStorage } = await import(pathToFileURL(path.join(root, 'dist/storage.js')).href);
-const storage = new CronStorage(cwd);
+const storage = new CronStorage(cwd, agentDir);
 storage.addJob({ id: 'cli', name: 'cli', type: 'once', schedule: new Date(Date.now() + 3000).toISOString(), prompt: 'Synthetic fixed native CLI acceptance', enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: config.sessionId, durable: true, catchUp: 'latest', maxRuns: 1, expiresAt: new Date(Date.now() + 90000).toISOString() });
 const host = path.join(root, 'scripts/supervisor.mjs');
 const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, HOME: path.join(cwd, 'home') };

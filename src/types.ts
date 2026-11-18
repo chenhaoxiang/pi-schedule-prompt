@@ -1,13 +1,23 @@
 import { type Static, Type } from "typebox";
 import type { ScheduleJobStatus } from "./status.js";
 
-const StringEnum = <T extends string>(values: T[], options?: { description?: string }) =>
-  Type.Union(values.map((value) => Type.Literal(value)), options);
+/** Keep enum values literal for tool parameter inference while emitting a compact schema. */
+function StringEnum<const T extends readonly string[]>(
+  values: T,
+  options?: { description?: string; default?: T[number] },
+) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: [...values],
+    ...(options?.description && { description: options.description }),
+    ...(options?.default && { default: options.default }),
+  });
+}
 
 /**
  * Type of cron job
  */
-export type CronJobType = "cron" | "once" | "interval" | "event";
+export type CronJobType = "cron" | "once" | "interval" | "event" | "idle";
 
 export type IntervalMode = "fixed-delay" | "fixed-rate";
 export type ResilientPolicy = {
@@ -223,7 +233,7 @@ export interface CronJob {
   legacyHandovers?: LegacyOwnerHandover[];
   /** Type of job */
   type: CronJobType;
-  /** Interval in milliseconds (for interval type) */
+  /** Duration in milliseconds: the period for `interval`, the idle threshold for `idle` */
   intervalMs?: number;
   /** When the job was created */
   createdAt: string;
@@ -293,6 +303,12 @@ export interface CronJob {
  * Persistent storage for cron jobs
  */
 export interface CronStore {
+  /** Canonical project path represented by a per-project agent-dir store. */
+  cwd?: string;
+  /** Set after the legacy project-local store has been imported once. */
+  legacyImported?: boolean;
+  /** Source fingerprint captured by the fork's explicit cutover, not a writer/closure proof. */
+  legacySourceSha256?: string;
   jobs: CronJob[];
   version: number;
   migration?: StoreMigration;
@@ -318,7 +334,7 @@ export interface CronToolDetails {
  */
 export const CronToolParams = Type.Object({
   action: StringEnum(["add", "remove", "list", "status", "enable", "disable", "update", "cleanup", "trigger", "resume", "reconcile", "drain", "preview"], {
-    description: "Action to perform",
+    description: "Action to perform. list returns job IDs; status and preview are read-only. cleanup removes eligible disabled jobs, not retained recovery evidence.",
   }),
   name: Type.Optional(
     Type.String({
@@ -327,23 +343,22 @@ export const CronToolParams = Type.Object({
   ),
   schedule: Type.Optional(
     Type.String({
-      description:
-        "Required for add. Cron expression, ISO timestamp, relative time (+10s, +5m), or interval string",
+      description: "Required for add. cron: six fields including seconds; once: +10s or future ISO; interval/idle: duration such as 5m or 1h (maximum 24d); event: 1–4 comma-separated event names. Updates must match the existing type.",
     })
   ),
   prompt: Type.Optional(
     Type.String({
-      description: "Required for add. The prompt text to execute",
+      description: "Required for add. Write the authorized work to request. Without model it is a custom turn in the owning chat; with model it must be self-contained because the separate session does not have this chat's history.",
     })
   ),
   jobId: Type.Optional(
     Type.String({
-      description: "Job ID for remove, enable, disable, or update actions",
+      description: "Exact job ID from add or list. Required for remove, enable, disable and update.",
     })
   ),
   type: Type.Optional(
-    StringEnum(["cron", "once", "interval", "event"], {
-      description: "Job type. Use 'once' for relative times like '+10s'. Default is cron",
+    StringEnum(["cron", "once", "interval", "event", "idle"], {
+      description: "Job type (default cron). idle runs once per user inactivity stretch after the agent settles. event reacts only to its configured names. Cannot be changed by update.",
     })
   ),
   description: Type.Optional(

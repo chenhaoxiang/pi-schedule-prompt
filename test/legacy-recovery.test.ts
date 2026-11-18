@@ -18,7 +18,7 @@ function chain() {
 }
 function fixture(jobs: CronJob[]) {
   const base = path.resolve("tmp/legacy-recovery"); fs.mkdirSync(base, { recursive: true }); const cwd = fs.mkdtempSync(path.join(base, "case-")); owned.push(cwd);
-  fs.mkdirSync(path.join(cwd, ".pi")); const storage = new CronStorage(cwd); fs.writeFileSync(storage.getStorePath(), JSON.stringify({ version: 3, jobs }));
+  const storage = new CronStorage(cwd); fs.mkdirSync(path.dirname(storage.getStorePath()), { recursive: true }); fs.writeFileSync(storage.getStorePath(), JSON.stringify({ version: 3, jobs }));
   return storage;
 }
 const observed = () => ({ status: "verified" as const, activeRunIds: [], incompatibleWriterIds: [] });

@@ -30,11 +30,11 @@ export async function runAddFlow(ctx: ExtensionCommandContext, storage: CronStor
   const name = await ctx.ui.input("Job Name", "Enter a name for this scheduled prompt");
   if (!name) return;
   if (storage.hasJobWithName(name)) { ctx.ui.notify(`A job named "${name}" already exists`, "error"); return; }
-  const typeChoice = await ctx.ui.select("Job Type", ["Cron (recurring)", "Once (one-shot)", "Interval (periodic)"]);
+  const typeChoice = await ctx.ui.select("Job Type", ["Cron (recurring)", "Once (one-shot)", "Interval (periodic)", "Idle (after inactivity)"]);
   if (!typeChoice) return;
-  const typeMap: Record<string, "cron" | "once" | "interval"> = { "Cron (recurring)": "cron", "Once (one-shot)": "once", "Interval (periodic)": "interval" };
+  const typeMap: Record<string, "cron" | "once" | "interval" | "idle"> = { "Cron (recurring)": "cron", "Once (one-shot)": "once", "Interval (periodic)": "interval", "Idle (after inactivity)": "idle" };
   const jobType = typeMap[typeChoice];
-  const placeholders = { cron: "6-field cron, e.g. '0 0 9 * * *'", once: "ISO timestamp or relative time (+10s, +5m)", interval: "Duration, e.g. '5m', '1h', '30s'" };
+  const placeholders = { cron: "6-field cron, e.g. '0 0 9 * * *'", once: "ISO timestamp or relative time (+10s, +5m)", interval: "Duration, e.g. '5m', '1h', '30s'", idle: "Idle duration, e.g. '10m', '1h'" };
   let schedule: string | undefined; let intervalMs: number | undefined; let placeholder = placeholders[jobType];
   while (true) {
     const raw = await ctx.ui.input("Schedule", placeholder); if (!raw) return;
@@ -46,7 +46,7 @@ export async function runAddFlow(ctx: ExtensionCommandContext, storage: CronStor
 
   let policy: Partial<ResilientPolicy> | undefined;
   let maxRuns: number | undefined; let expiresAt: string | undefined; let deadlineMs: number | undefined;
-  if (jobType !== "once") {
+  if (jobType !== "once" && jobType !== "idle") {
     const native = "Resilient native — serial checkpoint/recovery"; const legacy = "Legacy — existing scheduling behavior";
     const choice = await ctx.ui.select("Execution contract", nativeCapability(ctx) ? [native, legacy] : [legacy, native]);
     if (!choice) return;

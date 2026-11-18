@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inspectExpiredRetirement } from "./expired-retirement.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
@@ -8,7 +10,64 @@ import { continuationDelayNotBefore, instant, isResilient, requiresReconciliatio
 import { nextDue, timingView } from "./timing.js";
 import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type LegacyOwnerHandover, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
 
+const LEGACY_FILE = "schedule-prompts.json";
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
+
+/** Resolve symlinked project paths to one stable per-project store key. */
+export function canonicalProjectPath(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  try { return fs.realpathSync.native(resolved); }
+  catch { return resolved; }
+}
+
+/** Per-project store key shared with the community 0.5.1 layout. */
+export function projectKey(cwd: string): string {
+  return createHash("sha256").update(canonicalProjectPath(cwd)).digest("hex");
+}
+
+const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+const emptyBytes = () => Buffer.from(JSON.stringify({ version: 1, jobs: [] }));
+
+function present(file: string): boolean {
+  try { fs.lstatSync(file); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+}
+
+function readSnapshot(file: string): Buffer | undefined {
+  if (!present(file)) return;
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | fs.constants.O_NONBLOCK);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || (stat.mode & 0o022) || (process.getuid && stat.uid !== process.getuid())) throw new Error("Schedule store must be an owned regular file not writable by others");
+    return fs.readFileSync(fd);
+  } finally { fs.closeSync(fd); }
+}
+
+function decodeStore(bytes: Buffer): CronStore {
+  let store: unknown;
+  try { store = JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error("Invalid schedule store JSON; original bytes retained"); }
+  validate(store);
+  return store;
+}
+
+function privateWrite(file: string, bytes: Buffer | string): void {
+  const fd = fs.openSync(file, "wx", 0o600);
+  try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); }
+  catch (error) { fs.rmSync(file, { force: true }); throw error; }
+  finally { fs.closeSync(fd); }
+}
+
+function withStoreLock<T>(file: string, action: () => T): T {
+  const lock = `${file}.lock`;
+  let fd: number;
+  try { fd = fs.openSync(lock, "wx", 0o600); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ScheduleStoreBusyError(); throw error; }
+  try { fs.writeFileSync(fd, JSON.stringify({ pid: process.pid })); return action(); }
+  finally { fs.closeSync(fd); fs.unlinkSync(lock); }
+}
+
+const ownsExecution = (job: CronJob) => (job.claim && job.claim.phase !== "settled") || (isResilient(job) && job.runtime.slot.kind === "owned") || job.lastStatus === "running";
 
 /** Generic cleanup removes unused definitions, never immutable spending/UNKNOWN/resource evidence. */
 export function canCleanupJob(job: CronJob): boolean {
@@ -20,12 +79,15 @@ function validate(store: unknown): asserts store is CronStore {
   if (!store || typeof store !== "object") throw new Error("Invalid schedule store");
   const data = store as CronStore;
   if (![1, 2, 3, 4].includes(data.version) || !Array.isArray(data.jobs)) throw new Error("Unsupported schedule store");
+  if ((data.cwd !== undefined && (typeof data.cwd !== "string" || !path.isAbsolute(data.cwd))) ||
+    (data.legacyImported !== undefined && typeof data.legacyImported !== "boolean") ||
+    (data.legacySourceSha256 !== undefined && (data.legacyImported !== true || !validEvidenceFingerprint(data.legacySourceSha256)))) throw new Error("Invalid project store identity/import marker");
   const ids = new Set<string>();
   const names = new Set<string>();
   for (const job of data.jobs) {
     if (!job || typeof job !== "object" ||
       ![job.id, job.name, job.schedule, job.prompt, job.createdAt].every(v => typeof v === "string" && v.trim()) ||
-      !["cron", "interval", "once", "event"].includes(job.type) || typeof job.enabled !== "boolean" ||
+      !["cron", "interval", "once", "event", "idle"].includes(job.type) || typeof job.enabled !== "boolean" ||
       !Number.isSafeInteger(job.runCount) || job.runCount < 0 ||
       (job.intervalMs !== undefined && (!Number.isSafeInteger(job.intervalMs) || job.intervalMs <= 0)) ||
       (job.session !== undefined && (typeof job.session !== "string" || !job.session.trim())) ||
@@ -47,6 +109,7 @@ function validate(store: unknown): asserts store is CronStore {
       (job.expiresAt !== undefined && (typeof job.expiresAt !== "string" || !Number.isFinite(Date.parse(job.expiresAt))))) {
       throw new Error("Invalid scheduled job; refusing to overwrite the store");
     }
+    if (job.type === "idle" && (!job.intervalMs || job.intervalMs > 2_147_483_647 || job.durable || job.policy?.mode === "resilient" || job.catchUp === "latest")) throw new Error("Idle jobs require a positive bounded duration and do not support durable, resilient or catch-up execution");
     if (job.type === "event") {
       eventNames(job.schedule);
       if (!job.session) throw new Error("Event jobs must bind to a session; shared broadcast remains time-only");
@@ -137,31 +200,119 @@ export class ScheduleStoreBusyError extends Error {
 /** Cooperating same-user local writers; not a distributed execution lock. */
 export class CronStorage {
   private readonly storePath: string;
-  private readonly piDir: string;
+  private readonly storeDir: string;
+  private readonly projectPath: string;
+  private readonly legacyStorePath: string;
 
-  constructor(cwd: string) {
-    this.piDir = path.join(cwd, ".pi");
-    this.storePath = path.join(this.piDir, "schedule-prompts.json");
+  constructor(cwd: string, agentDir = getAgentDir()) {
+    this.projectPath = canonicalProjectPath(cwd);
+    this.storeDir = path.resolve(agentDir, "schedule-prompts", "projects");
+    this.storePath = path.join(this.storeDir, `${projectKey(this.projectPath)}.json`);
+    this.legacyStorePath = path.join(this.projectPath, CONFIG_DIR_NAME, LEGACY_FILE);
+  }
+
+  private readTarget() {
+    const bytes = readSnapshot(this.storePath);
+    const store = decodeStore(bytes ?? emptyBytes());
+    if (store.cwd !== undefined && store.cwd !== this.projectPath) throw new Error("Project store path/identity mismatch");
+    return { bytes, store, sha256: bytes ? sha256(bytes) : null };
+  }
+
+  private assertLegacyResolved(store: CronStore): void {
+    if (!present(this.legacyStorePath)) return;
+    if (!store.legacySourceSha256) throw new Error("Legacy schedule store requires an explicit offline project-store migration; scheduling is held");
+    const bytes = readSnapshot(this.legacyStorePath);
+    if (!bytes || sha256(bytes) !== store.legacySourceSha256) throw new Error("Legacy schedule store changed after cutover; scheduling is held for reconciliation");
   }
 
   load(): CronStore {
-    let text: string;
-    try {
-      text = fs.readFileSync(this.storePath, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, jobs: [] };
-      throw error;
-    }
-    const store: unknown = JSON.parse(text);
-    validate(store);
+    const { store } = this.readTarget();
+    this.assertLegacyResolved(store);
     return store;
+  }
+
+  /** Metadata only. Preview is not writer/handle observation or permission to import. */
+  previewProjectMigration() {
+    const old = readSnapshot(this.legacyStorePath);
+    const legacy = old ? decodeStore(old) : undefined;
+    const target = this.readTarget();
+    const sourceSha256 = old ? sha256(old) : null;
+    const summary = (store: CronStore | undefined) => store ? {
+      version: store.version, jobs: store.jobs.length, enabled: store.jobs.filter(job => job.enabled).length,
+      unsettled: store.jobs.filter(ownsExecution).length, idleJobs: store.jobs.filter(job => job.type === "idle").length,
+    } : null;
+    return { legacyPath: this.legacyStorePath, storePath: this.storePath, sourceSha256, targetSha256: target.sha256, source: summary(legacy), target: summary(target.bytes ? target.store : undefined),
+      state: !old ? "no-legacy" : target.store.legacySourceSha256 === sourceSha256 ? "already-imported" : target.store.legacySourceSha256 ? "legacy-changed" : "needs-import",
+      runtimeQuiescence: "not-verified" as const };
+  }
+
+  /** Explicit stopped-writer cutover; never called by session_start or a model tool. */
+  importProjectStore(options: { trustedProject: boolean; writersConfirmedStopped: boolean; sourceSha256: string; targetSha256: string | null }) {
+    if (!options.trustedProject || !options.writersConfirmedStopped || !validEvidenceFingerprint(options.sourceSha256) ||
+      (options.targetSha256 !== null && !validEvidenceFingerprint(options.targetSha256))) throw new Error("Import requires trusted project, verified stopped writers/handles and exact preview hashes");
+    if (fs.realpathSync.native(path.dirname(this.legacyStorePath)) !== path.dirname(this.legacyStorePath)) throw new Error("Legacy store requires its original canonical project config directory");
+    return withStoreLock(this.legacyStorePath, () => {
+      const bytes = readSnapshot(this.legacyStorePath);
+      if (!bytes || sha256(bytes) !== options.sourceSha256) throw new Error("Legacy store changed; re-preview");
+      const legacy = decodeStore(bytes);
+      fs.mkdirSync(this.storeDir, { recursive: true, mode: 0o700 });
+      return withStoreLock(this.storePath, () => {
+        const target = this.readTarget();
+        if (target.store.legacySourceSha256 === options.sourceSha256) return { changed: false, storePath: this.storePath, jobs: target.store.jobs.length, targetSha256: target.sha256 };
+        if (target.sha256 !== options.targetSha256) throw new Error("Target store changed; re-preview");
+        if (target.store.legacyImported) throw new Error("Prior import is unbound or legacy state diverged; reconcile without overwriting either copy");
+        if (legacy.jobs.some(ownsExecution) || target.store.jobs.some(ownsExecution)) throw new Error("Store owns an unsettled execution; reconcile before cutover");
+        if (legacy.migration && target.store.migration && !isDeepStrictEqual(legacy.migration, target.store.migration)) throw new Error("Conflicting schema4 migration evidence; no store was overwritten");
+        const jobs = new Map(target.store.jobs.map(job => [job.id, job]));
+        for (const job of legacy.jobs) {
+          const existing = jobs.get(job.id);
+          if (existing && !isDeepStrictEqual(existing, job)) throw new Error("Conflicting job ID/history; no store was overwritten");
+          jobs.set(job.id, job);
+        }
+        const store: CronStore = { ...legacy, ...target.store, cwd: this.projectPath,
+          version: Math.max(legacy.version, target.store.version), jobs: [...jobs.values()], legacyImported: true, legacySourceSha256: options.sourceSha256 };
+        validate(store);
+        const backupPath = target.bytes ? `${this.storePath}.pre-import-${randomUUID()}.bak` : undefined;
+        if (backupPath && target.bytes) privateWrite(backupPath, target.bytes);
+        // The old writer lock serializes cooperating .23 writers. Recheck the source before exposing new bytes.
+        const original = readSnapshot(this.legacyStorePath);
+        if (!original || sha256(original) !== options.sourceSha256) throw new Error("Legacy store changed; re-preview");
+        this.replaceStore(store);
+        const written = this.readTarget();
+        if (!isDeepStrictEqual(written.store, store)) throw new Error("Cutover readback changed; keep both stores and reconcile");
+        return { changed: true, storePath: this.storePath, jobs: store.jobs.length, targetSha256: written.sha256, ...(backupPath ? { backupPath } : {}) };
+      });
+    });
+  }
+
+  /** Verify that the old layout exposes the same state; never copy back or assert rollback is authorized. */
+  assessProjectRollback() {
+    const old = readSnapshot(this.legacyStorePath);
+    const legacy = decodeStore(old ?? emptyBytes());
+    const target = this.readTarget();
+    const equivalent = (!old || target.store.legacySourceSha256 === sha256(old)) &&
+      !target.store.jobs.some(job => job.type === "idle" || ownsExecution(job)) &&
+      isDeepStrictEqual(legacy.jobs, target.store.jobs) && isDeepStrictEqual(legacy.migration, target.store.migration) &&
+      (target.store.version === legacy.version || (!legacy.jobs.length && !target.store.jobs.length && target.store.version < 4));
+    return { legacyPath: this.legacyStorePath, storePath: this.storePath, sourceSha256: old ? sha256(old) : null, targetSha256: target.sha256,
+      action: equivalent ? "same-state-retain-both" : "hold-diverged-or-incompatible", backupRestorationAllowed: false, runtimeQuiescence: "not-verified" };
+  }
+
+  private replaceStore(store: CronStore): void {
+    const temporary = `${this.storePath}.${randomUUID()}.tmp`;
+    try {
+      privateWrite(temporary, JSON.stringify({ ...store, cwd: this.projectPath }, null, 2));
+      fs.renameSync(temporary, this.storePath);
+      const directory = fs.openSync(this.storeDir, "r");
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    } finally { fs.rmSync(temporary, { force: true }); }
   }
 
   /** Pure migration preview: no lock, bytes or job state are changed. */
   previewSchema4Migration(): Schema4MigrationPreview {
-    const raw = fs.existsSync(this.storePath) ? fs.readFileSync(this.storePath) : Buffer.from(JSON.stringify({ version: 1, jobs: [] }));
-    const store = JSON.parse(raw.toString("utf8")) as CronStore;
-    validate(store);
+    const { store, bytes } = this.readTarget();
+    this.assertLegacyResolved(store);
+    const raw = bytes ?? emptyBytes();
     return {
       sourceVersion: store.version as 1 | 2 | 3 | 4, targetVersion: 4,
       originalSha256: createHash("sha256").update(raw).digest("hex"), storePath: this.storePath,
@@ -172,9 +323,11 @@ export class CronStorage {
   /** Pure rollback/reader-format assessment. It never treats an old backup as the current state. */
   assessSchemaRollback(acceptedVersions: readonly number[] = [1, 2, 3]): SchemaRollbackAssessment {
     if (!acceptedVersions.length || acceptedVersions.some(version => ![1, 2, 3, 4].includes(version)) || new Set(acceptedVersions).size !== acceptedVersions.length) throw new Error("Rollback requires an explicit supported reader schema set");
-    const bytes = fs.existsSync(this.storePath) ? fs.readFileSync(this.storePath) : Buffer.from(JSON.stringify({ version: 1, jobs: [] }));
-    const store: unknown = JSON.parse(bytes.toString("utf8")); validate(store);
-    const formatCompatible = acceptedVersions.includes(store.version);
+    const target = this.readTarget();
+    const store = target.store;
+    this.assertLegacyResolved(store);
+    const bytes = target.bytes ?? emptyBytes();
+    const formatCompatible = acceptedVersions.includes(store.version) && !store.jobs.some(job => job.type === "idle");
     return {
       currentVersion: store.version, acceptedVersions: [...acceptedVersions], currentSha256: createHash("sha256").update(bytes).digest("hex"), formatCompatible,
       action: formatCompatible ? "retain-current-bytes" : "hold-incompatible-software-rollback", backupRestorationAllowed: false, runtimeQuiescence: "not-verified",
@@ -222,49 +375,20 @@ export class CronStorage {
   }
 
   private mutate<T>(change: (store: CronStore) => T, options: { targetVersion?: 4; backupPath?: string; expectedSha256?: string } = {}): T {
-    fs.mkdirSync(this.piDir, { recursive: true, mode: 0o700 });
-    const lockPath = `${this.storePath}.lock`;
-    let fd: number;
-    try {
-      fd = fs.openSync(lockPath, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new ScheduleStoreBusyError();
-      }
-      throw error;
-    }
-    const temporary = `${this.storePath}.${randomUUID()}.tmp`;
-    try {
-      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid }));
-      const original = fs.existsSync(this.storePath) ? fs.readFileSync(this.storePath) : Buffer.from(JSON.stringify({ version: 1, jobs: [] }));
-      if (options.expectedSha256 !== undefined && createHash("sha256").update(original).digest("hex") !== options.expectedSha256) throw new Error("Migration input changed; re-preview without overwriting newer activity");
-      const parsed: unknown = JSON.parse(original.toString("utf8"));
-      validate(parsed);
-      const store = parsed;
+    fs.mkdirSync(this.storeDir, { recursive: true, mode: 0o700 });
+    return withStoreLock(this.storePath, () => {
+      const { bytes, store } = this.readTarget();
+      this.assertLegacyResolved(store);
+      const original = bytes ?? emptyBytes();
+      if (options.expectedSha256 !== undefined && sha256(original) !== options.expectedSha256) throw new Error("Migration input changed; re-preview without overwriting newer activity");
       const result = change(store);
       // Never downgrade schema4 into a format an older writer can overwrite.
       store.version = Math.max(3, store.version, options.targetVersion ?? 3);
       validate(store);
-      if (options.backupPath) {
-        const backup = fs.openSync(options.backupPath, "wx", 0o600);
-        try { fs.writeFileSync(backup, original); fs.fsyncSync(backup); } finally { fs.closeSync(backup); }
-      }
-      const output = fs.openSync(temporary, "wx", 0o600);
-      try {
-        fs.writeFileSync(output, JSON.stringify(store, null, 2), "utf8");
-        fs.fsyncSync(output);
-      } finally {
-        fs.closeSync(output);
-      }
-      fs.renameSync(temporary, this.storePath);
-      const directory = fs.openSync(this.piDir, "r");
-      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+      if (options.backupPath) privateWrite(options.backupPath, original);
+      this.replaceStore(store);
       return result;
-    } finally {
-      fs.rmSync(temporary, { force: true });
-      fs.closeSync(fd);
-      fs.rmSync(lockPath);
-    }
+    });
   }
 
   private owned(job: CronJob | undefined, attemptId: string, owner: AttemptOwner): OwnedAttempt | undefined {
@@ -559,10 +683,12 @@ export class CronStorage {
   }
 
   /** Claim one attempt under the same mutation lock; this is not completion proof. */
-  admitJob(id: string, sessionId: string | undefined): CronJob | undefined {
+  admitJob(id: string, sessionId: string | undefined, idleRevision?: number): CronJob | undefined {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job?.enabled || job.durable || (job.session && job.session !== sessionId)) return;
+      if (idleRevision !== undefined && (job.type !== "idle" || (job.revision ?? 0) !== idleRevision)) return;
+      if (job.type === "idle" && (idleRevision === undefined || ["running", "unknown"].includes(job.lastStatus ?? ""))) return;
       if ((job.expiresAt && Date.parse(job.expiresAt) <= Date.now()) ||
         (job.maxRuns !== undefined && (job.attemptCount ?? job.runCount) >= job.maxRuns)) {
         job.enabled = false;
@@ -943,10 +1069,11 @@ export class CronStorage {
 
   /** Explicit host-operator maintenance. Ordinary session tools retain their foreign-owner guard. */
   previewExpiredRetirement(id: string, expectedOwner: string) {
-    const original = fs.readFileSync(this.storePath);
-    const parsed: unknown = JSON.parse(original.toString("utf8")); validate(parsed);
-    const metadata = inspectExpiredRetirement(path.dirname(this.piDir), parsed.jobs.find(job => job.id === id), expectedOwner);
-    return { ...metadata, expectedSha256: createHash("sha256").update(original).digest("hex") };
+    const { store, bytes } = this.readTarget();
+    this.assertLegacyResolved(store);
+    if (!bytes) throw new Error("Schedule store is absent");
+    const metadata = inspectExpiredRetirement(this.projectPath, store.jobs.find(job => job.id === id), expectedOwner);
+    return { ...metadata, expectedSha256: sha256(bytes) };
   }
 
   retireExpiredJob(id: string, expectedOwner: string, expectedSha256: string) {
@@ -957,7 +1084,7 @@ export class CronStorage {
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id);
       // Re-read the original closure while holding the existing store lock.
-      const metadata = inspectExpiredRetirement(path.dirname(this.piDir), job, expectedOwner);
+      const metadata = inspectExpiredRetirement(this.projectPath, job, expectedOwner);
       const changed = job!.enabled;
       job!.enabled = false;
       return { ...metadata, enabled: false, expectedSha256, changed, backupRef: path.basename(backupPath) };
