@@ -1025,6 +1025,10 @@ export class CronStorage {
         if (partial.policy && partial.policy.mode !== "resilient") throw new Error("Resilient state cannot be downgraded by a configuration update");
         if (job.runtime.continuation && "model" in partial && partial.model !== job.model) throw new Error("Reconcile the existing native checkpoint before changing execution routes");
       }
+      // Same locked snapshot as the write; a separate preflight lookup races other writers.
+      if (partial.name !== undefined && partial.name !== job.name && store.jobs.some(other => other.id !== id && other.name === partial.name)) {
+        throw new Error(`A job named "${partial.name}" already exists. Please use a different name.`);
+      }
       Object.assign(job, partial);
       if (changed) { job.revision = (job.revision ?? 0) + 1; job.pendingEvent = undefined; job.pendingIntent = undefined; job.sourceFingerprint = undefined; job.nextRun = undefined; if (isResilient(job)) { job.runtime.pending = undefined; job.runtime.nextEligibleAt = undefined; } }
       return true;

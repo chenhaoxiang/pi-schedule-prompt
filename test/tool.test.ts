@@ -391,6 +391,19 @@ describe("schedule_prompt — update resolves relative time on schedule (T17)", 
   });
 });
 
+describe("schedule_prompt — update name safety", () => {
+  it("rejects renaming a job to another job's name without mutating the store", async () => {
+    const first = exampleJob({ id: "j-name-1", name: "first" });
+    const second = exampleJob({ id: "j-name-2", name: "second" });
+    const { tool, storage } = buildTool([first, second]);
+    const before = structuredClone(storage.getAllJobs());
+    const result = await tool.execute("call", { action: "update", jobId: first.id, name: "second" } as any, undefined, undefined, makeCtx());
+    expect(result.isError).toBe(true);
+    expect(result.details?.error).toContain("already exists");
+    expect(storage.getAllJobs()).toEqual(before);
+  });
+});
+
 describe("schedule_prompt — session binding", () => {
   it("add with default scope ('session') stamps session = current sessionId", async () => {
     const { tool, storage } = buildTool([], () => "session");

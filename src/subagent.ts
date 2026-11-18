@@ -235,14 +235,13 @@ export async function runSubagentOnce(
     if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
     const session = await prepareModelSession(ctx, modelStr, options, SessionManager.inMemory(ctx.cwd));
     try {
+    // Setup can finish after a stop/shutdown. Aborting an idle SDK session
+    // does not prevent the subsequent prompt from starting a new run.
+    if (signal?.aborted) return { ok: false, error: "Scheduled model run was aborted" };
     let onAbort: (() => void) | undefined;
     if (signal) {
-      if (signal.aborted) {
-        session.abort();
-      } else {
-        onAbort = () => session.abort();
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
+      onAbort = () => session.abort();
+      signal.addEventListener("abort", onAbort, { once: true });
     }
 
     let buffered = "";

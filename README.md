@@ -16,7 +16,7 @@ This is [chenhaoxiang/pi-schedule-prompt](https://github.com/chenhaoxiang/pi-sch
 Install the maintained source only after reviewing its changes:
 
 ```sh
-pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.22
+pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.4.1-fork.23
 ```
 
 Pin a reviewed commit for reproducibility. Installation does not hot-upgrade active Pi sessions. This change does not install itself or start monitoring other sessions.
@@ -58,7 +58,7 @@ Schedule formats:
 | Interval | `30s`, `5m`, `1h` |
 | Cron, with seconds | `0 */5 * * * *`, `0 0 9 * * 1-5` |
 
-Five-field cron is not accepted. Intervals are bounded by the host timer range (2147483647 ms); long one-shot waits are re-armed in bounded chunks. Cron uses the process timezone.
+Five-field cron is not accepted. Intervals are bounded by the host timer range (2147483647 ms); long one-shot waits are re-armed in bounded chunks. User-facing one-shot times include the local UTC offset; persisted values remain UTC ISO. Cron uses the process timezone.
 
 `/schedule-prompt` opens Jobs and Settings. Jobs hotkeys: arrows select, `a` add, `t` enable/disable, `s` scope, `x` remove, `c` explicitly clean disabled jobs, `q` exit. Paused jobs survive shutdown and reload; cleanup is never automatic. Other sessions' bound jobs are read-only.
 

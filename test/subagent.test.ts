@@ -281,6 +281,20 @@ describe("runSubagentOnce", () => {
     expect(fakeSession.bindExtensions).not.toHaveBeenCalled();
   });
 
+  it("does not start a prompt if the legacy model job was cancelled while binding extensions", async () => {
+    const controller = new AbortController();
+    const emitShutdown = vi.fn().mockResolvedValue(undefined);
+    const session = { ...makeFakeSession(), extensionRunner: { emit: emitShutdown } };
+    session.bindExtensions.mockImplementation(async () => { controller.abort(); });
+    mockCreateAgentSession.mockResolvedValue({ session });
+
+    const result = await runSubagentOnce(makeCtx(), "synthetic scheduled check", MODELS[0].id, controller.signal, { extensions: true });
+    expect(result).toEqual({ ok: false, error: "Scheduled model run was aborted" });
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(emitShutdown).toHaveBeenCalledExactlyOnceWith({ type: "session_shutdown", reason: "quit" });
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+  });
+
   it("scheduled extension loadouts retain a native input guard without permitting a question or fallback prompt", async () => {
     const fakeSession = { ...makeFakeSession(), model: MODELS[0], scheduledExecution: { version: 1, active: undefined, start: vi.fn() } }; mockCreateAgentSession.mockResolvedValue({ session: fakeSession });
     await prepareModelSession(makeCtx(), MODELS[0].id, { extensions: ["allowed-fixture"] }, {} as any, true);

@@ -294,6 +294,19 @@ export class CronScheduler {
     return this.jobs.get(id)?.nextRun() || this.nextRuns.get(id) || this.resilient.nextRun(id) || null;
   }
 
+  // A persisted interval deadline can be far away after a clock rollback even
+  // if its period is valid. Recheck the exact target after each bounded wait.
+  private armAt(id: string, target: number, onDue: () => void): void {
+    const timer = setTimeout(() => {
+      if (this.stopped || this.intervals.get(id) !== timer) return;
+      if (target > Date.now()) { this.armAt(id, target, onDue); return; }
+      this.intervals.delete(id);
+      onDue();
+    }, Math.min(MAX_DELAY, Math.max(1, target - Date.now())));
+    timer.unref?.();
+    this.intervals.set(id, timer);
+  }
+
   private scheduleJob(job: CronJob, seedGithubOnly = false): void {
     if (isResilient(job)) { this.resilient.schedule(job); return; }
     try {
@@ -313,14 +326,12 @@ export class CronScheduler {
             if (this.stopped || generation !== (this.generations.get(job.id) ?? 0) || !this.storage.getJob(job.id)?.enabled) return;
             this.nextRuns.set(job.id, new Date(target));
             this.storage.updateJob(job.id, { nextRun: new Date(target).toISOString() });
-            const timer = setTimeout(() => {
-              if (this.stopped) return;
+            this.armAt(job.id, target, () => {
               const next = Date.now() + job.intervalMs!;
               this.nextRuns.set(job.id, new Date(next));
               void this.executeJob(job);
               try { arm(next); } catch (error) { this.fail(job.id, error); }
-            }, Math.max(1, target - Date.now()));
-            timer.unref?.(); this.intervals.set(job.id, timer);
+            });
           };
           arm(anchor);
         } else {
@@ -340,18 +351,10 @@ export class CronScheduler {
         }
         if (!Number.isFinite(target) || target <= Date.now()) throw new Error("One-shot time is invalid or in the past");
         this.nextRuns.set(job.id, new Date(target));
-        const arm = () => {
-          const timer = setTimeout(() => {
-            if (this.stopped) return;
-            if (target > Date.now()) return arm();
-            this.intervals.delete(job.id);
-            this.nextRuns.delete(job.id);
-            void this.executeJob(job);
-          }, Math.min(target - Date.now(), MAX_DELAY));
-          timer.unref?.();
-          this.intervals.set(job.id, timer);
-        };
-        arm();
+        this.armAt(job.id, target, () => {
+          this.nextRuns.delete(job.id);
+          void this.executeJob(job);
+        });
       } else {
         this.jobs.set(job.id, new Cron(job.schedule, () => { void this.executeJob(job); }));
         if (job.durable) this.storage.updateJob(job.id, { nextRun: this.getNextRun(job.id)?.toISOString() });
@@ -802,7 +805,7 @@ export class CronScheduler {
       if (!intervalMs) {
         return {
           ok: false,
-          error: `Invalid interval format: ${schedule}. Use format like '5m', '1h', '30s'`,
+          error: `Invalid interval format or range: ${schedule}. Use a positive duration such as '5m', '1h', '30s' (max 2147483647 ms); use a cron expression for longer calendar repeats.`,
         };
       }
       return { ok: true, schedule, intervalMs };
@@ -823,7 +826,7 @@ export class CronScheduler {
       if (delay < 0) {
         return {
           ok: false,
-          error: `Timestamp is in the past: ${date.toISOString()}. Current time: ${new Date().toISOString()}`,
+          error: `Timestamp is in the past: ${formatLocal(date)}. Current time: ${formatLocal(new Date())}`,
         };
       }
       if (delay < 5000) {
@@ -851,8 +854,7 @@ export class CronScheduler {
   static describeSchedule(type: CronJobType, schedule: string): string {
     if (type === "interval") return `every ${schedule}`;
     if (type === "once") {
-      const date = new Date(schedule);
-      return Number.isNaN(date.getTime()) ? schedule : formatISOShort(date);
+      return formatISOShort(schedule);
     }
     return humanizeCron(schedule);
   }
@@ -908,4 +910,22 @@ export function formatISOShort(input: Date | string): string {
   const hours = date.getHours().toString().padStart(2, "0");
   const minutes = date.getMinutes().toString().padStart(2, "0");
   return `${month} ${day} ${hours}:${minutes}`;
+}
+
+/** Render a user-facing wall-clock timestamp with its UTC offset; storage stays UTC ISO. */
+export function formatLocal(input: Date | string): string {
+  const date = typeof input === "string" ? new Date(input) : input;
+  if (Number.isNaN(date.getTime())) return String(input);
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ` +
+    `${sign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`;
+}
+
+/** Render a schedule without changing its persisted representation. */
+export function displaySchedule(job: Pick<CronJob, "type" | "schedule">): string {
+  return job.type === "once" ? formatLocal(job.schedule) : job.schedule;
 }

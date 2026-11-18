@@ -99,6 +99,25 @@ describe("native inline delivery", () => {
     h.scheduler.stop();
   });
 
+  it.each(["once", "interval"] as const)("waits for the exact far-future %s target before dispatch", async (type) => {
+    const delay = 30 * 86_400_000;
+    const target = new Date(Date.now() + delay).toISOString();
+    const h = harness(type === "once" ? job({ type, schedule: target, intervalMs: undefined }) : job({ durable: true, nextRun: target }));
+    try {
+      h.setIdle(true);
+      h.scheduler.start();
+      expect(h.scheduler.getNextRun("one")?.toISOString()).toBe(target);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(h.pi.sendMessage).not.toHaveBeenCalled();
+      expect(h.storage.getJob("one")?.attemptCount).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(delay - 11);
+      expect(h.pi.sendMessage).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(h.pi.sendMessage).toHaveBeenCalledTimes(1);
+      expect(h.storage.getJob("one")?.attemptCount).toBe(1);
+    } finally { h.scheduler.stop(); }
+  });
+
   it("re-checks the expiry while waiting", async () => {
     const h = harness(job({ expiresAt: new Date(Date.now() + 1500).toISOString() }));
     h.scheduler.start();
@@ -159,8 +178,11 @@ describe("storage and session management", () => {
   it("rejects a rename collision without losing the original records", () => {
     const h = harness();
     h.storage.addJob(job({ id: "two", name: "second" }));
-    expect(() => h.storage.updateJob("one", { name: "second" })).toThrow(/Duplicate/);
-    expect(h.storage.getJob("one")?.name).toBe("check");
+    const original = fs.readFileSync(h.storage.getStorePath());
+    expect(() => h.storage.updateJob("one", { name: "second" })).toThrow(/named "second" already exists/);
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(original);
+    expect(h.storage.updateJob("one", { name: "check", description: "new note" })).toBe(true);
+    expect(h.storage.getJob("one")).toMatchObject({ name: "check", description: "new note" });
   });
 
   it("pauses ambiguous host delivery instead of automatically retrying", async () => {
