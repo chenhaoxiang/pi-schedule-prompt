@@ -12,7 +12,7 @@ async function fixture(scheduled = true) {
   const agentDir = path.join(cwd, "agent"); fs.mkdirSync(agentDir);
   const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
   const storage = new CronStorage(cwd);
-  if (scheduled) storage.addJob({ id: "input", name: "input", type: "once", schedule: new Date(Date.now() + 500).toISOString(), prompt: "Finish independent work; missing email is a local blocker", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: manager.getSessionId(), durable: true, maxRuns: 1, deadlineMs: 1000 });
+  if (scheduled) storage.addJob({ id: "input", name: "input", type: "once", schedule: new Date(Date.now() + 1000).toISOString(), prompt: "Finish independent work; missing email is a local blocker", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: manager.getSessionId(), durable: true, maxRuns: 1, deadlineMs: 3000 });
   const question = vi.fn(async () => ({ content: [{ type: "text" as const, text: "Synthetic answer" }], details: undefined }));
   const faux = fauxProvider({ provider: "scheduled-input-fixture" });
   faux.setResponses([
