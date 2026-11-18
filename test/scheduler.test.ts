@@ -35,6 +35,10 @@ function makeStorage(seedJobs: CronJob[] = []) {
     admitJob: (id: string) => {
       const job = jobs.get(id);
       if (!job?.enabled) return undefined;
+      if (job.maxRunsPerDay !== undefined && (job.dailyUsage?.attempts ?? 0) >= job.maxRunsPerDay) {
+        job.lastStatus = "skipped";
+        return undefined;
+      }
       job.attemptCount = (job.attemptCount ?? job.runCount) + 1;
       job.lastStatus = "unknown";
       return { ...job };
@@ -124,6 +128,24 @@ describe("CronScheduler — idle job lifecycle", () => {
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  it("does not consume an idle stretch when daily admission is temporarily limited", async () => {
+    vi.setSystemTime(new Date("2026-11-18T23:59:58.000Z"));
+    const job = exampleJob({ id: "idle-cap", name: "idle-cap", type: "idle", schedule: "1s", intervalMs: 1_000, maxRunsPerDay: 1, dailyUsage: { day: "2026-11-18", attempts: 1 } });
+    const storage = makeStorage([job]);
+    const pi = makePi();
+    const ctx = makeCtx();
+    ctx.isIdle = () => true;
+    ctx.hasPendingMessages = () => false;
+    const scheduler = new CronScheduler(storage, pi, ctx);
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    storage.updateJob("idle-cap", { dailyUsage: { day: "2026-11-18", attempts: 0 } });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     scheduler.stop();
   });
 

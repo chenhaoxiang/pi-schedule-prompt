@@ -278,6 +278,23 @@ export class CronScheduler {
     }
   }
 
+  private retryIdleAfterAdmissionFailure(id: string, job: CronJob): void {
+    this.pending.delete(id);
+    if (!job.enabled || job.type !== "idle" || !CronScheduler.isLoadedFor(job, this.ctx.sessionManager.getSessionId())) {
+      this.unscheduleJob(id);
+      return;
+    }
+    const now = Date.now();
+    const nextUtcDay = new Date(now);
+    nextUtcDay.setUTCDate(nextUtcDay.getUTCDate() + 1);
+    nextUtcDay.setUTCHours(0, 0, 0, 0);
+    const retryAt = dailyLimited(job) ? nextUtcDay.getTime() : now + IDLE_RETRY_MS;
+    const entry = this.idleJobs.get(id);
+    if (!entry || this.firedThisStretch.has(id)) return;
+    this.clearIdleTimer(id);
+    this.setIdleTimer(entry.job, retryAt, Math.max(1, retryAt - now));
+  }
+
   private clearIdleTimers(): void {
     for (const { timer } of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
@@ -695,7 +712,12 @@ export class CronScheduler {
           this.updateJob(id, eligible);
           continue;
         }
-        if (idle && !eligible) this.consumeIdle(id);
+        if (idle && !eligible) {
+          const current = this.storage.getJob(id);
+          if (current) this.retryIdleAfterAdmissionFailure(id, current);
+          else this.unscheduleJob(id);
+          continue;
+        }
         // Only inline work needs the parent turn; keep it queued without starving
         // later independent model jobs or spending an inline attempt.
         if (eligible && parentBusy && !eligible.model) continue;
@@ -713,10 +735,10 @@ export class CronScheduler {
         }
         if (eligible?.durable && this.activeJobs.size) { this.pending.add(id); this.armDrain(); return; }
         const job = eligible && (eligible.durable ? this.durable.begin(id) : this.storage.admitJob(id, this.ctx.sessionManager.getSessionId(), idle ? eligible.revision ?? 0 : undefined));
-        if (idle) this.consumeIdle(id);
         if (!job && eligible?.durable && this.storage.getAllJobs().some(other => other.claim && other.claim.sessionId === eligible.session && other.claim.phase !== "settled")) this.pending.add(id);
         if (job) {
           admitted = true;
+          if (idle) this.consumeIdle(id);
           this.contention.delete(id);
           const attempts = job.attemptCount!;
           if (job.followUp && job.claim) {
@@ -808,8 +830,11 @@ export class CronScheduler {
     if (!eligible?.model) return;
     const idle = eligible.type === "idle";
     const job = eligible.durable ? this.durable.begin(eligible.id) : this.storage.admitJob(eligible.id, this.ctx.sessionManager.getSessionId(), idle ? eligible.revision ?? 0 : undefined);
+    if (!job) {
+      if (idle) this.retryIdleAfterAdmissionFailure(eligible.id, eligible);
+      return;
+    }
     if (idle) this.consumeIdle(eligible.id);
-    if (!job) return;
     const model = job.model!;
     const attempts = job.attemptCount!;
     if (!job.durable) this.storage.updateJob(job.id, { lastStatus: "running", attemptCount: attempts,
