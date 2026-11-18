@@ -65,7 +65,9 @@ function selectProjectStore(config, host) {
   const configDir = host.piConfig?.configDir || '.pi';
   const agentEnv = (host.piConfig?.name || 'pi').toUpperCase() + '_CODING_AGENT_DIR';
   const configured = process.env[agentEnv];
-  const agentDir = path.resolve(config.cwd, !configured ? path.join(homedir(), configDir, 'agent') : configured === '~' || configured.startsWith('~/') ? path.join(homedir(), configured.slice(1)) : configured);
+  const resolved = path.resolve(config.cwd, !configured ? path.join(homedir(), configDir, 'agent') : configured === '~' || configured.startsWith('~/') ? path.join(homedir(), configured.slice(1)) : configured);
+  const agentDir = fs.realpathSync.native(resolved);
+  if (!fs.statSync(agentDir).isDirectory()) throw new Error('Dedicated host requires an existing agent directory');
   return { agentDir, agentEnv, storePath: path.join(agentDir, 'schedule-prompts', 'projects', sha(config.cwd) + '.json'), legacyPath: path.join(config.cwd, configDir, 'schedule-prompts.json') };
 }
 function validatePins(config) {
@@ -77,8 +79,16 @@ function validatePins(config) {
   if (host.version !== receipt.hostVersion) throw new Error('CLI and fixed installer host bindings differ');
   if (fs.realpathSync(config.packageRoot) !== config.packageRoot || fs.realpathSync(config.cwd) !== config.cwd) throw new Error('Use canonical cwd/package paths');
   validateSessionFile(config);
-  const project = selectProjectStore(config, host);
-  // The extension performs identical path, source and format checks before arming in the child.
+  return selectProjectStore(config, host);
+}
+
+function validateProjectStore(config, project) {
+  // Do not follow a symlink into another profile's store namespace.
+  const directory = path.dirname(project.storePath);
+  for (const dir of [path.dirname(directory), directory]) {
+    if (fs.existsSync(dir) && fs.realpathSync.native(dir) !== dir) throw new Error('Dedicated host requires a canonical project store directory');
+  }
+  // The extension repeats the selected path/source/format checks before arming in the child.
   const legacyExists = fs.existsSync(project.legacyPath);
   if (fs.existsSync(project.storePath)) {
     const store = JSON.parse(fs.readFileSync(project.storePath, 'utf8'));
@@ -86,7 +96,6 @@ function validatePins(config) {
     if (legacyExists && (!/^[a-f0-9]{64}$/.test(store.legacySourceSha256 ?? '') || sha(fs.readFileSync(project.legacyPath)) !== store.legacySourceSha256)) throw new Error('Legacy schedule store requires explicit previewed cutover before dedicated host start');
     if (![1, 2, 3, 4].includes(store.version) || !Array.isArray(store.jobs) || store.jobs.some(job => job.enabled && (!job.session || (job.session === config.sessionId && (!job.durable || !job.maxRuns || !job.expiresAt || (config.toolProfile === 'read-only' && job.model)))))) throw new Error('Dedicated host requires finite durable session-bound schedules; read-only profile requires inline jobs');
   } else if (legacyExists) throw new Error('Legacy schedule store requires explicit previewed cutover before dedicated host start');
-  return project;
 }
 
 async function control(config, op, jobId) {
@@ -112,12 +121,15 @@ export async function run(config) {
   const project = validatePins(config);
   const identityFile = path.join(config.stateDir, 'identity.json');
   const identity = { fingerprint: config.fingerprint, agentEnv: project.agentEnv, agentDir: project.agentDir, storePath: project.storePath };
+  const verifyIdentity = () => {
+    const previous = JSON.parse(fs.readFileSync(identityFile, 'utf8'));
+    if (!previous || Object.entries(identity).some(([field, value]) => previous[field] !== value)) throw new Error('State directory already belongs to a different fixed config/profile/store; use a new private state directory');
+  };
+  // Reject a changed binding before reading a different profile's jobs.
+  if (fs.existsSync(identityFile)) verifyIdentity();
+  validateProjectStore(config, project);
   try { fs.writeFileSync(identityFile, JSON.stringify(identity), { flag: 'wx', mode: 0o600 }); }
-  catch (error) {
-    let previous;
-    try { previous = JSON.parse(fs.readFileSync(identityFile, 'utf8')); } catch { previous = undefined; }
-    if (error.code !== 'EEXIST' || !previous || previous.fingerprint !== identity.fingerprint || previous.agentEnv !== identity.agentEnv || previous.agentDir !== identity.agentDir || previous.storePath !== identity.storePath) throw new Error('State directory already belongs to a different fixed config/profile/store');
-  }
+  catch (error) { if (error.code !== 'EEXIST') throw error; verifyIdentity(); }
   const recordFile = path.join(config.stateDir, 'host.json');
   const token = randomBytes(32).toString('hex');
   let owned = false;

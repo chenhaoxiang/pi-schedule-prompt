@@ -121,12 +121,25 @@ describe("dedicated native RPC supervisor service", () => {
     const profileB = path.join(h.cwd, "profile-b");
     fs.mkdirSync(profileA, { recursive: true, mode: 0o700 });
     fs.mkdirSync(profileB, { recursive: true, mode: 0o700 });
-    const first = start(h.file, { PI_CODING_AGENT_DIR: profileA });
+    const alias = path.join(h.cwd, "selected-profile");
+    fs.symlinkSync(profileA, alias, "dir");
+    const first = start(h.file, { PI_CODING_AGENT_DIR: alias });
     await ready(h, first);
+    const boundPath = new CronStorage(h.cwd, profileA).getStorePath();
+    expect(JSON.parse((await command("status", h.file)).data)).toMatchObject({ agentDir: profileA, storePath: boundPath, runtime: { storePath: boundPath } });
     expect((await command("stop", h.file)).code).toBe(0);
     await vi.waitFor(() => expect(first.child.exitCode).toBe(0), { timeout: 12000 });
-    const second = start(h.file, { PI_CODING_AGENT_DIR: profileB });
+    const identity = path.join(h.stateDir, "identity.json");
+    const original = fs.readFileSync(identity);
+    expect(JSON.parse(original.toString("utf8"))).toMatchObject({ agentDir: profileA, storePath: boundPath });
+    // Even an unchanged environment string cannot redirect state by retargeting its alias.
+    fs.unlinkSync(alias);
+    fs.symlinkSync(profileB, alias, "dir");
+    const second = start(h.file, { PI_CODING_AGENT_DIR: alias });
     await vi.waitFor(() => expect(second.child.exitCode).toBe(1), { timeout: 10000 });
+    expect(second.stderr()).toContain("different fixed config/profile/store");
+    expect(fs.readFileSync(identity)).toEqual(original);
+    expect(fs.existsSync(path.join(h.stateDir, "host.json"))).toBe(false);
     expect(fs.existsSync(path.join(h.cwd, "inference-started"))).toBe(false);
   }, 35000);
 
