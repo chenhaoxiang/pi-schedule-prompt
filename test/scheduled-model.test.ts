@@ -16,13 +16,16 @@ function fixture() {
   const cwd = fs.mkdtempSync(path.join(root, "case-")); directories.push(cwd);
   const directory = path.join(cwd, ".pi/schedule-native"); fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = path.join(directory, "selected.jsonl");
+  const checkpointReference = { sessionId: "schedule-synthetic", entryId: "checkpoint", runId: "run", sessionFile: file };
   const checkpoint = { version: 1, runId: "run", binding: { jobId: "job", attemptId: "before", ownerSessionId: "schedule-synthetic", ownerEpoch: 2, revision: 1 }, completedResults: [], completedResultCount: 0, declarations: { nextAction: "use-existing-result" }, effectStatus: "none-observed", businessOutcome: "unverified" };
   const values = [{ type: "session", version: CURRENT_SESSION_VERSION, id: "schedule-synthetic", timestamp: new Date().toISOString(), cwd }, { id: "checkpoint", parentId: null, timestamp: new Date().toISOString(), type: "custom", customType: "pi.scheduled-checkpoint.v1", data: checkpoint }];
   fs.writeFileSync(file, values.map(value => JSON.stringify(value)).join("\n") + "\n", { mode: 0o600 });
   const job: ResilientJob = resilientDefinition({ id: "job", name: "job", type: "interval", schedule: "1s", intervalMs: 1000, prompt: "synthetic", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: "logical-owner", model: "fixture/model", maxRuns: 3, expiresAt: new Date(Date.now() + 60_000).toISOString(), deadlineMs: 10_000 });
-  // This pure planner fixture supplies only the historical fields it reads; schema validation is tested separately.
-  job.runtime.continuation = { attemptId: "before", checkpoint: { sessionId: "schedule-synthetic", entryId: "checkpoint", runId: "run", sessionFile: file } };
-  job.attemptHistory = [{ id: "before", model: "fixture/model" } as any];
+  job.runtime.continuation = { attemptId: "before", checkpoint: checkpointReference };
+  job.attemptHistory = [{
+    id: "before", revision: 1, owner: { sessionId: "logical-owner", instanceId: "instance", epoch: 2 }, checkpoint: checkpointReference,
+    nativeProof: { version: 1, runId: "run", binding: { ...checkpoint.binding }, finishedAt: new Date().toISOString(), execution: "deferred", checkpointEntryId: "checkpoint", effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 }, model: "fixture/model",
+  } as any];
   const getAvailable = vi.fn(() => [{ provider: "fixture", id: "model", name: "model" }]);
   const ctx = { cwd, modelRegistry: { getAvailable } } as any;
   return { cwd, file, values, job, ctx, getAvailable };
@@ -48,7 +51,8 @@ function sdkFixture() {
   vi.mocked(prepareModelSession).mockResolvedValue(session as any);
   const attempt: OwnedAttempt = { id: "before", revision: 1, owner: { sessionId: "logical-owner", instanceId: "instance", epoch: 2 }, occurrence: { id: "tick", revision: 1, source: "timer", dueAt: new Date().toISOString() }, admittedAt: new Date().toISOString(), deadlineMs: 10_000, workBudgetMs: 5000, model: "fixture/model", nativeSessionId: "schedule-synthetic" };
   const receipt: NativeExecutionProof = { version: 1, runId: "run", binding: { jobId: h.job.id, attemptId: attempt.id, ownerSessionId: "schedule-synthetic", ownerEpoch: attempt.owner.epoch, revision: attempt.revision }, finishedAt: new Date().toISOString(), execution: "deferred", checkpointEntryId: "checkpoint", effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 };
-  return { ...h, order, session, manager, attempt, receipt, emitShutdownError: () => listener?.({ event: "session_shutdown", error: "synthetic shutdown rejection", extensionPath: "fixture" }), open: () => prepareScheduledModel(h.ctx, h.job, attempt, "fixture/model", () => order.push("bound")) };
+  entries.set("receipt", { id: "receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: receipt });
+  return { ...h, order, session, manager, entries, attempt, receipt, emitShutdownError: () => listener?.({ event: "session_shutdown", error: "synthetic shutdown rejection", extensionPath: "fixture" }), open: () => prepareScheduledModel(h.ctx, h.job, attempt, "fixture/model", () => order.push("bound")) };
 }
 
  describe("read-only model planning and native transcript readback", () => {
@@ -66,6 +70,50 @@ function sdkFixture() {
     expect(create).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled(); expect(fs.readFileSync(h.file)).toEqual(bytes);
     const reader = readStoredModelSession(h.cwd, "schedule-synthetic", h.file); const entry = reader.getEntry("checkpoint") as any; entry.data.declarations.nextAction = "caller mutation";
     expect((reader.getEntry("checkpoint") as any).data.declarations.nextAction).toBe("use-existing-result");
+  });
+
+  it("re-reads the exact stored transcript tail for every metadata-only access", () => {
+    const h = fixture();
+    const reader = readStoredModelSession(h.cwd, "schedule-synthetic", h.file);
+    expect(reader.getEntries()).toHaveLength(1);
+    fs.appendFileSync(h.file, JSON.stringify({ id: "later", parentId: "checkpoint", timestamp: new Date().toISOString(), type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId: "run", binding: h.values[1].data.binding } }) + "\n");
+    expect(reader.getEntries()).toHaveLength(2);
+    expect(reader.getEntry("later")).toMatchObject({ id: "later", customType: "pi.scheduled-checkpoint.v1" });
+  });
+
+  it("rejects a continuation transcript with a missing or foreign cwd without rewriting it", () => {
+    const h = fixture();
+    for (const cwd of [undefined, path.dirname(h.cwd)]) {
+      h.values[0] = { ...h.values[0], ...(cwd === undefined ? {} : { cwd }) };
+      if (cwd === undefined) delete (h.values[0] as { cwd?: string }).cwd;
+      fs.writeFileSync(h.file, h.values.map(value => JSON.stringify(value)).join("\n") + "\n");
+      const bytes = fs.readFileSync(h.file);
+      expect(() => readStoredModelSession(h.cwd, "schedule-synthetic", h.file)).toThrow(/identity/);
+      expect(fs.readFileSync(h.file)).toEqual(bytes);
+    }
+  });
+
+  it("fails a cwd-mismatched continuation before SDK open or admission/store writes", async () => {
+    const h = fixture(); Object.defineProperty(AgentSession, "scheduledExecutionVersion", { configurable: true, value: 1 });
+    h.values[0] = { ...h.values[0], cwd: path.dirname(h.cwd) };
+    fs.writeFileSync(h.file, h.values.map(value => JSON.stringify(value)).join("\n") + "\n");
+    const transcript = fs.readFileSync(h.file); const storeFile = path.join(h.cwd, "store.json"); fs.writeFileSync(storeFile, "store-before"); const store = fs.readFileSync(storeFile);
+    const open = vi.spyOn(SessionManager, "open");
+    const bindFile = vi.fn((sessionFile: string) => fs.writeFileSync(storeFile, sessionFile));
+    const attempt: OwnedAttempt = { id: "before", revision: 1, owner: { sessionId: "logical-owner", instanceId: "instance", epoch: 2 }, occurrence: { id: "tick", revision: 1, source: "timer", dueAt: new Date().toISOString() }, admittedAt: new Date().toISOString(), deadlineMs: 10_000, workBudgetMs: 5000, model: "fixture/model", nativeSessionId: "schedule-synthetic", nativeSessionFile: h.file };
+    await expect(prepareScheduledModel(h.ctx, h.job, attempt, "fixture/model", bindFile)).rejects.toThrow(/identity/);
+    expect(open).not.toHaveBeenCalled(); expect(prepareModelSession).not.toHaveBeenCalled(); expect(bindFile).not.toHaveBeenCalled();
+    expect(fs.readFileSync(h.file)).toEqual(transcript); expect(fs.readFileSync(storeFile)).toEqual(store);
+  });
+
+  it.each(["ownerEpoch", "revision"] as const)("rejects a continuation checkpoint with a stale %s binding before any session construction", field => {
+    const h = fixture(); Object.defineProperty(AgentSession, "scheduledExecutionVersion", { configurable: true, value: 1 });
+    const create = vi.spyOn(SessionManager, "create"); const open = vi.spyOn(SessionManager, "open");
+    (h.values[1].data as any).binding[field]++;
+    fs.writeFileSync(h.file, h.values.map(value => JSON.stringify(value)).join("\n") + "\n");
+    const bytes = fs.readFileSync(h.file);
+    expect(() => planScheduledModel(h.ctx, h.job)).toThrow(/replay/);
+    expect(create).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled(); expect(fs.readFileSync(h.file)).toEqual(bytes);
   });
 
   it("never repairs a malformed/partly written transcript while another exact native owner may still be alive", () => {
@@ -110,6 +158,24 @@ describe("actual SDK close acknowledgement producer", () => {
     const h = sdkFixture(); h.session.extensionRunner.emit.mockImplementationOnce(async () => { h.emitShutdownError(); });
     const prepared = await h.open(); await expect(prepared.dispose(h.receipt)).rejects.toThrow(/shutdown handler failed/);
     expect(h.session.dispose).toHaveBeenCalledOnce(); expect(h.manager.appendCustomEntry).not.toHaveBeenCalled(); expect(readModelSdkClose(prepared.sessionManager, h.receipt)).toBeUndefined();
+  });
+
+  it("does not accept an ACK that is followed by later transcript activity", () => {
+    const h = sdkFixture();
+    const proof: ModelSdkCloseProof = { version: 1, runId: h.receipt.runId, binding: { ...h.receipt.binding }, checkpointEntryId: h.receipt.checkpointEntryId, closedAt: new Date().toISOString() };
+    h.entries.set("sdk-close", { id: "sdk-close", type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: proof });
+    h.entries.set("later", { id: "later", type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId: h.receipt.runId, binding: h.receipt.binding } });
+    expect(readModelSdkClose(h.manager, h.receipt)).toBeUndefined();
+  });
+
+  it("rejects an ACK when a conflicting same-binding receipt precedes the valid receipt", () => {
+    const h = sdkFixture();
+    const proof: ModelSdkCloseProof = { version: 1, runId: h.receipt.runId, binding: { ...h.receipt.binding }, checkpointEntryId: h.receipt.checkpointEntryId, closedAt: new Date().toISOString() };
+    h.entries.clear();
+    h.entries.set("conflicting-receipt", { id: "conflicting-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: { ...h.receipt, failedRecoveryMs: 1 } });
+    h.entries.set("valid-receipt", { id: "valid-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: h.receipt });
+    h.entries.set("sdk-close", { id: "sdk-close", type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: proof });
+    expect(readModelSdkClose(h.manager, h.receipt)).toBeUndefined();
   });
 
   it("does not acknowledge a failed close-ACK write even after SDK disposal has returned", async () => {

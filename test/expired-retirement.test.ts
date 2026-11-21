@@ -24,7 +24,7 @@ function fixture() {
   if (claimed.runtime.slot.kind !== "owned") throw new Error("fixture admission missing");
   const attempt = claimed.runtime.slot.attempt;
   const sessionId = attempt.nativeSessionId!, runId = "synthetic-native-run";
-  storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId, sessionId, startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 10_000).toISOString() });
+  storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId, sessionId, sessionFile: path.join(cwd, ".pi/schedule-native", "synthetic.jsonl"), startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 10_000).toISOString() });
   const nativeDir = path.join(cwd, ".pi/schedule-native"); fs.mkdirSync(nativeDir, { recursive: true });
   const nativeFile = path.join(nativeDir, "synthetic.jsonl");
   const checkpoint = { sessionId, runId, entryId: "checkpoint", sessionFile: nativeFile };

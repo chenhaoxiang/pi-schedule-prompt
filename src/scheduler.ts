@@ -84,7 +84,12 @@ export class CronScheduler {
   ) {
     this.durable = new DurableExecution(storage, pi, ctx);
     this.resilient = new ResilientScheduling(storage, ctx, {
-      onQueued: id => { this.pending.add(id); this.emitChange({ type: "fire", job: this.storage.getJob(id) }); this.armDrain(); },
+      onQueued: id => {
+        this.pending.add(id);
+        try { this.emitChange({ type: "fire", job: this.storage.getJob(id) }); }
+        catch (error) { if (!(error instanceof ScheduleStoreBusyError)) this.failResilient(id, error); }
+        this.armDrain();
+      },
       onSettled: id => { this.resilient.scheduleAfterSettlement(id); this.drain(); },
       onChange: job => this.emitChange({ type: "update", job }),
       onError: (id, error) => this.failResilient(id, error),
@@ -112,7 +117,11 @@ export class CronScheduler {
       }
       if (job.github && job.github.kind !== "pull-request-checks" && job.catchUp !== "latest") this.storage.updateJob(job.id, { sourceFingerprint: undefined });
       if (isResilient(job)) {
-        this.resilient.schedule(job);
+        try { this.resilient.schedule(job, "restore"); }
+        catch (error) {
+          if (error instanceof ScheduleStoreBusyError) this.resilient.recoverContention(job.id, "restore");
+          else throw error;
+        }
         continue;
       }
       if (job.type === "event" && job.pendingEvent) {
@@ -360,10 +369,19 @@ export class CronScheduler {
     const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && item.resumeAfterMs === resumeAfterMs && JSON.stringify(item.safeScopes ?? []) === JSON.stringify(safeScopes));
     if (prior) return { job, changed: false };
     if (job.runtime.slot.kind === "owned") throw new Error("Wait for exact native/SDK resource closure before checkpoint/effect reconciliation");
-    const changed = this.storage.reconcileResilientAttempt(id, job.session!, attemptId, evidenceFingerprint, disposition, safeScopes, resumeAfterMs);
+    const expectedRevision = job.revision ?? 0;
+    const expectedRuntime = {
+      phase: job.runtime.slot.phase,
+      ...(job.runtime.slot.reason !== undefined ? { reason: job.runtime.slot.reason } : {}),
+      ownerEpoch: job.runtime.ownerEpoch,
+      nextEligibleAt: job.runtime.nextEligibleAt,
+      pendingId: job.runtime.pending?.id,
+      pendingRevision: job.runtime.pending?.revision,
+    };
+    const changed = this.storage.reconcileResilientAttempt(id, job.session!, attemptId, evidenceFingerprint, disposition, safeScopes, resumeAfterMs, expectedRevision, expectedRuntime);
     const updated = this.storage.getJob(id);
     if (!updated || !isResilient(updated) || !updated.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && item.resumeAfterMs === resumeAfterMs)) throw new Error("No exact finalized checkpoint resolution was recorded; no old work was replayed");
-    if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated); this.drain(); }
+    if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated, "restore"); this.drain(); }
     return { job: updated, changed };
   }
 
@@ -371,10 +389,19 @@ export class CronScheduler {
     const job = this.storage.getJob(id);
     if (this.isScheduledTurn() || !job || !isResilient(job) || job.session !== this.ctx.sessionManager.getSessionId()) throw new Error("Legacy effect reconciliation requires the ordinary owning operator context");
     if (this.durable.busy() || this.activeJobs.size || this.activeSubagents.size || job.runtime.slot.kind === "owned") throw new Error("Wait for exact native/SDK resource closure before legacy reconciliation");
-    const changed = this.storage.reconcileLegacyClaim(id, job.session!, claimId, claimBinding, evidenceFingerprint, disposition, safeScopes);
+    const expectedRevision = job.revision ?? 0;
+    const expectedRuntime = {
+      phase: job.runtime.slot.phase,
+      ...(job.runtime.slot.reason !== undefined ? { reason: job.runtime.slot.reason } : {}),
+      ownerEpoch: job.runtime.ownerEpoch,
+      nextEligibleAt: job.runtime.nextEligibleAt,
+      pendingId: job.runtime.pending?.id,
+      pendingRevision: job.runtime.pending?.revision,
+    };
+    const changed = this.storage.reconcileLegacyClaim(id, job.session!, claimId, claimBinding, evidenceFingerprint, disposition, safeScopes, expectedRevision, expectedRuntime);
     const updated = this.storage.getJob(id);
     if (!updated || !isResilient(updated) || !updated.attemptResolutions.some(item => item.attemptId === claimId && item.legacyClaimBinding === claimBinding && item.evidenceFingerprint === evidenceFingerprint && item.disposition === disposition && JSON.stringify(item.safeScopes ?? []) === JSON.stringify(safeScopes))) throw new Error("No exact retained legacy claim resolution was recorded");
-    if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated); this.drain(); }
+    if (changed) { this.unscheduleJob(id); this.resilient.schedule(updated, "restore"); this.drain(); }
     return { job: updated, changed };
   }
 
@@ -496,7 +523,7 @@ export class CronScheduler {
   }
 
   private scheduleJob(job: CronJob, seedGithubOnly = false, idleSince?: number): void {
-    if (isResilient(job)) { this.resilient.schedule(job); return; }
+    if (isResilient(job)) { this.resilient.schedule(job, false); return; }
     try {
       if (job.type === "event") {
         eventNames(job.schedule);
@@ -921,7 +948,14 @@ export class CronScheduler {
   private deferContention(id: string): void {
     const failures = (this.contention.get(id) ?? 0) + 1;
     this.contention.set(id, failures);
-    if (this.storage.getJob(id)?.durable && failures > 3) { this.fail(id, new Error("Pre-dispatch store remained busy after three retries; held without execution")); return; }
+    let durable = false;
+    try { durable = !!this.storage.getJob(id)?.durable; }
+    catch (error) {
+      if (!(error instanceof ScheduleStoreBusyError)) throw error;
+      this.pending.add(id); this.armDrain();
+      return;
+    }
+    if (durable && failures > 3) { this.fail(id, new Error("Pre-dispatch store remained busy after three retries; held without execution")); return; }
     this.pending.add(id); this.armDrain();
   }
 

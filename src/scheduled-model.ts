@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AgentSession, CURRENT_SESSION_VERSION, type ExtensionContext, type FileEntry, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
-import { validateModelSdkClose, validateNativeProof } from "./resilient-policy.js";
+import { normalizeNativeProof, sameCheckpointReference, sameNativeProof, validateModelSdkClose, validateNativeProof } from "./resilient-policy.js";
 import { prepareModelSession, resolveModelRoute } from "./subagent.js";
 import type { ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob } from "./types.js";
 
@@ -14,6 +14,7 @@ export interface PreparedScheduledModel {
   sessionManager: NativeSessionReader;
   dispose(receipt?: NativeExecutionProof): Promise<ModelSdkCloseProof | undefined>;
 }
+type ScheduledContinuation = NonNullable<ResilientJob["runtime"]["continuation"]>;
 const sessionDirectory = (cwd: string) => path.resolve(cwd, ".pi", "schedule-native");
 const staticCapabilityVersion = () => (AgentSession as unknown as { scheduledExecutionVersion?: number }).scheduledExecutionVersion;
 
@@ -23,30 +24,80 @@ function selectedFile(cwd: string, sessionFile: string): string {
   return selected;
 }
 
-/** A strict metadata-only read. Never call SessionManager.open (which may repair/migrate bytes) during preflight/readback. */
-export function readStoredModelSession(cwd: string, sessionId: string, sessionFile: string): NativeSessionReader {
+function readStoredEntries(cwd: string, sessionId: string, sessionFile: string): { selected: string; entries: SessionEntry[] } {
   const selected = selectedFile(cwd, sessionFile);
   const values = fs.readFileSync(selected, "utf8").split("\n").filter(line => line.trim()).map(line => JSON.parse(line) as FileEntry);
   const header = values[0];
-  if (header?.type !== "session" || header.id !== sessionId || header.version !== CURRENT_SESSION_VERSION) throw new Error("Native transcript identity/format is unavailable; preserve original bytes");
+  if (header?.type !== "session" || header.id !== sessionId || header.version !== CURRENT_SESSION_VERSION || typeof header.cwd !== "string" || path.resolve(header.cwd) !== path.resolve(cwd)) throw new Error("Native transcript identity/format is unavailable; preserve original bytes");
   const entries = values.slice(1) as SessionEntry[];
   if (entries.some(entry => !entry || typeof entry.id !== "string" || !entry.id) || new Set(entries.map(entry => entry.id)).size !== entries.length) throw new Error("Native transcript entries are malformed/duplicated; preserve original bytes");
-  const byId = new Map(entries.map(entry => [entry.id, entry]));
-  return { getSessionId: () => sessionId, getSessionFile: () => selected, getEntry: id => structuredClone(byId.get(id)), getEntries: () => structuredClone(entries) };
+  return { selected, entries };
+}
+
+/** A strict metadata-only read. Never call SessionManager.open (which may repair/migrate bytes) during preflight/readback. */
+export function readStoredModelSession(cwd: string, sessionId: string, sessionFile: string): NativeSessionReader {
+  const initial = readStoredEntries(cwd, sessionId, sessionFile);
+  return {
+    getSessionId: () => sessionId,
+    getSessionFile: () => initial.selected,
+    getEntry: id => structuredClone(readStoredEntries(cwd, sessionId, sessionFile).entries.find(entry => entry.id === id)),
+    getEntries: () => structuredClone(readStoredEntries(cwd, sessionId, sessionFile).entries),
+  };
 }
 
 /** A native run receipt cannot substitute for this separate persistent SDK/file-writer acknowledgement. */
 export function readModelSdkClose(manager: NativeSessionReader, native: NativeExecutionProof): ModelSdkCloseProof | undefined {
-  const entries = manager.getEntries();
-  for (let index = entries.length - 1; index >= 0; index--) {
+  const entries = manager.getEntries().filter(entry => !!entry);
+  const lastIndex = entries.length - 1;
+  if (lastIndex < 1) return undefined;
+  const expected = normalizeNativeProof(native);
+  let latestReceiptIndex = -1;
+  let latestReceiptMatches = false;
+  let matchingReceipt = false;
+  let conflictingReceipt = false;
+  for (let index = 0; index < lastIndex; index++) {
     const entry = entries[index];
-    if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY) continue;
-    const proof = entry.data as ModelSdkCloseProof;
-    if (proof?.runId !== native.runId || !sameNativeBinding(proof.binding, native.binding) || proof.checkpointEntryId !== native.checkpointEntryId) continue;
-    validateModelSdkClose(proof, native);
-    return structuredClone(proof);
+    if (entry.type !== "custom" || entry.customType !== "pi.scheduled-receipt.v1") continue;
+    latestReceiptIndex = index;
+    if (!sameNativeBinding((entry.data as NativeExecutionProof)?.binding, expected.binding)) {
+      latestReceiptMatches = false;
+      continue;
+    }
+    try {
+      // Compare every receipt for the exact native binding. An ACK cannot
+      // choose a later valid proof over an earlier conflicting transcript.
+      latestReceiptMatches = sameNativeProof(entry.data as NativeExecutionProof, expected);
+      if (latestReceiptMatches) matchingReceipt = true;
+      else conflictingReceipt = true;
+    } catch {
+      latestReceiptMatches = false;
+      conflictingReceipt = true;
+    }
   }
-  return undefined;
+  if (latestReceiptIndex < 0 || !latestReceiptMatches || !matchingReceipt || conflictingReceipt) return undefined;
+  const entry = entries[lastIndex];
+  if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY || lastIndex <= latestReceiptIndex) return undefined;
+  const proof = entry.data as ModelSdkCloseProof;
+  if (proof?.runId !== expected.runId || !sameNativeBinding(proof.binding, expected.binding) || proof.checkpointEntryId !== expected.checkpointEntryId) return undefined;
+  try { validateModelSdkClose(proof, expected); }
+  catch { return undefined; }
+  return structuredClone(proof);
+}
+
+export function validateContinuationCheckpointBinding(job: ResilientJob, continuation: ScheduledContinuation, data: { runId: string; binding: NativeExecutionProof["binding"] }): void {
+  const record = job.attemptHistory.find(item => item.id === continuation.attemptId);
+  const proof = record?.nativeProof;
+  const checkpoint = record?.checkpoint;
+  if (!record || !proof || !checkpoint || !sameCheckpointReference(checkpoint, continuation.checkpoint)) throw new Error("Exact native continuation binding is unavailable; do not replay the run");
+  validateNativeProof(proof);
+  const expectedBinding: NativeExecutionProof["binding"] = {
+    jobId: job.id,
+    attemptId: continuation.attemptId,
+    ownerSessionId: continuation.checkpoint.sessionId,
+    ownerEpoch: record.owner.epoch,
+    revision: record.revision,
+  };
+  if (proof.runId !== continuation.checkpoint.runId || proof.checkpointEntryId !== continuation.checkpoint.entryId || !sameNativeBinding(proof.binding, expectedBinding) || data.runId !== continuation.checkpoint.runId || !sameNativeBinding(data.binding, expectedBinding)) throw new Error("Exact native continuation binding is unavailable; do not replay the run");
 }
 
 /** Pure route/checkpoint/SDK preflight. It constructs no SDK session and writes no transcript. */
@@ -63,7 +114,8 @@ export function planScheduledModel(ctx: ExtensionContext, job: ResilientJob): Sc
     const manager = readStoredModelSession(ctx.cwd, continuation.checkpoint.sessionId, continuation.checkpoint.sessionFile);
     const entry = manager.getEntry(continuation.checkpoint.entryId);
     const data = entry?.type === "custom" && entry.customType === "pi.scheduled-checkpoint.v1" ? entry.data as { version?: number; runId?: string; binding?: NativeExecutionProof["binding"] } : undefined;
-    if (data?.version !== 1 || data.runId !== continuation.checkpoint.runId || data.binding?.jobId !== job.id || data.binding.attemptId !== continuation.attemptId || data.binding.ownerSessionId !== continuation.checkpoint.sessionId) throw new Error("Model continuation checkpoint/binding is unavailable; do not create a replay session");
+    if (data?.version !== 1 || data.runId !== continuation.checkpoint.runId || !data.binding) throw new Error("Model continuation checkpoint/binding is unavailable; do not create a replay session");
+    validateContinuationCheckpointBinding(job, continuation, data as { runId: string; binding: NativeExecutionProof["binding"] });
   }
   return { route: resolution.route, ...(continuation ? { checkpoint: structuredClone(continuation.checkpoint) } : {}) };
 }

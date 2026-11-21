@@ -6,9 +6,9 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inspectExpiredRetirement } from "./expired-retirement.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
-import { continuationDelayNotBefore, instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
+import { continuationDelayNotBefore, instant, isResilient, normalizeNativeProof, requiresReconciliation, resilientDefinition, sameCheckpointReference, sameNativeProof, spentOnUtcDay, validateModelSdkClose, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
 import { nextDue, timingView } from "./timing.js";
-import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type LegacyOwnerHandover, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type TimedOccurrence } from "./types.js";
+import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type LegacyOwnerHandover, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type ResilientRuntimeExpectation, type TimedOccurrence } from "./types.js";
 
 const LEGACY_FILE = "schedule-prompts.json";
 const STATUSES = new Set(["success", "error", "running", "queued", "dispatched", "unknown", "skipped", "quiet"]);
@@ -196,6 +196,8 @@ export interface SchemaRollbackAssessment {
 export class ScheduleStoreBusyError extends Error {
   constructor() { super("Schedule store is busy (lock exists); retry after the owning writer finishes"); }
 }
+
+type MutationOutcome<T> = { write: boolean; value: T };
 
 /** Cooperating same-user local writers; not a distributed execution lock. */
 export class CronStorage {
@@ -393,53 +395,96 @@ export class CronStorage {
     });
   }
 
+  /** CAS-aware mutations can explicitly return without rewriting unchanged bytes. */
+  private mutateCas<T>(change: (store: CronStore) => MutationOutcome<T>): T {
+    fs.mkdirSync(this.storeDir, { recursive: true, mode: 0o700 });
+    return withStoreLock(this.storePath, () => {
+      const { store } = this.readTarget();
+      this.assertLegacyResolved(store);
+      const result = change(store);
+      if (!result.write) return result.value;
+      // Never downgrade schema4 into a format an older writer can overwrite.
+      store.version = Math.max(3, store.version);
+      validate(store);
+      this.replaceStore(store);
+      return result.value;
+    });
+  }
+
   private owned(job: CronJob | undefined, attemptId: string, owner: AttemptOwner): OwnedAttempt | undefined {
     if (!job || !isResilient(job) || job.runtime.slot.kind !== "owned") return;
     const attempt = job.runtime.slot.attempt;
     return attempt.id === attemptId && attempt.owner.sessionId === owner.sessionId && attempt.owner.instanceId === owner.instanceId && attempt.owner.epoch === owner.epoch ? attempt : undefined;
   }
 
+  private matchesRuntime(job: ResilientJob, expected: ResilientRuntimeExpectation): boolean {
+    const slot = job.runtime.slot;
+    if (slot.phase !== expected.phase || slot.reason !== expected.reason) return false;
+    if (expected.ownerEpoch !== undefined && job.runtime.ownerEpoch !== expected.ownerEpoch) return false;
+    if (expected.attemptId !== undefined && (slot.kind !== "owned" || slot.attempt.id !== expected.attemptId || slot.attempt.owner.epoch !== expected.ownerEpoch)) return false;
+    if (Object.hasOwn(expected, "nextEligibleAt") && job.runtime.nextEligibleAt !== expected.nextEligibleAt) return false;
+    if (Object.hasOwn(expected, "pendingId") && job.runtime.pending?.id !== expected.pendingId) return false;
+    if (Object.hasOwn(expected, "pendingRevision") && job.runtime.pending?.revision !== expected.pendingRevision) return false;
+    return true;
+  }
+
   /** One bounded occurrence, never a prompt payload. Overlapping ticks do not charge attempts. */
-  queueResilient(id: string, sessionId: string, occurrence: TimedOccurrence, nextEligibleAt?: string, now = Date.now()): EventResult {
+  queueResilient(id: string, sessionId: string, occurrence: TimedOccurrence, nextEligibleAt?: string, now = Date.now(), expectedRuntime?: ResilientRuntimeExpectation): EventResult {
     validateOccurrence(occurrence);
     if (nextEligibleAt !== undefined && !instant(nextEligibleAt)) throw new Error("Invalid future eligibility");
-    return this.mutate(store => {
+    return this.mutateCas<EventResult>(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job || !isResilient(job) || job.session !== sessionId || !job.enabled || occurrence.revision !== job.revision) return { status: "ignored", reason: "disabled-or-changed" };
+      if (!job || !isResilient(job) || job.session !== sessionId || !job.enabled || occurrence.revision !== job.revision) return { write: false, value: { status: "ignored", reason: "disabled-or-changed" } };
+      if (expectedRuntime && !this.matchesRuntime(job, expectedRuntime)) return { write: false, value: { status: "ignored", reason: "runtime-changed" } };
       const runtime = job.runtime;
-      if ((runtime.pending?.id === occurrence.id && runtime.pending.revision === occurrence.revision) || (runtime.slot.kind === "owned" && runtime.slot.attempt.occurrence.id === occurrence.id && runtime.slot.attempt.occurrence.revision === occurrence.revision) || job.attemptHistory.some(record => record.charged && record.occurrence.id === occurrence.id && record.occurrence.revision === occurrence.revision)) return { status: "duplicate" };
-      if (runtime.slot.kind === "idle" && !["waiting", "backoff"].includes(runtime.slot.phase)) return { status: "ignored", reason: runtime.slot.phase };
+      if ((runtime.pending?.id === occurrence.id && runtime.pending.revision === occurrence.revision) || (runtime.slot.kind === "owned" && runtime.slot.attempt.occurrence.id === occurrence.id && runtime.slot.attempt.occurrence.revision === occurrence.revision) || job.attemptHistory.some(record => record.charged && record.occurrence.id === occurrence.id && record.occurrence.revision === occurrence.revision)) return { write: false, value: { status: "duplicate" } };
+      if (runtime.slot.kind === "idle" && !["waiting", "backoff"].includes(runtime.slot.phase)) return { write: false, value: { status: "ignored", reason: runtime.slot.phase } };
       if ((job.expiresAt && Date.parse(job.expiresAt) <= now) || job.attemptCount! >= job.maxRuns!) {
         runtime.pending = undefined; runtime.nextEligibleAt = undefined;
         if (runtime.slot.kind === "idle") runtime.slot = { kind: "idle", phase: "finished", reason: "authorization_bound" };
-        return { status: "ignored", reason: "authorization-bound" };
+        return { write: true, value: { status: "ignored", reason: "authorization-bound" } };
       }
       runtime.nextEligibleAt = nextEligibleAt;
       if (runtime.slot.kind === "owned") {
         if (job.policy.overlapPolicy === "skip" || job.policy.intervalMode === "fixed-delay" || runtime.pending) {
-          runtime.missedCount++; return { status: "ignored", reason: "overlap-skipped" };
+          runtime.missedCount++;
+          return { write: true, value: { status: "ignored", reason: "overlap-skipped" } };
         }
         runtime.pending = { ...occurrence, source: "overlap" };
-        return { status: "queued", reason: "buffered-first" };
+        return { write: true, value: { status: "queued", reason: "buffered-first" } };
       }
       const minimumContinuation = continuationDelayNotBefore(job);
-      if ((minimumContinuation && Date.parse(minimumContinuation) > now) || (runtime.notBefore && Date.parse(runtime.notBefore) > now)) { runtime.missedCount++; return { status: "ignored", reason: "not-before" }; }
-      if (runtime.pending) return { status: "duplicate" };
-      if (occurrence.source === "continuation" && !runtime.continuation) return { status: "ignored", reason: "missing-checkpoint" };
+      if ((minimumContinuation && Date.parse(minimumContinuation) > now) || (runtime.notBefore && Date.parse(runtime.notBefore) > now)) {
+        runtime.missedCount++;
+        return { write: true, value: { status: "ignored", reason: "not-before" } };
+      }
+      if (runtime.pending) return { write: false, value: { status: "duplicate" } };
+      if (occurrence.source === "continuation" && !runtime.continuation) return { write: false, value: { status: "ignored", reason: "missing-checkpoint" } };
       runtime.pending = { ...occurrence }; job.lastStatus = "queued";
-      return { status: "queued" };
+      return { write: true, value: { status: "queued" } };
     });
   }
 
   /** Persist timing only; no phase, admission, owner or authorization is inferred from a clock. */
-  setResilientEligibility(id: string, sessionId: string, revision: number, nextEligibleAt: string | undefined, discardPending = false): boolean {
+  setResilientEligibility(id: string, sessionId: string, revision: number, nextEligibleAt: string | undefined, discardPending = false, expectedRuntime?: ResilientRuntimeExpectation): boolean {
     if (nextEligibleAt !== undefined && !instant(nextEligibleAt)) throw new Error("Invalid resilient timing target");
-    return this.mutate(store => {
+    return this.mutateCas(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job || !isResilient(job) || job.session !== sessionId || job.revision !== revision) return false;
+      if (!job || !isResilient(job) || job.session !== sessionId || job.revision !== revision || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
       job.runtime.nextEligibleAt = nextEligibleAt;
       if (discardPending && job.runtime.pending) { job.runtime.pending = undefined; job.runtime.missedCount++; }
-      return true;
+      return { write: true, value: true };
+    });
+  }
+
+  /** Atomically remove only transient scheduler projection while the exact revision/runtime remains recoverable and idle. */
+  clearResilientProjection(id: string, sessionId: string, revision: number, expectedRuntime?: ResilientRuntimeExpectation): boolean {
+    return this.mutateCas(store => {
+      const job = store.jobs.find(item => item.id === id);
+      if (!job || !isResilient(job) || job.session !== sessionId || job.revision !== revision || job.runtime.slot.kind !== "idle" || !["waiting", "backoff", "attention-required"].includes(job.runtime.slot.phase) || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
+      job.runtime.nextEligibleAt = undefined;
+      if (job.runtime.pending) { job.runtime.pending = undefined; job.runtime.missedCount++; }
+      return { write: true, value: true };
     });
   }
 
@@ -447,21 +492,21 @@ export class CronStorage {
   reserveResilient(id: string, sessionId: string, instanceId: string, revision: number, occurrenceId: string, now = Date.now(), preparedNative?: { model: string; route: string; checkpoint?: NativeCheckpointReference }): ResilientJob | undefined {
     if (!validEventId(instanceId)) throw new Error("Invalid native owner instance");
     if (preparedNative && (!preparedNative.model?.trim() || !preparedNative.route?.trim())) throw new Error("Invalid prepared native model route");
-    return this.mutate(store => {
+    return this.mutateCas<ResilientJob | undefined>(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job || !isResilient(job) || !job.enabled || job.session !== sessionId || job.revision !== revision || job.runtime.slot.kind !== "idle" || !["waiting", "backoff"].includes(job.runtime.slot.phase)) return;
-      if (requiresReconciliation(job)) return;
-      if (preparedNative && (job.model !== preparedNative.model || (job.runtime.continuation || preparedNative.checkpoint) && !sameCheckpointReference(job.runtime.continuation?.checkpoint, preparedNative.checkpoint))) return;
+      if (!job || !isResilient(job) || !job.enabled || job.session !== sessionId || job.revision !== revision || job.runtime.slot.kind !== "idle" || !["waiting", "backoff"].includes(job.runtime.slot.phase)) return { write: false, value: undefined };
+      if (requiresReconciliation(job)) return { write: false, value: undefined };
+      if (preparedNative && (job.model !== preparedNative.model || (job.runtime.continuation || preparedNative.checkpoint) && !sameCheckpointReference(job.runtime.continuation?.checkpoint, preparedNative.checkpoint))) return { write: false, value: undefined };
       const runtime = job.runtime; const pending = runtime.pending;
-      if (!pending || pending.id !== occurrenceId || pending.revision !== revision || Date.parse(pending.dueAt) > now) return;
-      if (runtime.legacyFutureAfter && Date.parse(pending.dueAt) <= Date.parse(runtime.legacyFutureAfter)) { runtime.pending = undefined; runtime.missedCount++; return; }
-      if (job.attemptHistory.some(record => record.charged && record.occurrence.id === pending.id && record.occurrence.revision === pending.revision)) { runtime.pending = undefined; return; }
-      if (now - Date.parse(pending.dueAt) > job.policy.latenessMs) { runtime.pending = undefined; runtime.missedCount++; return; }
+      if (!pending || pending.id !== occurrenceId || pending.revision !== revision || Date.parse(pending.dueAt) > now) return { write: false, value: undefined };
+      if (runtime.legacyFutureAfter && Date.parse(pending.dueAt) <= Date.parse(runtime.legacyFutureAfter)) { runtime.pending = undefined; runtime.missedCount++; return { write: true, value: undefined }; }
+      if (job.attemptHistory.some(record => record.charged && record.occurrence.id === pending.id && record.occurrence.revision === pending.revision)) { runtime.pending = undefined; return { write: true, value: undefined }; }
+      if (now - Date.parse(pending.dueAt) > job.policy.latenessMs) { runtime.pending = undefined; runtime.missedCount++; return { write: true, value: undefined }; }
       const day = new Date(now).toISOString().slice(0, 10);
       const minimumContinuation = continuationDelayNotBefore(job);
-      if ((minimumContinuation && Date.parse(minimumContinuation) > now) || (runtime.notBefore && Date.parse(runtime.notBefore) > now) || (job.dailyUsage && day < job.dailyUsage.day) || (job.maxRunsPerDay !== undefined && spentOnUtcDay(job, day) >= job.maxRunsPerDay)) return;
+      if ((minimumContinuation && Date.parse(minimumContinuation) > now) || (runtime.notBefore && Date.parse(runtime.notBefore) > now) || (job.dailyUsage && day < job.dailyUsage.day) || (job.maxRunsPerDay !== undefined && spentOnUtcDay(job, day) >= job.maxRunsPerDay)) return { write: false, value: undefined };
       if (Date.parse(job.expiresAt!) <= now || job.attemptCount! >= job.maxRuns!) {
-        runtime.pending = undefined; runtime.nextEligibleAt = undefined; runtime.slot = { kind: "idle", phase: "finished", reason: "authorization_bound" }; return;
+        runtime.pending = undefined; runtime.nextEligibleAt = undefined; runtime.slot = { kind: "idle", phase: "finished", reason: "authorization_bound" }; return { write: true, value: undefined };
       }
       job.dailyUsage = { day, attempts: spentOnUtcDay(job, day) + 1 };
       job.attemptCount!++;
@@ -475,7 +520,7 @@ export class CronStorage {
       runtime.pending = undefined; runtime.notBefore = undefined;
       if (job.policy.intervalMode === "fixed-delay") runtime.nextEligibleAt = undefined;
       job.lastStatus = "running"; job.lastRun = new Date(now).toISOString();
-      return structuredClone(job);
+      return { write: true, value: structuredClone(job) };
     });
   }
 
@@ -491,11 +536,12 @@ export class CronStorage {
     });
   }
 
-  bindResilientNative(id: string, attemptId: string, owner: AttemptOwner, native: { runId: string; sessionId: string; sessionFile?: string; startedAt: string; deadlineAt: string }): boolean {
+  bindResilientNative(id: string, attemptId: string, owner: AttemptOwner, native: { runId: string; sessionId: string; sessionFile: string; startedAt: string; deadlineAt: string }): boolean {
+    if (typeof native.sessionFile !== "string" || !native.sessionFile || native.sessionFile.length > 2048 || /[\u0000-\u001f\u007f]/.test(native.sessionFile)) return false;
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id); const attempt = this.owned(job, attemptId, owner);
       if (!attempt) return false;
-      if (attempt.nativeRunId !== undefined) return attempt.nativeRunId === native.runId && attempt.nativeSessionId === native.sessionId;
+      if (attempt.nativeRunId !== undefined) return attempt.nativeRunId === native.runId && attempt.nativeSessionId === native.sessionId && attempt.nativeSessionFile === native.sessionFile;
       if (attempt.nativeSessionId !== undefined && attempt.nativeSessionId !== native.sessionId) return false;
       if (attempt.nativeSessionFile !== undefined && native.sessionFile !== undefined && attempt.nativeSessionFile !== native.sessionFile) return false;
       attempt.nativeRunId = native.runId; attempt.nativeSessionId = native.sessionId;
@@ -506,15 +552,15 @@ export class CronStorage {
   }
 
   /** Draining/cancelling still owns the exact slot. Neither time nor a PID can release it. */
-  markResilientPhase(id: string, attemptId: string, owner: AttemptOwner, phase: "draining" | "cancelling" | "attention-required", reason?: string, checkpoint?: NativeCheckpointReference): boolean {
-    return this.mutate(store => {
+  markResilientPhase(id: string, attemptId: string, owner: AttemptOwner, phase: "draining" | "cancelling" | "attention-required", reason?: string, checkpoint?: NativeCheckpointReference, expectedRuntime?: ResilientRuntimeExpectation): boolean {
+    return this.mutateCas(store => {
       const job = store.jobs.find(item => item.id === id);
       const attempt = this.owned(job, attemptId, owner);
-      if (!job || !isResilient(job) || !attempt || job.runtime.slot.kind !== "owned") return false;
-      if (job.runtime.slot.phase === "cancelling" && phase === "draining") return false;
+      if (!job || !isResilient(job) || !attempt || job.runtime.slot.kind !== "owned" || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
+      if (job.runtime.slot.phase === "cancelling" && phase === "draining") return { write: false, value: false };
       job.runtime.slot.phase = phase; job.runtime.slot.reason = reason;
       if (checkpoint) attempt.checkpoint = structuredClone(checkpoint);
-      return true;
+      return { write: true, value: true };
     });
   }
 
@@ -534,28 +580,24 @@ export class CronStorage {
   }
 
   /** Exact native closure first; final attempt records are append-only and never become business success. */
-  settleResilient(id: string, attemptId: string, owner: AttemptOwner, received: NativeExecutionProof, checkpoint: NativeCheckpointReference, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }, modelSdkClose?: ModelSdkCloseProof): boolean {
-    validateNativeProof(received);
-    const proof: NativeExecutionProof = {
-      version: 1, runId: received.runId,
-      binding: { jobId: received.binding.jobId, attemptId: received.binding.attemptId, ownerSessionId: received.binding.ownerSessionId, ownerEpoch: received.binding.ownerEpoch, revision: received.binding.revision },
-      finishedAt: received.finishedAt, execution: received.execution, checkpointEntryId: received.checkpointEntryId,
-      effectStatus: received.effectStatus, businessOutcome: "unverified", failedRecoveryMs: received.failedRecoveryMs,
-      ...(received.retryNotBefore === undefined ? {} : { retryNotBefore: received.retryNotBefore }),
-    };
-    return this.mutate(store => {
+  settleResilient(id: string, attemptId: string, owner: AttemptOwner, received: NativeExecutionProof, checkpoint: NativeCheckpointReference, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }, modelSdkClose?: ModelSdkCloseProof, expectedRuntime?: ResilientRuntimeExpectation): boolean {
+    const proof = normalizeNativeProof(received);
+    return this.mutateCas(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job || !isResilient(job)) return false;
+      if (!job || !isResilient(job) || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
       const attempt = this.owned(job, attemptId, owner);
       if (!attempt) {
         const previous = job.attemptHistory.find(item => item.id === attemptId);
-        if (previous?.nativeProof && previous.owner.sessionId === owner.sessionId && previous.owner.instanceId === owner.instanceId && previous.owner.epoch === owner.epoch && previous.nativeProof.runId === proof.runId && previous.nativeProof.binding.ownerSessionId === proof.binding.ownerSessionId && proof.binding.attemptId === attemptId && proof.binding.jobId === id && proof.binding.ownerEpoch === owner.epoch && proof.binding.revision === previous.revision) {
+        if (previous?.nativeProof && previous.owner.sessionId === owner.sessionId && previous.owner.instanceId === owner.instanceId && previous.owner.epoch === owner.epoch && sameNativeProof(previous.nativeProof, proof) && sameCheckpointReference(previous.checkpoint, checkpoint)) {
           const fingerprint = createHash("sha256").update(JSON.stringify(proof)).digest("hex");
-          if (!job.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === fingerprint)) job.attemptResolutions.push({ attemptId, evidenceFingerprint: fingerprint, at: proof.finishedAt, disposition: "native-closure" });
+          if (job.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === fingerprint)) return { write: false, value: false };
+          job.attemptResolutions.push({ attemptId, evidenceFingerprint: fingerprint, at: proof.finishedAt, disposition: "native-closure" });
+          return { write: true, value: false };
         }
-        return false;
+        return { write: false, value: false };
       }
-      if (proof.binding.jobId !== id || proof.binding.attemptId !== attemptId || proof.binding.ownerEpoch !== owner.epoch || proof.binding.revision !== attempt.revision || (attempt.nativeRunId && proof.runId !== attempt.nativeRunId) || proof.binding.ownerSessionId !== (attempt.nativeSessionId ?? owner.sessionId)) return false;
+      if (proof.binding.jobId !== id || proof.binding.attemptId !== attemptId || proof.binding.ownerEpoch !== owner.epoch || proof.binding.revision !== attempt.revision || (attempt.nativeRunId && proof.runId !== attempt.nativeRunId) || proof.binding.ownerSessionId !== (attempt.nativeSessionId ?? owner.sessionId)) return { write: false, value: false };
+      if (typeof attempt.nativeSessionFile !== "string" || !attempt.nativeSessionFile || checkpoint.sessionFile !== attempt.nativeSessionFile || checkpoint.sessionId !== (attempt.nativeSessionId ?? owner.sessionId) || checkpoint.runId !== proof.runId || checkpoint.entryId !== proof.checkpointEntryId || (attempt.checkpoint && !sameCheckpointReference(attempt.checkpoint, checkpoint))) return { write: false, value: false };
       if (attempt.model) {
         if (!modelSdkClose) throw new Error("A native model receipt cannot release its persistent SDK/file writer without a close acknowledgement");
         validateModelSdkClose(modelSdkClose, proof);
@@ -583,25 +625,25 @@ export class CronStorage {
       if (effectivePhase === "backoff") job.runtime.cooldownStep = Math.min(5, job.runtime.cooldownStep + 1);
       job.runCount += proof.execution === "completed" ? 1 : 0;
       job.lastStatus = effectUnknown ? "unknown" : proof.execution === "completed" ? "success" : proof.execution === "failed" ? "error" : "unknown";
-      return true;
+      return { write: true, value: true };
     });
   }
 
   /** Exact owner evidence is the only transition out of an unknown-effect barrier. */
-  reconcileResilientAttempt(id: string, sessionId: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = [], resumeAfterMs?: number): boolean {
+  reconcileResilientAttempt(id: string, sessionId: string, attemptId: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = [], resumeAfterMs?: number, expectedRevision?: number, expectedRuntime?: ResilientRuntimeExpectation): boolean {
     if (resumeAfterMs !== undefined && (disposition !== "continue" || !Number.isSafeInteger(resumeAfterMs) || resumeAfterMs < 1000 || resumeAfterMs > 86400000)) throw new Error("Invalid minimum continuation delay");
     if (!validEvidenceFingerprint(evidenceFingerprint) || !Array.isArray(safeScopes) || safeScopes.length > 32 || !safeScopes.every(scope => validEventId(scope))) throw new Error("Reconciliation requires bounded SHA-256 evidence and safe scopes");
-    return this.mutate(store => {
+    return this.mutateCas(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind === "owned") return false;
+      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind === "owned" || (expectedRevision !== undefined && job.revision !== expectedRevision) || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
       const record = job.attemptHistory.find(item => item.id === attemptId);
-      if (!record?.checkpoint || !record.nativeProof || !record.charged) return false;
-      if (job.runtime.continuation && job.runtime.continuation.attemptId !== attemptId) return false;
-      if (record.effectStatus !== "unknown" && job.runtime.continuation?.attemptId !== attemptId) return false;
+      if (!record?.checkpoint || !record.nativeProof || !record.charged) return { write: false, value: false };
+      if (job.runtime.continuation && job.runtime.continuation.attemptId !== attemptId) return { write: false, value: false };
+      if (record.effectStatus !== "unknown" && job.runtime.continuation?.attemptId !== attemptId) return { write: false, value: false };
       const prior = job.attemptResolutions.find(item => item.attemptId === attemptId && item.evidenceFingerprint === evidenceFingerprint);
       if (prior) {
         if (prior.disposition !== disposition || prior.resumeAfterMs !== resumeAfterMs || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution or timing");
-        return false;
+        return { write: false, value: false };
       }
       const now = Date.now();
       const resolution = { attemptId, evidenceFingerprint, at: new Date(now).toISOString(), disposition, checkpoint: structuredClone(record.checkpoint), ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}), ...(resumeAfterMs !== undefined ? { resumeAfterMs } : {}) };
@@ -622,25 +664,25 @@ export class CronStorage {
       } else {
         job.runtime.slot = { kind: "idle", phase: "reconciling", reason: "effect_unknown" };
       }
-      return true;
+      return { write: true, value: true };
     });
   }
 
   /** Exact migrated-legacy claim evidence permits only future occurrences, without inventing native history. */
-  reconcileLegacyClaim(id: string, sessionId: string, claimId: string, claimBinding: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = []): boolean {
+  reconcileLegacyClaim(id: string, sessionId: string, claimId: string, claimBinding: string, evidenceFingerprint: string, disposition: "continue" | "waiting-input" | "unknown", safeScopes: string[] = [], expectedRevision?: number, expectedRuntime?: ResilientRuntimeExpectation): boolean {
     if (!validEventId(claimId) || !validEvidenceFingerprint(claimBinding) || !validEvidenceFingerprint(evidenceFingerprint) || !["continue", "waiting-input", "unknown"].includes(disposition) || !Array.isArray(safeScopes) || safeScopes.length > 32 || !safeScopes.every(validEventId)) throw new Error("Legacy reconciliation requires exact claim/binding, SHA-256 effect evidence and bounded scopes");
-    return this.mutate(store => {
+    return this.mutateCas(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind === "owned" || job.runtime.continuation) return false;
+      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind === "owned" || job.runtime.continuation || (expectedRevision !== undefined && job.revision !== expectedRevision) || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
       const claim = job.claim;
-      if (!claim || claim.id !== claimId || claim.binding !== claimBinding || claim.phase !== "settled" || !["unknown", "aborted"].includes(claim.outcome ?? "") || job.runtime.legacyUncertainty?.claimId !== claimId) return false;
+      if (!claim || claim.id !== claimId || claim.binding !== claimBinding || claim.phase !== "settled" || !["unknown", "aborted"].includes(claim.outcome ?? "") || job.runtime.legacyUncertainty?.claimId !== claimId) return { write: false, value: false };
       const prior = job.attemptResolutions.find(item => item.attemptId === claimId && item.evidenceFingerprint === evidenceFingerprint);
       if (prior) {
         if (prior.disposition !== disposition || prior.legacyClaimBinding !== claimBinding || JSON.stringify(prior.safeScopes ?? []) !== JSON.stringify(safeScopes)) throw new Error("Evidence is already bound to a different resolution");
-        return false;
+        return { write: false, value: false };
       }
       // Once a new native attempt exists, legacy evidence cannot retime it or replace native reconciliation.
-      if (job.attemptHistory.length) return false;
+      if (job.attemptHistory.length) return { write: false, value: false };
       const at = new Date().toISOString();
       job.attemptResolutions.push({ attemptId: claimId, legacyClaimBinding: claimBinding, evidenceFingerprint, at, disposition, ...(safeScopes.length ? { safeScopes: [...safeScopes] } : {}) });
       const blocked = requiresReconciliation(job);
@@ -652,7 +694,7 @@ export class CronStorage {
         if (!job.runtime.notBefore || Date.parse(job.runtime.notBefore) < Date.parse(next)) job.runtime.notBefore = next;
         job.runtime.slot = { kind: "idle", phase: Date.parse(job.expiresAt!) <= Date.now() || job.attemptCount! >= job.maxRuns! ? "finished" : "backoff", reason: "legacy_future_only" };
       } else job.runtime.slot = { kind: "idle", phase: disposition === "waiting-input" ? "waiting-input" : "reconciling", reason: disposition === "waiting-input" ? "legacy_waiting_input" : "legacy_effect_unresolved" };
-      return true;
+      return { write: true, value: true };
     });
   }
 
@@ -668,19 +710,19 @@ export class CronStorage {
   }
 
   /** Metadata-only compatibility/wait state. UNKNOWN cannot be cleared by an unrelated status update. */
-  setResilientDisposition(id: string, sessionId: string, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }): boolean {
+  setResilientDisposition(id: string, sessionId: string, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }, expectedRevision?: number, expectedRuntime?: ResilientRuntimeExpectation): boolean {
     if ((disposition.notBefore !== undefined && !instant(disposition.notBefore)) || (disposition.nextEligibleAt !== undefined && !instant(disposition.nextEligibleAt))) throw new Error("Invalid compatibility timing projection");
-    return this.mutate(store => {
+    return this.mutateCas(store => {
       const job = store.jobs.find(item => item.id === id);
-      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind !== "idle") return false;
+      if (!job || !isResilient(job) || job.session !== sessionId || job.runtime.slot.kind !== "idle" || (expectedRevision !== undefined && job.revision !== expectedRevision) || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
       const before = job.runtime.slot;
       if (["waiting", "backoff"].includes(disposition.phase) && requiresReconciliation(job)) throw new Error("Reconciliation evidence is required before continuation");
-      if (["reconciling", "waiting-input", "attention-required"].includes(before.phase) && ["waiting", "backoff"].includes(disposition.phase) && !["runtime_unavailable", "native_disposed", "native_model_route_unsupported"].includes(before.reason ?? "")) throw new Error("Reconciliation evidence is required before continuation");
+      if (["reconciling", "waiting-input", "attention-required"].includes(before.phase) && ["waiting", "backoff"].includes(disposition.phase) && !["runtime_unavailable", "native_disposed", "native_model_route_unsupported", "native_model_unavailable"].includes(before.reason ?? "")) throw new Error("Reconciliation evidence is required before continuation");
       job.runtime.slot = { kind: "idle", phase: disposition.phase, ...(disposition.reason ? { reason: disposition.reason } : {}) };
       // Metadata-only compatibility holds must not erase or shorten timing.
       if (disposition.notBefore !== undefined && (!job.runtime.notBefore || Date.parse(disposition.notBefore) > Date.parse(job.runtime.notBefore))) job.runtime.notBefore = disposition.notBefore;
       if (disposition.nextEligibleAt !== undefined && (!job.runtime.nextEligibleAt || Date.parse(disposition.nextEligibleAt) > Date.parse(job.runtime.nextEligibleAt))) job.runtime.nextEligibleAt = disposition.nextEligibleAt;
-      return true;
+      return { write: true, value: true };
     });
   }
 

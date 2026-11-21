@@ -165,7 +165,9 @@ describe("CronStorage — per-project agent-dir store and explicit legacy cutove
     expect(admitted.runtime.slot.kind).toBe("owned");
     if (admitted.runtime.slot.kind !== "owned") throw new Error("fixture did not reserve");
     const { attempt } = admitted.runtime.slot;
-    const checkpoint = { sessionId: "owner", entryId: "checkpoint", runId: "native-run" };
+    const sessionFile = "/synthetic/owner.jsonl";
+    expect(seed.bindResilientNative("job-1", attempt.id, attempt.owner, { runId: "native-run", sessionId: "owner", sessionFile, startedAt: now.toISOString(), deadlineAt: new Date(+now + attempt.deadlineMs).toISOString() })).toBe(true);
+    const checkpoint = { sessionId: "owner", entryId: "checkpoint", runId: "native-run", sessionFile };
     const proof: NativeExecutionProof = { version: 1, runId: "native-run", binding: { jobId: "job-1", attemptId: attempt.id, ownerSessionId: "owner", ownerEpoch: attempt.owner.epoch, revision: 1 }, finishedAt: now.toISOString(), execution: "interrupted", effectStatus: "unknown", businessOutcome: "unverified", checkpointEntryId: "checkpoint", failedRecoveryMs: 0 };
     expect(seed.settleResilient("job-1", attempt.id, attempt.owner, proof, checkpoint, { phase: "reconciling" })).toBe(true);
     seed.updateJob("job-1", { enabled: false }, "owner");

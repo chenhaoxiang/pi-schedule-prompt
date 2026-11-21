@@ -32,9 +32,10 @@ function reserve(storage: CronStorage, id = "job", instance = "instance-a"): { j
 function evidence(storage: CronStorage, attempt: OwnedAttempt, outcome: NativeExecutionProof["execution"] = "completed", effectStatus: NativeExecutionProof["effectStatus"] = "none-observed", id = "job") {
   const runId = "run-" + attempt.id;
   const sessionId = attempt.nativeSessionId ?? attempt.owner.sessionId;
+  const sessionFile = "/synthetic/" + sessionId + ".jsonl";
   const startedAt = new Date().toISOString();
-  expect(storage.bindResilientNative(id, attempt.id, attempt.owner, { runId, sessionId, startedAt, deadlineAt: new Date(Date.now() + attempt.deadlineMs).toISOString() })).toBe(true);
-  const checkpoint: NativeCheckpointReference = { runId, sessionId, entryId: "entry-" + attempt.id, sessionFile: "/synthetic/" + sessionId + ".jsonl" };
+  expect(storage.bindResilientNative(id, attempt.id, attempt.owner, { runId, sessionId, sessionFile, startedAt, deadlineAt: new Date(Date.now() + attempt.deadlineMs).toISOString() })).toBe(true);
+  const checkpoint: NativeCheckpointReference = { runId, sessionId, entryId: "entry-" + attempt.id, sessionFile };
   const proof: NativeExecutionProof = { version: 1, runId, binding: { jobId: id, attemptId: attempt.id, ownerSessionId: sessionId, ownerEpoch: attempt.owner.epoch, revision: attempt.revision }, execution: outcome, finishedAt: new Date().toISOString(), checkpointEntryId: checkpoint.entryId, effectStatus, businessOutcome: "unverified", failedRecoveryMs: 0 };
   return { proof, checkpoint };
 }
@@ -71,6 +72,107 @@ describe("versioned resilient store and exact ownership", () => {
     expect(second.reserveResilient("job", "owner", "instance-b", 1, first.attempt.occurrence.id)).toBeUndefined();
     expect(reserve(second, "other", "instance-b").attempt.owner.instanceId).toBe("instance-b");
     expect(h.storage.getJob("job")?.attemptCount).toBe(1);
+  });
+
+  it("does not clear a newly owned slot when stale projection cleanup races reservation", () => {
+    const h = fixture();
+    const cleanupWriter = new CronStorage(h.cwd);
+    const reserveWriter = new CronStorage(h.cwd);
+    const beforeQueue = cleanupWriter.getJob("job") as ResilientJob;
+    const target = new Date(Date.now() + 60_000).toISOString();
+    const tick = occurrence(beforeQueue, "cross-writer-cleanup");
+    expect(reserveWriter.queueResilient("job", "owner", tick, target).status).toBe("queued");
+    const stale = cleanupWriter.getJob("job") as ResilientJob;
+    expect(stale.runtime.slot).toMatchObject({ kind: "idle", phase: "waiting" });
+    const admitted = reserveWriter.reserveResilient("job", "owner", "reserve-writer", stale.revision!, tick.id);
+    expect(admitted?.runtime.slot.kind).toBe("owned");
+    expect(cleanupWriter.clearResilientProjection("job", "owner", stale.revision!)).toBe(false);
+    expect(new CronStorage(h.cwd).getJob("job")).toMatchObject({
+      attemptCount: 1,
+      runtime: { slot: { kind: "owned" }, nextEligibleAt: target },
+    });
+  });
+
+  it.each(["waiting-input", "reconciling"] as const)("rejects a same-revision stale disposition after a %s barrier wins", phase => {
+    const h = fixture(); const staleWriter = new CronStorage(h.cwd); const winner = new CronStorage(h.cwd);
+    const stale = staleWriter.getJob("job") as ResilientJob;
+    expect(winner.setResilientDisposition("job", "owner", { phase, reason: "newer_barrier" })).toBe(true);
+    expect(staleWriter.setResilientDisposition("job", "owner", { phase: "attention-required", reason: "stale_preflight" }, stale.revision!, { phase: stale.runtime.slot.phase, ownerEpoch: stale.runtime.ownerEpoch })).toBe(false);
+    expect(new CronStorage(h.cwd).getJob("job")).toMatchObject({ revision: stale.revision, runtime: { slot: { kind: "idle", phase, reason: "newer_barrier" } } });
+  });
+
+  it("rejects a same-revision stale disposition after a reason-only change", () => {
+    const h = fixture(); const staleWriter = new CronStorage(h.cwd); const winner = new CronStorage(h.cwd);
+    const stale = staleWriter.getJob("job") as ResilientJob;
+    expect(winner.setResilientDisposition("job", "owner", { phase: "waiting", reason: "newer_reason" })).toBe(true);
+    expect(staleWriter.setResilientDisposition("job", "owner", { phase: "attention-required", reason: "stale_preflight" }, stale.revision!, { phase: "waiting", ownerEpoch: stale.runtime.ownerEpoch })).toBe(false);
+    expect(new CronStorage(h.cwd).getJob("job")).toMatchObject({ revision: stale.revision, runtime: { slot: { kind: "idle", phase: "waiting", reason: "newer_reason" } } });
+  });
+
+  it("rejects a same-revision stale hold after an owned takeover", () => {
+    const h = fixture(); const staleWriter = new CronStorage(h.cwd); const ownerWriter = new CronStorage(h.cwd);
+    const stale = staleWriter.getJob("job") as ResilientJob;
+    const tick = occurrence(stale, "takeover");
+    expect(ownerWriter.queueResilient("job", "owner", tick).status).toBe("queued");
+    const admitted = ownerWriter.reserveResilient("job", "owner", "foreign-owner", stale.revision!, tick.id);
+    expect(admitted?.runtime.slot.kind).toBe("owned");
+    expect(staleWriter.setResilientDisposition("job", "owner", { phase: "attention-required", reason: "stale_preflight" }, stale.revision!, { phase: stale.runtime.slot.phase, ownerEpoch: stale.runtime.ownerEpoch })).toBe(false);
+    expect(new CronStorage(h.cwd).getJob("job")).toMatchObject({ revision: stale.revision, runtime: { slot: { kind: "owned", attempt: { owner: { instanceId: "foreign-owner" } } } } });
+  });
+
+  it("rejects a stale owned phase after a same-revision owner takeover", () => {
+    const h = fixture(); const first = reserve(h.storage, "job", "first-owner"); const stale = structuredClone(first.attempt);
+    const closed = evidence(h.storage, first.attempt); expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, closed.proof, closed.checkpoint, { phase: "waiting" })).toBe(true);
+    const current = h.storage.getJob("job") as ResilientJob; const tick = occurrence(current, "second-takeover");
+    expect(h.storage.queueResilient("job", "owner", tick).status).toBe("queued");
+    const second = h.storage.reserveResilient("job", "owner", "second-owner", current.revision!, tick.id);
+    expect(second?.runtime.slot.kind).toBe("owned");
+    expect(h.storage.markResilientPhase("job", stale.id, stale.owner, "attention-required", "stale_preflight", undefined, { phase: "running", ownerEpoch: stale.owner.epoch, attemptId: stale.id })).toBe(false);
+    const final = h.storage.getJob("job") as ResilientJob;
+    expect(final).toMatchObject({ revision: current.revision, runtime: { slot: { kind: "owned", attempt: { owner: { instanceId: "second-owner" } } } } });
+    if (final.runtime.slot.kind !== "owned") throw new Error("Takeover did not remain owned");
+    expect(final.runtime.slot.attempt.id).not.toBe(stale.id);
+  });
+
+  it("does not replace bytes when a resilient CAS eligibility check loses", () => {
+    const h = fixture(); const before = fs.readFileSync(h.storage.getStorePath());
+    const replace = vi.spyOn(h.storage as any, "replaceStore");
+    expect(h.storage.setResilientEligibility("job", "owner", 999, new Date(Date.now() + 60_000).toISOString())).toBe(false);
+    expect(replace).not.toHaveBeenCalled();
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(before);
+  });
+
+  it("rejects a same-revision stale target and pending identity after replacement", () => {
+    const h = fixture(); const staleWriter = new CronStorage(h.cwd); const winner = new CronStorage(h.cwd);
+    const initial = staleWriter.getJob("job") as ResilientJob;
+    const firstTarget = new Date(Date.now() + 60_000).toISOString();
+    const first = occurrence(initial, "pending-first");
+    expect(winner.queueResilient("job", "owner", first, firstTarget).status).toBe("queued");
+    const stale = staleWriter.getJob("job") as ResilientJob;
+    expect(stale.runtime.pending?.id).toBe(first.id);
+    expect(winner.clearResilientProjection("job", "owner", stale.revision!)).toBe(true);
+    const second = occurrence(stale, "pending-second");
+    const secondTarget = new Date(Date.now() + 120_000).toISOString();
+    expect(winner.queueResilient("job", "owner", second, secondTarget).status).toBe("queued");
+    expect(staleWriter.setResilientEligibility("job", "owner", stale.revision!, firstTarget, true, {
+      phase: stale.runtime.slot.phase,
+      ownerEpoch: stale.runtime.ownerEpoch,
+      nextEligibleAt: firstTarget,
+      pendingId: first.id,
+      pendingRevision: first.revision,
+    })).toBe(false);
+    expect(new CronStorage(h.cwd).getJob("job")).toMatchObject({ runtime: { nextEligibleAt: secondTarget, pending: { id: second.id, revision: second.revision } } });
+  });
+
+  it("does not let stale reconciliation replace a same-revision waiting-input barrier", () => {
+    const h = fixture(); const first = reserve(h.storage); const closed = evidence(h.storage, first.attempt, "completed", "unknown");
+    expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, closed.proof, closed.checkpoint, { phase: "reconciling" })).toBe(true);
+    const staleWriter = new CronStorage(h.cwd); const snapshot = staleWriter.getJob("job") as ResilientJob;
+    const winner = new CronStorage(h.cwd);
+    expect(winner.setResilientDisposition("job", "owner", { phase: "waiting-input", reason: "newer_input" })).toBe(true);
+    if (snapshot.runtime.slot.kind !== "idle") throw new Error("Expected idle reconciliation snapshot");
+    expect(staleWriter.reconcileResilientAttempt("job", "owner", first.attempt.id, "b".repeat(64), "continue", [], undefined, snapshot.revision, { phase: snapshot.runtime.slot.phase, reason: snapshot.runtime.slot.reason, ownerEpoch: snapshot.runtime.ownerEpoch })).toBe(false);
+    expect(new CronStorage(h.cwd).getJob("job")).toMatchObject({ attemptResolutions: [], runtime: { slot: { kind: "idle", phase: "waiting-input", reason: "newer_input" } } });
   });
 
   it.each(["draining", "cancelling", "attention-required"] as const)("retains the %s slot regardless of elapsed time or a new process", phase => {
@@ -176,6 +278,72 @@ describe("versioned resilient store and exact ownership", () => {
     expect(state.runtime.slot).toMatchObject({ kind: "owned", attempt: { id: second.attempt.id } });
     expect(state.attemptHistory).toHaveLength(1); expect(state.attemptResolutions).toHaveLength(1); expect(state.attemptCount).toBe(2);
   });
+
+  it("does not rewrite an already recorded native settlement receipt", () => {
+    const h = fixture(); const first = reserve(h.storage); const receipt = evidence(h.storage, first.attempt);
+    expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(true);
+    const replace = vi.spyOn(h.storage as any, "replaceStore");
+    expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
+    expect(replace).toHaveBeenCalledOnce();
+    const afterFirstReceipt = h.storage.getJob("job") as ResilientJob;
+    const bytes = fs.readFileSync(h.storage.getStorePath());
+    const mtime = fs.statSync(h.storage.getStorePath()).mtimeMs;
+    const revision = afterFirstReceipt.revision;
+    expect(afterFirstReceipt.attemptResolutions).toHaveLength(1);
+
+    expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
+    const afterRetry = h.storage.getJob("job") as ResilientJob;
+    expect(replace).toHaveBeenCalledOnce();
+    expect(afterRetry.attemptResolutions).toHaveLength(1);
+    expect(afterRetry.revision).toBe(revision);
+    expect(fs.readFileSync(h.storage.getStorePath())).toEqual(bytes);
+    expect(fs.statSync(h.storage.getStorePath()).mtimeMs).toBe(mtime);
+  });
+
+  for (const mismatch of [
+    { name: "finished time", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.finishedAt = new Date(Date.parse(proof.finishedAt) + 1000).toISOString(); } },
+    { name: "execution", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.execution = "failed"; } },
+    { name: "effect status", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.effectStatus = "unknown"; } },
+    { name: "failed recovery", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.failedRecoveryMs++; } },
+    { name: "retry not-before", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.retryNotBefore = new Date(Date.parse(proof.finishedAt) + 1000).toISOString(); } },
+    { name: "proof run", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.runId = "wrong-proof-run"; } },
+    { name: "proof checkpoint entry", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.checkpointEntryId = "wrong-proof-checkpoint"; } },
+    { name: "checkpoint entry", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.entryId = "wrong-checkpoint"; } },
+    { name: "checkpoint session", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.sessionId = "wrong-session"; } },
+    { name: "checkpoint run", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.runId = "wrong-run"; } },
+    { name: "proof job binding", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.jobId = "wrong-job"; } },
+    { name: "proof attempt binding", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.attemptId = "wrong-attempt"; } },
+    { name: "proof session binding", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.ownerSessionId = "wrong-session"; } },
+    { name: "proof owner epoch", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.ownerEpoch++; } },
+    { name: "proof revision", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.revision++; } },
+  ] as const) {
+    it(`rejects a late receipt with a mismatched ${mismatch.name} without writing native closure evidence`, () => {
+      const h = fixture(); const first = reserve(h.storage); const receipt = evidence(h.storage, first.attempt);
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(true);
+      const second = reserve(h.storage, "job", "instance-b");
+      const proof = structuredClone(receipt.proof); const checkpoint = structuredClone(receipt.checkpoint); mismatch.change(proof, checkpoint);
+      const before = fs.readFileSync(h.storage.getStorePath()); const replace = vi.spyOn(h.storage as any, "replaceStore");
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, proof, checkpoint, { phase: "waiting" })).toBe(false);
+      expect(replace).not.toHaveBeenCalled(); expect(fs.readFileSync(h.storage.getStorePath())).toEqual(before);
+      expect(h.storage.getJob("job")).toMatchObject({ runtime: { slot: { kind: "owned", attempt: { id: second.attempt.id } } }, attemptHistory: [{ id: first.attempt.id }], attemptResolutions: [] });
+
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
+      expect(replace).toHaveBeenCalledOnce(); expect(h.storage.getJob("job")?.attemptResolutions).toHaveLength(1);
+    });
+  }
+
+  for (const scenario of [{ label: "inline", model: false }, { label: "explicit-model", model: true }] as const) {
+    it(`rejects a foreign checkpoint transcript for ${scenario.label} settlement`, () => {
+      const h = fixture([seed(scenario.model ? { model: "fixture/model" } : {})]); const first = reserve(h.storage); const receipt = evidence(h.storage, first.attempt);
+      const foreign = { ...receipt.checkpoint, sessionFile: "/synthetic/foreign-session.jsonl" };
+      const before = fs.readFileSync(h.storage.getStorePath());
+      const sdk = scenario.model ? { version: 1 as const, runId: receipt.proof.runId, binding: { ...receipt.proof.binding }, checkpointEntryId: receipt.proof.checkpointEntryId, closedAt: receipt.proof.finishedAt } : undefined;
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, foreign, { phase: "waiting" }, sdk)).toBe(false);
+      expect(fs.readFileSync(h.storage.getStorePath())).toEqual(before); expect(h.storage.getJob("job")?.attemptHistory).toHaveLength(0);
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" }, sdk)).toBe(true);
+    });
+  }
 
   it("records real native interrupted execution without treating it as a completed fresh occurrence", () => {
     const h = fixture(); const { attempt } = reserve(h.storage); const { proof, checkpoint } = evidence(h.storage, attempt, "interrupted");
