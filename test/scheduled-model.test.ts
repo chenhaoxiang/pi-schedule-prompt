@@ -16,13 +16,16 @@ function fixture() {
   const cwd = fs.mkdtempSync(path.join(root, "case-")); directories.push(cwd);
   const directory = path.join(cwd, ".pi/schedule-native"); fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = path.join(directory, "selected.jsonl");
+  const checkpointReference = { sessionId: "schedule-synthetic", entryId: "checkpoint", runId: "run", sessionFile: file };
   const checkpoint = { version: 1, runId: "run", binding: { jobId: "job", attemptId: "before", ownerSessionId: "schedule-synthetic", ownerEpoch: 2, revision: 1 }, completedResults: [], completedResultCount: 0, declarations: { nextAction: "use-existing-result" }, effectStatus: "none-observed", businessOutcome: "unverified" };
   const values = [{ type: "session", version: CURRENT_SESSION_VERSION, id: "schedule-synthetic", timestamp: new Date().toISOString(), cwd }, { id: "checkpoint", parentId: null, timestamp: new Date().toISOString(), type: "custom", customType: "pi.scheduled-checkpoint.v1", data: checkpoint }];
   fs.writeFileSync(file, values.map(value => JSON.stringify(value)).join("\n") + "\n", { mode: 0o600 });
   const job: ResilientJob = resilientDefinition({ id: "job", name: "job", type: "interval", schedule: "1s", intervalMs: 1000, prompt: "synthetic", enabled: true, createdAt: new Date().toISOString(), runCount: 0, session: "logical-owner", model: "fixture/model", maxRuns: 3, expiresAt: new Date(Date.now() + 60_000).toISOString(), deadlineMs: 10_000 });
-  // This pure planner fixture supplies only the historical fields it reads; schema validation is tested separately.
-  job.runtime.continuation = { attemptId: "before", checkpoint: { sessionId: "schedule-synthetic", entryId: "checkpoint", runId: "run", sessionFile: file } };
-  job.attemptHistory = [{ id: "before", model: "fixture/model" } as any];
+  job.runtime.continuation = { attemptId: "before", checkpoint: checkpointReference };
+  job.attemptHistory = [{
+    id: "before", revision: 1, owner: { sessionId: "logical-owner", instanceId: "instance", epoch: 2 }, checkpoint: checkpointReference,
+    nativeProof: { version: 1, runId: "run", binding: checkpoint.binding, finishedAt: new Date().toISOString(), execution: "deferred", checkpointEntryId: "checkpoint", effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 }, model: "fixture/model",
+  } as any];
   const getAvailable = vi.fn(() => [{ provider: "fixture", id: "model", name: "model" }]);
   const ctx = { cwd, modelRegistry: { getAvailable } } as any;
   return { cwd, file, values, job, ctx, getAvailable };
@@ -66,6 +69,16 @@ function sdkFixture() {
     expect(create).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled(); expect(fs.readFileSync(h.file)).toEqual(bytes);
     const reader = readStoredModelSession(h.cwd, "schedule-synthetic", h.file); const entry = reader.getEntry("checkpoint") as any; entry.data.declarations.nextAction = "caller mutation";
     expect((reader.getEntry("checkpoint") as any).data.declarations.nextAction).toBe("use-existing-result");
+  });
+
+  it.each(["ownerEpoch", "revision"] as const)("rejects a continuation checkpoint with a stale %s binding before any session construction", field => {
+    const h = fixture(); Object.defineProperty(AgentSession, "scheduledExecutionVersion", { configurable: true, value: 1 });
+    const create = vi.spyOn(SessionManager, "create"); const open = vi.spyOn(SessionManager, "open");
+    (h.values[1].data as any).binding[field]++;
+    fs.writeFileSync(h.file, h.values.map(value => JSON.stringify(value)).join("\n") + "\n");
+    const bytes = fs.readFileSync(h.file);
+    expect(() => planScheduledModel(h.ctx, h.job)).toThrow(/replay/);
+    expect(create).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled(); expect(fs.readFileSync(h.file)).toEqual(bytes);
   });
 
   it("never repairs a malformed/partly written transcript while another exact native owner may still be alive", () => {

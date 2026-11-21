@@ -981,6 +981,18 @@ describe("resilient native timer composition", () => {
     expect(h.runs[1].request.content).toContain("use-the-saved-synthetic-result"); expect(h.runs[1].request.content).toContain('"completedResultCount":0'); expect(h.runs[1].request.content).toContain('"artifacts"'); expect(prepared.readers.size).toBe(1);
   });
 
+  it.each(["ownerEpoch", "revision"] as const)("fails closed in the continuation prompt when checkpoint %s metadata is stale", async field => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute }); modelPreparation(h); h.newScheduler().start();
+    await advance(minute + 1000); await flush();
+    h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    const continuation = h.row().runtime.continuation!;
+    const checkpoint = h.entries.get(continuation.checkpoint.entryId) as any;
+    checkpoint.data.binding[field]++;
+    await advance(minute + 1000); await flush();
+    expect(h.runs).toHaveLength(1);
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_model_preparation_failed" });
+  });
+
   it("does not construct a second child SDK writer when another scheduler already owns the logical job", async () => {
     const h = fixture({ model: "fixture/model" }); modelPreparation(h); const first = h.newScheduler(); first.start(); await advance(60 * minute + 1000); await flush();
     const before = h.row().attemptCount; const second = h.newScheduler(); second.start(); await flush();

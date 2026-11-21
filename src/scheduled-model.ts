@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AgentSession, CURRENT_SESSION_VERSION, type ExtensionContext, type FileEntry, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
-import { validateModelSdkClose, validateNativeProof } from "./resilient-policy.js";
+import { sameCheckpointReference, validateModelSdkClose, validateNativeProof } from "./resilient-policy.js";
 import { prepareModelSession, resolveModelRoute } from "./subagent.js";
 import type { ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob } from "./types.js";
 
@@ -14,6 +14,7 @@ export interface PreparedScheduledModel {
   sessionManager: NativeSessionReader;
   dispose(receipt?: NativeExecutionProof): Promise<ModelSdkCloseProof | undefined>;
 }
+type ScheduledContinuation = NonNullable<ResilientJob["runtime"]["continuation"]>;
 const sessionDirectory = (cwd: string) => path.resolve(cwd, ".pi", "schedule-native");
 const staticCapabilityVersion = () => (AgentSession as unknown as { scheduledExecutionVersion?: number }).scheduledExecutionVersion;
 
@@ -49,6 +50,22 @@ export function readModelSdkClose(manager: NativeSessionReader, native: NativeEx
   return undefined;
 }
 
+export function validateContinuationCheckpointBinding(job: ResilientJob, continuation: ScheduledContinuation, data: { runId: string; binding: NativeExecutionProof["binding"] }): void {
+  const record = job.attemptHistory.find(item => item.id === continuation.attemptId);
+  const proof = record?.nativeProof;
+  const checkpoint = record?.checkpoint;
+  if (!record || !proof || !checkpoint || !sameCheckpointReference(checkpoint, continuation.checkpoint)) throw new Error("Exact native continuation binding is unavailable; do not replay the run");
+  validateNativeProof(proof);
+  const expectedBinding: NativeExecutionProof["binding"] = {
+    jobId: job.id,
+    attemptId: continuation.attemptId,
+    ownerSessionId: continuation.checkpoint.sessionId,
+    ownerEpoch: record.owner.epoch,
+    revision: record.revision,
+  };
+  if (proof.runId !== continuation.checkpoint.runId || proof.checkpointEntryId !== continuation.checkpoint.entryId || !sameNativeBinding(proof.binding, expectedBinding) || data.runId !== continuation.checkpoint.runId || !sameNativeBinding(data.binding, expectedBinding)) throw new Error("Exact native continuation binding is unavailable; do not replay the run");
+}
+
 /** Pure route/checkpoint/SDK preflight. It constructs no SDK session and writes no transcript. */
 export function planScheduledModel(ctx: ExtensionContext, job: ResilientJob): ScheduledModelPlan {
   if (!job.model) throw new Error("A persisted explicit model route is required");
@@ -63,7 +80,8 @@ export function planScheduledModel(ctx: ExtensionContext, job: ResilientJob): Sc
     const manager = readStoredModelSession(ctx.cwd, continuation.checkpoint.sessionId, continuation.checkpoint.sessionFile);
     const entry = manager.getEntry(continuation.checkpoint.entryId);
     const data = entry?.type === "custom" && entry.customType === "pi.scheduled-checkpoint.v1" ? entry.data as { version?: number; runId?: string; binding?: NativeExecutionProof["binding"] } : undefined;
-    if (data?.version !== 1 || data.runId !== continuation.checkpoint.runId || data.binding?.jobId !== job.id || data.binding.attemptId !== continuation.attemptId || data.binding.ownerSessionId !== continuation.checkpoint.sessionId) throw new Error("Model continuation checkpoint/binding is unavailable; do not create a replay session");
+    if (data?.version !== 1 || data.runId !== continuation.checkpoint.runId || !data.binding) throw new Error("Model continuation checkpoint/binding is unavailable; do not create a replay session");
+    validateContinuationCheckpointBinding(job, continuation, data as { runId: string; binding: NativeExecutionProof["binding"] });
   }
   return { route: resolution.route, ...(continuation ? { checkpoint: structuredClone(continuation.checkpoint) } : {}) };
 }

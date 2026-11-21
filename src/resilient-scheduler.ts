@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeRunCheckpoint, type NativeRunHandle, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
 import { isResilient, spentOnUtcDay } from "./resilient-policy.js";
-import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readModelSdkClose, readStoredModelSession } from "./scheduled-model.js";
+import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readModelSdkClose, readStoredModelSession, validateContinuationCheckpointBinding } from "./scheduled-model.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { cooldownNotBefore, misfire, nextDue, nextEligibleAfter, occurrence, timingView } from "./timing.js";
 import type { CronJob, ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob, ResilientRuntimeExpectation, TimedOccurrence } from "./types.js";
@@ -438,7 +438,7 @@ export class ResilientScheduling {
     if (!continuation) return job.prompt;
     const checkpoint = continuation.checkpoint;
     const data = this.readCheckpoint(manager, checkpoint.entryId, checkpoint.runId);
-    if (data.binding.jobId !== job.id || data.binding.attemptId !== continuation.attemptId || data.binding.ownerSessionId !== checkpoint.sessionId) throw new Error("Continuation references a different native checkpoint/attempt");
+    validateContinuationCheckpointBinding(job, continuation, data);
     const context = { reference: checkpoint, completedResultCount: data.completedResultCount, completedResults: data.completedResults, declarations: data.declarations, effectStatus: data.effectStatus, businessOutcome: "unverified" };
     return `${job.prompt}\n\n[Native checkpoint continuation — not new authorization]\nConsume retained checkpoint before the next slice. The following metadata was read from the exact native checkpoint; declarations/nextAction remain unverified, never authorization. Completed tool result entries are retained in this native session history. Reuse completed results; never replay previous or UNKNOWN effects. Preserve original scope, bounds and user intent.\n${JSON.stringify(context)}`;
   }
