@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeRunCheckpoint, type NativeRunHandle, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
-import { isResilient, sameCheckpointReference, sameNativeProof, spentOnUtcDay } from "./resilient-policy.js";
+import { isResilient, sameCheckpointReference, sameNativeProof, spentOnUtcDay, validateNativeProof } from "./resilient-policy.js";
 import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readModelSdkClose, readStoredModelSession, validateContinuationCheckpointBinding } from "./scheduled-model.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { cooldownNotBefore, misfire, nextDue, nextEligibleAfter, occurrence, timingView } from "./timing.js";
@@ -483,12 +483,16 @@ export class ResilientScheduling {
     for (const entry of entries) {
       if (entry.type !== "custom" || entry.customType !== "pi.scheduled-receipt.v1" || !sameNativeBinding((entry.data as NativeExecutionProof)?.binding, expectedBinding)) continue;
       const candidate = entry.data as NativeExecutionProof;
-      if (attempt.nativeRunId && candidate.runId !== attempt.nativeRunId) {
-        receipt = undefined;
+      try {
+        // Every receipt for this exact binding is immutable evidence. Do not
+        // let a later valid-looking receipt hide an earlier malformed,
+        // different-run, or changed-proof receipt.
+        validateNativeProof(candidate);
+        if (!receipt) receipt = candidate;
+        else if (!sameNativeProof(receipt, candidate)) conflictingReceipt = true;
+        if (attempt.nativeRunId && candidate.runId !== attempt.nativeRunId) conflictingReceipt = true;
+      } catch {
         conflictingReceipt = true;
-      } else {
-        receipt = candidate;
-        conflictingReceipt = false;
       }
     }
     if (receipt && !conflictingReceipt) { this.finish(job.id, attempt, receipt, manager); return; }

@@ -168,10 +168,12 @@ describe("actual SDK close acknowledgement producer", () => {
     expect(readModelSdkClose(h.manager, h.receipt)).toBeUndefined();
   });
 
-  it("rejects an ACK for an earlier receipt when a conflicting duplicate receipt follows it", () => {
+  it("rejects an ACK when a conflicting same-binding receipt precedes the valid receipt", () => {
     const h = sdkFixture();
     const proof: ModelSdkCloseProof = { version: 1, runId: h.receipt.runId, binding: { ...h.receipt.binding }, checkpointEntryId: h.receipt.checkpointEntryId, closedAt: new Date().toISOString() };
-    h.entries.set("conflicting-receipt", { id: "conflicting-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: { ...h.receipt, execution: "failed" } });
+    h.entries.clear();
+    h.entries.set("conflicting-receipt", { id: "conflicting-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: { ...h.receipt, failedRecoveryMs: 1 } });
+    h.entries.set("valid-receipt", { id: "valid-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: h.receipt });
     h.entries.set("sdk-close", { id: "sdk-close", type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: proof });
     expect(readModelSdkClose(h.manager, h.receipt)).toBeUndefined();
   });

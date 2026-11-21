@@ -51,25 +51,32 @@ export function readModelSdkClose(manager: NativeSessionReader, native: NativeEx
   const lastIndex = entries.length - 1;
   if (lastIndex < 1) return undefined;
   const expected = normalizeNativeProof(native);
-  let receiptIndex = -1;
   let latestReceiptIndex = -1;
   let latestReceiptMatches = false;
+  let matchingReceipt = false;
+  let conflictingReceipt = false;
   for (let index = 0; index < lastIndex; index++) {
     const entry = entries[index];
     if (entry.type !== "custom" || entry.customType !== "pi.scheduled-receipt.v1") continue;
     latestReceiptIndex = index;
-    try {
-      latestReceiptMatches = sameNativeProof(entry.data as NativeExecutionProof, expected);
-      if (latestReceiptMatches) receiptIndex = index;
-    } catch {
-      // A malformed or conflicting later receipt is still transcript activity;
-      // it cannot be skipped when proving which receipt the ACK closes.
+    if (!sameNativeBinding((entry.data as NativeExecutionProof)?.binding, expected.binding)) {
       latestReceiptMatches = false;
+      continue;
+    }
+    try {
+      // Compare every receipt for the exact native binding. An ACK cannot
+      // choose a later valid proof over an earlier conflicting transcript.
+      latestReceiptMatches = sameNativeProof(entry.data as NativeExecutionProof, expected);
+      if (latestReceiptMatches) matchingReceipt = true;
+      else conflictingReceipt = true;
+    } catch {
+      latestReceiptMatches = false;
+      conflictingReceipt = true;
     }
   }
-  if (receiptIndex < 0 || receiptIndex !== latestReceiptIndex || !latestReceiptMatches) return undefined;
+  if (latestReceiptIndex < 0 || !latestReceiptMatches || !matchingReceipt || conflictingReceipt) return undefined;
   const entry = entries[lastIndex];
-  if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY || lastIndex <= receiptIndex) return undefined;
+  if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY || lastIndex <= latestReceiptIndex) return undefined;
   const proof = entry.data as ModelSdkCloseProof;
   if (proof?.runId !== expected.runId || !sameNativeBinding(proof.binding, expected.binding) || proof.checkpointEntryId !== expected.checkpointEntryId) return undefined;
   try { validateModelSdkClose(proof, expected); }

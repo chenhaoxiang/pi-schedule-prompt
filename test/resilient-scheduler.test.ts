@@ -368,6 +368,30 @@ describe("resilient native timer composition", () => {
     expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed" });
   });
 
+  it("retains inline ownership when restore sees an earlier conflicting receipt", async () => {
+    const h = fixture(); const first = h.newScheduler(); first.start(); await advance(60 * minute + 1000);
+    const run = h.runs[0]; const checkpointEntryId = run.handle.checkpoint(); const finishedAt = new Date().toISOString();
+    const valid: NativeExecutionProof = { version: 1, runId: run.handle.runId, binding: { ...run.request.binding }, finishedAt, execution: "completed", checkpointEntryId, effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 };
+    h.entries.set("conflicting-receipt", { id: "conflicting-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: { ...valid, execution: "failed" } });
+    h.entries.set("valid-receipt", { id: "valid-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: valid });
+    first.stop();
+    const restored = new CronScheduler(h.storage, h.pi as any, { ...h.ctx, scheduledExecution: { ...h.capability, active: undefined } } as any); schedulers.push(restored); restored.start(); await flush();
+    expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce(); expect(restored.getNextRun("job")).toBeNull();
+    expect(h.row()).toMatchObject({ attemptCount: 1, attemptHistory: [], runtime: { slot: { kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed", attempt: { id: run.request.binding.attemptId } } } });
+  });
+
+  it("retains model ownership when restore sees an earlier conflicting receipt", async () => {
+    const h = fixture({ model: "fixture/model" }); modelPreparation(h); const first = h.newScheduler(); first.start(); await advance(60 * minute + 1000); await flush();
+    const run = h.runs[0]; const checkpointEntryId = run.handle.checkpoint(); const finishedAt = new Date().toISOString();
+    const valid: NativeExecutionProof = { version: 1, runId: run.handle.runId, binding: { ...run.request.binding }, finishedAt, execution: "completed", checkpointEntryId, effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 };
+    h.entries.set("conflicting-receipt", { id: "conflicting-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: { ...valid, failedRecoveryMs: 1 } });
+    h.entries.set("valid-receipt", { id: "valid-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: valid });
+    first.stop();
+    const restored = new CronScheduler(h.storage, h.pi as any, { ...h.ctx, scheduledExecution: { ...h.ctx.scheduledExecution, active: undefined } } as any); schedulers.push(restored); restored.start(); await flush();
+    expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce(); expect(prepareScheduledModel).toHaveBeenCalledOnce(); expect(restored.getNextRun("job")).toBeNull();
+    expect(h.row()).toMatchObject({ attemptCount: 1, attemptHistory: [], runtime: { slot: { kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed", attempt: { id: run.request.binding.attemptId } } } });
+  });
+
   it("retains inline ownership when settlement cannot obtain a persistent checkpoint file", async () => {
     const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
     (h.ctx.sessionManager as any).getSessionFile = () => undefined;
