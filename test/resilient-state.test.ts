@@ -300,6 +300,7 @@ describe("versioned resilient store and exact ownership", () => {
   });
 
   for (const mismatch of [
+    { name: "proof run", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.runId = "wrong-proof-run"; } },
     { name: "proof checkpoint entry", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.checkpointEntryId = "wrong-proof-checkpoint"; } },
     { name: "checkpoint entry", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.entryId = "wrong-checkpoint"; } },
     { name: "checkpoint session", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.sessionId = "wrong-session"; } },
