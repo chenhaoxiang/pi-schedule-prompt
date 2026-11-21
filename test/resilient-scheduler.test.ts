@@ -92,6 +92,13 @@ function modelPreparation(h: ReturnType<typeof fixture>) {
 }
 const advance = (duration: number) => vi.advanceTimersByTimeAsync(duration);
 async function flush() { for (let i = 0; i < 6; i++) await Promise.resolve(); }
+function removePersistedCheckpointSessionFile(h: ReturnType<typeof fixture>): void {
+  const store = JSON.parse(fs.readFileSync(h.storage.getStorePath(), "utf8"));
+  const job = store.jobs.find((item: any) => item.id === "job");
+  delete job.runtime.continuation.checkpoint.sessionFile;
+  delete job.attemptHistory.at(-1).checkpoint.sessionFile;
+  fs.writeFileSync(h.storage.getStorePath(), JSON.stringify(store));
+}
 beforeEach(() => { vi.mocked(planScheduledModel).mockReset(); vi.mocked(prepareScheduledModel).mockReset(); vi.mocked(readStoredModelSession).mockReset(); vi.useFakeTimers(); vi.setSystemTime(beginning); });
 afterEach(() => { for (const scheduler of schedulers.splice(0)) scheduler.stop(); vi.unstubAllEnvs(); vi.useRealTimers(); for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
 
@@ -321,6 +328,37 @@ describe("resilient native timer composition", () => {
     const restored = h.newScheduler(); restored.start(); await flush();
     expect(restored.isRunning()).toBe(true); expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce();
     expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed" });
+  });
+
+  it("fails closed before inline continuation when the persisted checkpoint file is missing", async () => {
+    const h = fixture({ intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute }); const scheduler = h.newScheduler(); scheduler.start();
+    await advance(minute + 1000); h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    removePersistedCheckpointSessionFile(h);
+    await advance(minute + 1000); await flush();
+    expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_start_failed" });
+  });
+
+  it("fails closed while restoring inline ownership when the persisted checkpoint file is missing", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    const slot = h.row().runtime.slot;
+    if (slot.kind !== "owned") throw new Error("Expected an owned inline run");
+    const checkpointEntryId = h.runs[0].handle.checkpoint();
+    expect(h.storage.markResilientPhase("job", slot.attempt.id, slot.attempt.owner, "attention-required", "synthetic_restore", { sessionId: "owner", entryId: checkpointEntryId, runId: "run-0" })).toBe(true);
+    scheduler.stop();
+    const restored = h.newScheduler(); restored.start(); await flush();
+    expect(restored.isRunning()).toBe(true); expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed" });
+  });
+
+  it("retains inline ownership when settlement cannot obtain a persistent checkpoint file", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    (h.ctx.sessionManager as any).getSessionFile = () => undefined;
+    h.runs[0].close("completed", "unknown"); await flush();
+    expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce();
+    expect(h.row()).toMatchObject({ attemptCount: 1, attemptHistory: [], runtime: { slot: { kind: "owned", phase: "attention-required", reason: "native_settlement_failed" } } });
+    expect(h.row().runtime.continuation).toBeUndefined();
+    expect(scheduler.getNextRun("job")).toBeNull();
   });
 
   it("retains the exact receipt and owner when receipt-only recovery reads a busy store", async () => {

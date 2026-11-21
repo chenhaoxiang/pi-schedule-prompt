@@ -435,7 +435,9 @@ export class ResilientScheduling {
     return job && isResilient(job) && job.session === this.ctx.sessionManager.getSessionId() ? job : undefined;
   }
   private assertCheckpointSessionFile(checkpoint: NativeCheckpointReference | undefined, manager: NativeSessionReader): void {
-    if (checkpoint?.sessionFile !== undefined && manager.getSessionFile?.() !== checkpoint.sessionFile) throw new Error("Exact native checkpoint transcript file is unavailable; do not replay the run");
+    if (!checkpoint) return;
+    const currentSessionFile = manager.getSessionFile?.();
+    if (typeof checkpoint.sessionFile !== "string" || !checkpoint.sessionFile || typeof currentSessionFile !== "string" || !currentSessionFile || checkpoint.sessionFile !== currentSessionFile) throw new Error("Exact native checkpoint transcript file is unavailable; do not replay the run");
   }
   private prompt(job: ResilientJob, manager: NativeSessionReader): string {
     const continuation = job.runtime.continuation;
@@ -525,7 +527,8 @@ export class ResilientScheduling {
     const data = this.readCheckpoint(manager, receipt.checkpointEntryId, receipt.runId);
     if (!sameNativeBinding(data.binding, receipt.binding)) throw new Error("Exact native checkpoint binding changed; do not replay the run");
     const sessionFile = manager.getSessionFile?.();
-    return { reference: { sessionId: receipt.binding.ownerSessionId, entryId: receipt.checkpointEntryId, runId: receipt.runId, ...(sessionFile ? { sessionFile } : {}) }, waitingReason: data.declarations?.waitingReason };
+    if (typeof sessionFile !== "string" || !sessionFile) throw new Error("Exact native checkpoint transcript file is unavailable; do not continue the run");
+    return { reference: { sessionId: receipt.binding.ownerSessionId, entryId: receipt.checkpointEntryId, runId: receipt.runId, sessionFile }, waitingReason: data.declarations?.waitingReason };
   }
 
   private finish(id: string, attempt: OwnedAttempt, receipt: NativeExecutionProof & { reason?: string }, manager: NativeSessionReader, allowRecovery = true, retained?: { checkpoint: NativeCheckpointReference; waitingReason?: string; modelSdkClose?: ModelSdkCloseProof }): void {
@@ -538,6 +541,7 @@ export class ResilientScheduling {
       // store. If the store is busy, this exact receipt can still be retained
       // for a persistence-only retry; no new native action is authorized.
       const checkpoint = retained ? { reference: structuredClone(retained.checkpoint), ...(retained.waitingReason !== undefined ? { waitingReason: retained.waitingReason } : {}) } : this.checkpoint(receipt, manager);
+      this.assertCheckpointSessionFile(checkpoint.reference, manager);
       recoveryCheckpoint = checkpoint.reference;
       recoveryWaitingReason = checkpoint.waitingReason;
       const modelSdkClose = attempt.model ? retained?.modelSdkClose ?? readModelSdkClose(manager, receipt) : undefined;
@@ -606,7 +610,19 @@ export class ResilientScheduling {
         return;
       }
       if (before) this.keepOwned(before, attempt, "native_settlement_failed", error, recoveryCheckpoint);
-      else this.hooks.onError(id, error);
+      else {
+        try {
+          const current = this.current(id);
+          if (current) this.keepOwned(current, attempt, "native_settlement_failed", error, recoveryCheckpoint);
+          else this.hooks.onError(id, error);
+        } catch (failure) {
+          if (failure instanceof ScheduleStoreBusyError) this.armOwnedRecovery(id, () => {
+            const current = this.current(id);
+            if (current) this.keepOwned(current, attempt, "native_settlement_failed", error, recoveryCheckpoint);
+          });
+          else this.hooks.onError(id, failure);
+        }
+      }
     }
   }
 
@@ -868,7 +884,9 @@ export class ResilientScheduling {
               const ownedExpected = current ? this.ownedRuntimeExpectation(current, run.attempt) : undefined;
               if (nextProjection.phase === "running" || !ownedExpected) continue;
               const expectedRuntime: ResilientRuntimeExpectation = { ...ownedExpected, phase: previous?.phase ?? "running", ...(previous?.reason !== undefined ? { reason: previous.reason } : { reason: undefined }) };
-              const committed = this.storage.markResilientPhase(id, run.attempt.id, run.attempt.owner, nextProjection.phase, nextProjection.reason, nextProjection.checkpointEntryId ? { sessionId: snapshot.binding.ownerSessionId, runId: snapshot.runId, entryId: nextProjection.checkpointEntryId } : undefined, expectedRuntime);
+              const sessionFile = run.sessionManager.getSessionFile?.();
+              const checkpoint = nextProjection.checkpointEntryId && typeof sessionFile === "string" && sessionFile ? { sessionId: snapshot.binding.ownerSessionId, runId: snapshot.runId, entryId: nextProjection.checkpointEntryId, sessionFile } : undefined;
+              const committed = this.storage.markResilientPhase(id, run.attempt.id, run.attempt.owner, nextProjection.phase, nextProjection.reason, checkpoint, expectedRuntime);
               if (committed) { run.projected = nextProjection; this.hooks.onChange(this.current(id)); }
             }
           }
