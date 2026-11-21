@@ -6,6 +6,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inspectExpiredRetirement } from "./expired-retirement.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
+import { sameNativeBinding } from "./native.js";
 import { continuationDelayNotBefore, instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
 import { nextDue, timingView } from "./timing.js";
 import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type LegacyOwnerHandover, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type ResilientRuntimeExpectation, type TimedOccurrence } from "./types.js";
@@ -594,7 +595,7 @@ export class CronStorage {
       const attempt = this.owned(job, attemptId, owner);
       if (!attempt) {
         const previous = job.attemptHistory.find(item => item.id === attemptId);
-        if (previous?.nativeProof && previous.owner.sessionId === owner.sessionId && previous.owner.instanceId === owner.instanceId && previous.owner.epoch === owner.epoch && previous.nativeProof.runId === proof.runId && previous.nativeProof.binding.ownerSessionId === proof.binding.ownerSessionId && proof.binding.attemptId === attemptId && proof.binding.jobId === id && proof.binding.ownerEpoch === owner.epoch && proof.binding.revision === previous.revision) {
+        if (previous?.nativeProof && previous.owner.sessionId === owner.sessionId && previous.owner.instanceId === owner.instanceId && previous.owner.epoch === owner.epoch && previous.nativeProof.runId === proof.runId && previous.nativeProof.checkpointEntryId === proof.checkpointEntryId && sameNativeBinding(previous.nativeProof.binding, proof.binding) && sameCheckpointReference(previous.checkpoint, checkpoint)) {
           const fingerprint = createHash("sha256").update(JSON.stringify(proof)).digest("hex");
           if (job.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === fingerprint)) return { write: false, value: false };
           job.attemptResolutions.push({ attemptId, evidenceFingerprint: fingerprint, at: proof.finishedAt, disposition: "native-closure" });

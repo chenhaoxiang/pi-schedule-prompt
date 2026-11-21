@@ -728,7 +728,23 @@ export class ResilientScheduling {
   }
 
   private settledByOtherWriter(job: ResilientJob | undefined, attempt: OwnedAttempt, receipt: NativeExecutionProof): boolean {
-    return !!job?.attemptHistory.some(record => record.charged && record.id === attempt.id && record.owner.sessionId === attempt.owner.sessionId && record.owner.instanceId === attempt.owner.instanceId && record.owner.epoch === attempt.owner.epoch && record.nativeProof?.runId === receipt.runId && record.nativeProof.binding.attemptId === attempt.id && record.nativeProof.binding.ownerEpoch === attempt.owner.epoch);
+    if (!job) return false;
+    const expectedBinding: NativeExecutionProof["binding"] = {
+      jobId: job.id,
+      attemptId: attempt.id,
+      ownerSessionId: attempt.nativeSessionId ?? attempt.owner.sessionId,
+      ownerEpoch: attempt.owner.epoch,
+      revision: attempt.revision,
+    };
+    return job.attemptHistory.some(record => {
+      const proof = record.nativeProof;
+      const checkpoint = record.checkpoint;
+      return record.charged && record.id === attempt.id && record.revision === attempt.revision &&
+        record.owner.sessionId === attempt.owner.sessionId && record.owner.instanceId === attempt.owner.instanceId && record.owner.epoch === attempt.owner.epoch &&
+        !!proof && sameNativeBinding(proof.binding, receipt.binding) && sameNativeBinding(proof.binding, expectedBinding) &&
+        proof.runId === receipt.runId && proof.checkpointEntryId === receipt.checkpointEntryId &&
+        checkpoint?.sessionId === receipt.binding.ownerSessionId && checkpoint.runId === receipt.runId && checkpoint.entryId === receipt.checkpointEntryId;
+    });
   }
 
   private emitChange(id: string): void {

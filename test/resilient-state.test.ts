@@ -299,6 +299,33 @@ describe("versioned resilient store and exact ownership", () => {
     expect(fs.statSync(h.storage.getStorePath()).mtimeMs).toBe(mtime);
   });
 
+  for (const mismatch of [
+    { name: "proof checkpoint entry", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.checkpointEntryId = "wrong-proof-checkpoint"; } },
+    { name: "checkpoint entry", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.entryId = "wrong-checkpoint"; } },
+    { name: "checkpoint session", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.sessionId = "wrong-session"; } },
+    { name: "checkpoint run", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.runId = "wrong-run"; } },
+    { name: "proof job binding", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.jobId = "wrong-job"; } },
+    { name: "proof attempt binding", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.attemptId = "wrong-attempt"; } },
+    { name: "proof session binding", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.ownerSessionId = "wrong-session"; } },
+    { name: "proof owner epoch", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.ownerEpoch++; } },
+    { name: "proof revision", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.binding.revision++; } },
+  ] as const) {
+    it(`rejects a late receipt with a mismatched ${mismatch.name} without writing native closure evidence`, () => {
+      const h = fixture(); const first = reserve(h.storage); const receipt = evidence(h.storage, first.attempt);
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(true);
+      const second = reserve(h.storage, "job", "instance-b");
+      const proof = structuredClone(receipt.proof); const checkpoint = structuredClone(receipt.checkpoint); mismatch.change(proof, checkpoint);
+      const before = fs.readFileSync(h.storage.getStorePath()); const replace = vi.spyOn(h.storage as any, "replaceStore");
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, proof, checkpoint, { phase: "waiting" })).toBe(false);
+      expect(replace).not.toHaveBeenCalled(); expect(fs.readFileSync(h.storage.getStorePath())).toEqual(before);
+      expect(h.storage.getJob("job")).toMatchObject({ runtime: { slot: { kind: "owned", attempt: { id: second.attempt.id } } }, attemptHistory: [{ id: first.attempt.id }], attemptResolutions: [] });
+
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
+      expect(replace).toHaveBeenCalledOnce(); expect(h.storage.getJob("job")?.attemptResolutions).toHaveLength(1);
+    });
+  }
+
   it("records real native interrupted execution without treating it as a completed fresh occurrence", () => {
     const h = fixture(); const { attempt } = reserve(h.storage); const { proof, checkpoint } = evidence(h.storage, attempt, "interrupted");
     expect(() => h.storage.settleResilient("job", attempt.id, attempt.owner, proof, checkpoint, { phase: "waiting" })).toThrow(/silently rearmed/);
