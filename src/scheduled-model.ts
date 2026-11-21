@@ -29,7 +29,7 @@ export function readStoredModelSession(cwd: string, sessionId: string, sessionFi
   const selected = selectedFile(cwd, sessionFile);
   const values = fs.readFileSync(selected, "utf8").split("\n").filter(line => line.trim()).map(line => JSON.parse(line) as FileEntry);
   const header = values[0];
-  if (header?.type !== "session" || header.id !== sessionId || header.version !== CURRENT_SESSION_VERSION) throw new Error("Native transcript identity/format is unavailable; preserve original bytes");
+  if (header?.type !== "session" || header.id !== sessionId || header.version !== CURRENT_SESSION_VERSION || typeof header.cwd !== "string" || path.resolve(header.cwd) !== path.resolve(cwd)) throw new Error("Native transcript identity/format is unavailable; preserve original bytes");
   const entries = values.slice(1) as SessionEntry[];
   if (entries.some(entry => !entry || typeof entry.id !== "string" || !entry.id) || new Set(entries.map(entry => entry.id)).size !== entries.length) throw new Error("Native transcript entries are malformed/duplicated; preserve original bytes");
   const byId = new Map(entries.map(entry => [entry.id, entry]));

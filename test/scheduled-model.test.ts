@@ -71,6 +71,31 @@ function sdkFixture() {
     expect((reader.getEntry("checkpoint") as any).data.declarations.nextAction).toBe("use-existing-result");
   });
 
+  it("rejects a continuation transcript with a missing or foreign cwd without rewriting it", () => {
+    const h = fixture();
+    for (const cwd of [undefined, path.dirname(h.cwd)]) {
+      h.values[0] = { ...h.values[0], ...(cwd === undefined ? {} : { cwd }) };
+      if (cwd === undefined) delete (h.values[0] as { cwd?: string }).cwd;
+      fs.writeFileSync(h.file, h.values.map(value => JSON.stringify(value)).join("\n") + "\n");
+      const bytes = fs.readFileSync(h.file);
+      expect(() => readStoredModelSession(h.cwd, "schedule-synthetic", h.file)).toThrow(/identity/);
+      expect(fs.readFileSync(h.file)).toEqual(bytes);
+    }
+  });
+
+  it("fails a cwd-mismatched continuation before SDK open or admission/store writes", async () => {
+    const h = fixture(); Object.defineProperty(AgentSession, "scheduledExecutionVersion", { configurable: true, value: 1 });
+    h.values[0] = { ...h.values[0], cwd: path.dirname(h.cwd) };
+    fs.writeFileSync(h.file, h.values.map(value => JSON.stringify(value)).join("\n") + "\n");
+    const transcript = fs.readFileSync(h.file); const storeFile = path.join(h.cwd, "store.json"); fs.writeFileSync(storeFile, "store-before"); const store = fs.readFileSync(storeFile);
+    const open = vi.spyOn(SessionManager, "open");
+    const bindFile = vi.fn((sessionFile: string) => fs.writeFileSync(storeFile, sessionFile));
+    const attempt: OwnedAttempt = { id: "before", revision: 1, owner: { sessionId: "logical-owner", instanceId: "instance", epoch: 2 }, occurrence: { id: "tick", revision: 1, source: "timer", dueAt: new Date().toISOString() }, admittedAt: new Date().toISOString(), deadlineMs: 10_000, workBudgetMs: 5000, model: "fixture/model", nativeSessionId: "schedule-synthetic", nativeSessionFile: h.file };
+    await expect(prepareScheduledModel(h.ctx, h.job, attempt, "fixture/model", bindFile)).rejects.toThrow(/identity/);
+    expect(open).not.toHaveBeenCalled(); expect(prepareModelSession).not.toHaveBeenCalled(); expect(bindFile).not.toHaveBeenCalled();
+    expect(fs.readFileSync(h.file)).toEqual(transcript); expect(fs.readFileSync(storeFile)).toEqual(store);
+  });
+
   it.each(["ownerEpoch", "revision"] as const)("rejects a continuation checkpoint with a stale %s binding before any session construction", field => {
     const h = fixture(); Object.defineProperty(AgentSession, "scheduledExecutionVersion", { configurable: true, value: 1 });
     const create = vi.spyOn(SessionManager, "create"); const open = vi.spyOn(SessionManager, "open");
