@@ -24,7 +24,7 @@ function fixture() {
   job.runtime.continuation = { attemptId: "before", checkpoint: checkpointReference };
   job.attemptHistory = [{
     id: "before", revision: 1, owner: { sessionId: "logical-owner", instanceId: "instance", epoch: 2 }, checkpoint: checkpointReference,
-    nativeProof: { version: 1, runId: "run", binding: checkpoint.binding, finishedAt: new Date().toISOString(), execution: "deferred", checkpointEntryId: "checkpoint", effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 }, model: "fixture/model",
+    nativeProof: { version: 1, runId: "run", binding: { ...checkpoint.binding }, finishedAt: new Date().toISOString(), execution: "deferred", checkpointEntryId: "checkpoint", effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 }, model: "fixture/model",
   } as any];
   const getAvailable = vi.fn(() => [{ provider: "fixture", id: "model", name: "model" }]);
   const ctx = { cwd, modelRegistry: { getAvailable } } as any;
