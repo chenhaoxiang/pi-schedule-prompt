@@ -58,7 +58,7 @@ export function spentOnUtcDay(job: ResilientJob, day: string): number {
 }
 
 export function sameCheckpointReference(a: NativeCheckpointReference | undefined, b: NativeCheckpointReference | undefined): boolean {
-  return !!a && !!b && a.sessionId === b.sessionId && a.entryId === b.entryId && a.runId === b.runId && a.sessionFile === b.sessionFile;
+  return !!a && !!b && a.sessionId === b.sessionId && a.entryId === b.entryId && a.runId === b.runId && typeof a.sessionFile === "string" && typeof b.sessionFile === "string" && a.sessionFile === b.sessionFile;
 }
 
 function latestEffectResolution(job: ResilientJob, attemptId: string | undefined): AttemptResolution | undefined {

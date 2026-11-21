@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeRunCheckpoint, type NativeRunHandle, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
-import { isResilient, spentOnUtcDay } from "./resilient-policy.js";
+import { isResilient, sameCheckpointReference, spentOnUtcDay } from "./resilient-policy.js";
 import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readModelSdkClose, readStoredModelSession, validateContinuationCheckpointBinding } from "./scheduled-model.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { cooldownNotBefore, misfire, nextDue, nextEligibleAfter, occurrence, timingView } from "./timing.js";
@@ -26,20 +26,21 @@ interface TrackedRun {
   closing?: boolean;
   projected?: ProjectedPhase;
 }
-interface PendingSettlementRecovery {
-  id: string;
+interface PendingSettlementEvidence {
   attempt: OwnedAttempt;
+  receipt: NativeExecutionProof;
+  checkpoint: NativeCheckpointReference;
+}
+interface PendingSettlementRecovery extends PendingSettlementEvidence {
+  id: string;
   receipt: NativeExecutionProof & { reason?: string };
   manager: NativeSessionReader;
-  checkpoint: NativeCheckpointReference;
   waitingReason?: string;
   modelSdkClose?: ModelSdkCloseProof;
   timer?: NodeJS.Timeout;
 }
-interface PendingSettlementNotification {
+interface PendingSettlementNotification extends PendingSettlementEvidence {
   id: string;
-  attempt: OwnedAttempt;
-  receipt: NativeExecutionProof;
   changeNotified: boolean;
   settledNotified: boolean;
   retries: number;
@@ -83,7 +84,7 @@ export class ResilientScheduling {
   private readonly settlementRecovery = new Map<string, PendingSettlementRecovery>();
   private readonly settlementNotification = new Map<string, PendingSettlementNotification>();
   private readonly lastSettledAttempt = new Map<string, string>();
-  private readonly lastSettledEvidence = new Map<string, { attempt: OwnedAttempt; receipt: NativeExecutionProof }>();
+  private readonly lastSettledEvidence = new Map<string, PendingSettlementEvidence>();
   private readonly scheduledSettlementAttempt = new Map<string, string>();
   private readonly settlementCadenceRecovery = new Map<string, { retries: number; timer?: NodeJS.Timeout }>();
   private readonly preparing = new Set<string>();
@@ -230,7 +231,7 @@ export class ResilientScheduling {
     try {
       const job = this.current(id);
       const evidence = this.lastSettledEvidence.get(id);
-      if (evidence && !this.settledByOtherWriter(job, evidence.attempt, evidence.receipt)) return;
+      if (evidence && !this.settledByOtherWriter(job, evidence.attempt, evidence.receipt, evidence.checkpoint)) return;
       if (!job?.enabled || job.runtime.slot.kind !== "idle") return;
       if (job.runtime.pending) this.hooks.onQueued(id);
       this.stopJob(id);
@@ -547,7 +548,7 @@ export class ResilientScheduling {
         before = this.current(id);
         if (!before) return;
         if (!this.sameOwnedAttempt(before, attempt)) {
-          if (this.settledByOtherWriter(before, attempt, receipt)) this.confirmSettlement(id, attempt, receipt);
+          if (this.settledByOtherWriter(before, attempt, receipt, checkpoint.reference)) this.confirmSettlement(id, attempt, receipt, checkpoint.reference);
           return;
         }
         const exhausted = !before.enabled || Date.parse(before.expiresAt!) <= Date.now() || before.attemptCount! >= before.maxRuns!;
@@ -557,12 +558,12 @@ export class ResilientScheduling {
         if (!expectedRuntime) continue;
         const committed = this.storage.settleResilient(id, attempt.id, attempt.owner, receipt, checkpoint.reference, { phase, reason: input ? "user_input_required" : receipt.reason, ...(notBefore ? { notBefore } : {}), ...(["waiting", "backoff"].includes(phase) && before.runtime.nextEligibleAt ? { nextEligibleAt: before.runtime.nextEligibleAt } : {}) }, modelSdkClose, expectedRuntime);
         if (committed) {
-          this.confirmSettlement(id, attempt, receipt);
+          this.confirmSettlement(id, attempt, receipt, checkpoint.reference);
           return;
         }
         const latest = this.current(id);
         if (!this.sameOwnedAttempt(latest, attempt)) {
-          if (this.settledByOtherWriter(latest, attempt, receipt)) this.confirmSettlement(id, attempt, receipt);
+          if (this.settledByOtherWriter(latest, attempt, receipt, checkpoint.reference)) this.confirmSettlement(id, attempt, receipt, checkpoint.reference);
           return;
         }
       }
@@ -598,14 +599,14 @@ export class ResilientScheduling {
     }
   }
 
-  private confirmSettlement(id: string, attempt: OwnedAttempt, receipt: NativeExecutionProof): void {
+  private confirmSettlement(id: string, attempt: OwnedAttempt, receipt: NativeExecutionProof, checkpoint: NativeCheckpointReference): void {
     this.clearSettlementRecovery(id);
     if (this.active.get(id)?.attempt.id === attempt.id) this.active.delete(id);
     const notification: PendingSettlementNotification = {
-      id, attempt: structuredClone(attempt), receipt: structuredClone(receipt), changeNotified: false, settledNotified: false, retries: 0,
+      id, attempt: structuredClone(attempt), receipt: structuredClone(receipt), checkpoint: structuredClone(checkpoint), changeNotified: false, settledNotified: false, retries: 0,
     };
     this.lastSettledAttempt.set(id, attempt.id);
-    this.lastSettledEvidence.set(id, { attempt: structuredClone(attempt), receipt: structuredClone(receipt) });
+    this.lastSettledEvidence.set(id, { attempt: structuredClone(attempt), receipt: structuredClone(receipt), checkpoint: structuredClone(checkpoint) });
     this.scheduledSettlementAttempt.delete(id);
     const existing = this.settlementNotification.get(id);
     if (!existing || existing.attempt.id !== attempt.id) this.settlementNotification.set(id, notification);
@@ -622,7 +623,7 @@ export class ResilientScheduling {
       else { this.settlementNotification.delete(notification.id); this.hooks.onError(notification.id, error); }
       return;
     }
-    if (!current || !this.settledByOtherWriter(current, notification.attempt, notification.receipt)) {
+    if (!current || !this.settledByOtherWriter(current, notification.attempt, notification.receipt, notification.checkpoint)) {
       this.settlementNotification.delete(notification.id);
       return;
     }
@@ -727,7 +728,7 @@ export class ResilientScheduling {
     return slot.kind === "owned" && slot.attempt.id === attempt.id && slot.attempt.owner.sessionId === attempt.owner.sessionId && slot.attempt.owner.instanceId === attempt.owner.instanceId && slot.attempt.owner.epoch === attempt.owner.epoch;
   }
 
-  private settledByOtherWriter(job: ResilientJob | undefined, attempt: OwnedAttempt, receipt: NativeExecutionProof): boolean {
+  private settledByOtherWriter(job: ResilientJob | undefined, attempt: OwnedAttempt, receipt: NativeExecutionProof, checkpointReference: NativeCheckpointReference): boolean {
     if (!job) return false;
     const expectedBinding: NativeExecutionProof["binding"] = {
       jobId: job.id,
@@ -743,7 +744,8 @@ export class ResilientScheduling {
         record.owner.sessionId === attempt.owner.sessionId && record.owner.instanceId === attempt.owner.instanceId && record.owner.epoch === attempt.owner.epoch &&
         !!proof && sameNativeBinding(proof.binding, receipt.binding) && sameNativeBinding(proof.binding, expectedBinding) &&
         proof.runId === receipt.runId && proof.checkpointEntryId === receipt.checkpointEntryId &&
-        checkpoint?.sessionId === receipt.binding.ownerSessionId && checkpoint.runId === receipt.runId && checkpoint.entryId === receipt.checkpointEntryId;
+        checkpoint?.sessionId === receipt.binding.ownerSessionId && checkpoint.runId === receipt.runId && checkpoint.entryId === receipt.checkpointEntryId &&
+        sameCheckpointReference(checkpoint, checkpointReference);
     });
   }
 

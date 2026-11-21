@@ -282,6 +282,21 @@ describe("resilient native timer composition", () => {
     expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { slot: { kind: "idle" } }, attemptHistory: [{ outcome: "completed" }] });
   });
 
+  it("does not confirm a late settlement from a different native transcript file", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    const persist = h.storage.settleResilient.bind(h.storage);
+    const settle = vi.spyOn(h.storage, "settleResilient");
+    settle.mockImplementationOnce((id, attemptId, owner, proof, checkpoint, disposition, modelSdkClose, expectedRuntime) => {
+      const foreignCheckpoint = { ...checkpoint, sessionFile: path.join(h.ctx.cwd, "foreign-native-session.jsonl") };
+      expect(persist(id, attemptId, owner, proof, foreignCheckpoint, disposition, modelSdkClose, expectedRuntime)).toBe(true);
+      return false;
+    });
+    h.runs[0].close(); await flush();
+    expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { slot: { kind: "idle" } }, attemptHistory: [{ outcome: "completed" }] });
+    expect(h.runs).toHaveLength(1);
+    expect(scheduler.getNextRun("job")).toBeNull();
+  });
+
   it("retains the exact receipt and owner when receipt-only recovery reads a busy store", async () => {
     const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
     vi.spyOn(h.storage, "settleResilient").mockReturnValue(false);
