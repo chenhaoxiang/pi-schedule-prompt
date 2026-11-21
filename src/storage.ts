@@ -6,8 +6,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { dailyLimited, EVENT_KEY_LIMIT, eventBinding, eventKey, eventNames, validateGithub, validEventId, validEventName, validEvidenceFingerprint } from "./events.js";
 import { inspectExpiredRetirement } from "./expired-retirement.js";
 import { inheritLegacyBudget } from "./legacy-lineage.js";
-import { sameNativeBinding } from "./native.js";
-import { continuationDelayNotBefore, instant, isResilient, requiresReconciliation, resilientDefinition, sameCheckpointReference, spentOnUtcDay, validateModelSdkClose, validateNativeProof, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
+import { continuationDelayNotBefore, instant, isResilient, normalizeNativeProof, requiresReconciliation, resilientDefinition, sameCheckpointReference, sameNativeProof, spentOnUtcDay, validateModelSdkClose, validateOccurrence, validateResilientJob } from "./resilient-policy.js";
 import { nextDue, timingView } from "./timing.js";
 import { type AttemptOwner, type AttemptRecord, type CronJob, type CronStore, type EventResult, EXECUTION_REASONS, type ExecutionOutcome, type ExecutionReceipt, type LegacyOwnerHandover, type ModelSdkCloseProof, type NativeCheckpointReference, type NativeExecutionProof, type OwnedAttempt, type ProgressOutcome, type ResilientIdlePhase, type ResilientJob, type ResilientPolicy, type ResilientRuntimeExpectation, type TimedOccurrence } from "./types.js";
 
@@ -537,11 +536,12 @@ export class CronStorage {
     });
   }
 
-  bindResilientNative(id: string, attemptId: string, owner: AttemptOwner, native: { runId: string; sessionId: string; sessionFile?: string; startedAt: string; deadlineAt: string }): boolean {
+  bindResilientNative(id: string, attemptId: string, owner: AttemptOwner, native: { runId: string; sessionId: string; sessionFile: string; startedAt: string; deadlineAt: string }): boolean {
+    if (typeof native.sessionFile !== "string" || !native.sessionFile || native.sessionFile.length > 2048 || /[\u0000-\u001f\u007f]/.test(native.sessionFile)) return false;
     return this.mutate(store => {
       const job = store.jobs.find(item => item.id === id); const attempt = this.owned(job, attemptId, owner);
       if (!attempt) return false;
-      if (attempt.nativeRunId !== undefined) return attempt.nativeRunId === native.runId && attempt.nativeSessionId === native.sessionId;
+      if (attempt.nativeRunId !== undefined) return attempt.nativeRunId === native.runId && attempt.nativeSessionId === native.sessionId && attempt.nativeSessionFile === native.sessionFile;
       if (attempt.nativeSessionId !== undefined && attempt.nativeSessionId !== native.sessionId) return false;
       if (attempt.nativeSessionFile !== undefined && native.sessionFile !== undefined && attempt.nativeSessionFile !== native.sessionFile) return false;
       attempt.nativeRunId = native.runId; attempt.nativeSessionId = native.sessionId;
@@ -581,21 +581,14 @@ export class CronStorage {
 
   /** Exact native closure first; final attempt records are append-only and never become business success. */
   settleResilient(id: string, attemptId: string, owner: AttemptOwner, received: NativeExecutionProof, checkpoint: NativeCheckpointReference, disposition: { phase: ResilientIdlePhase; reason?: string; notBefore?: string; nextEligibleAt?: string }, modelSdkClose?: ModelSdkCloseProof, expectedRuntime?: ResilientRuntimeExpectation): boolean {
-    validateNativeProof(received);
-    const proof: NativeExecutionProof = {
-      version: 1, runId: received.runId,
-      binding: { jobId: received.binding.jobId, attemptId: received.binding.attemptId, ownerSessionId: received.binding.ownerSessionId, ownerEpoch: received.binding.ownerEpoch, revision: received.binding.revision },
-      finishedAt: received.finishedAt, execution: received.execution, checkpointEntryId: received.checkpointEntryId,
-      effectStatus: received.effectStatus, businessOutcome: "unverified", failedRecoveryMs: received.failedRecoveryMs,
-      ...(received.retryNotBefore === undefined ? {} : { retryNotBefore: received.retryNotBefore }),
-    };
+    const proof = normalizeNativeProof(received);
     return this.mutateCas(store => {
       const job = store.jobs.find(item => item.id === id);
       if (!job || !isResilient(job) || (expectedRuntime && !this.matchesRuntime(job, expectedRuntime))) return { write: false, value: false };
       const attempt = this.owned(job, attemptId, owner);
       if (!attempt) {
         const previous = job.attemptHistory.find(item => item.id === attemptId);
-        if (previous?.nativeProof && previous.owner.sessionId === owner.sessionId && previous.owner.instanceId === owner.instanceId && previous.owner.epoch === owner.epoch && previous.nativeProof.runId === proof.runId && previous.nativeProof.checkpointEntryId === proof.checkpointEntryId && sameNativeBinding(previous.nativeProof.binding, proof.binding) && sameCheckpointReference(previous.checkpoint, checkpoint)) {
+        if (previous?.nativeProof && previous.owner.sessionId === owner.sessionId && previous.owner.instanceId === owner.instanceId && previous.owner.epoch === owner.epoch && sameNativeProof(previous.nativeProof, proof) && sameCheckpointReference(previous.checkpoint, checkpoint)) {
           const fingerprint = createHash("sha256").update(JSON.stringify(proof)).digest("hex");
           if (job.attemptResolutions.some(item => item.attemptId === attemptId && item.evidenceFingerprint === fingerprint)) return { write: false, value: false };
           job.attemptResolutions.push({ attemptId, evidenceFingerprint: fingerprint, at: proof.finishedAt, disposition: "native-closure" });
@@ -604,6 +597,7 @@ export class CronStorage {
         return { write: false, value: false };
       }
       if (proof.binding.jobId !== id || proof.binding.attemptId !== attemptId || proof.binding.ownerEpoch !== owner.epoch || proof.binding.revision !== attempt.revision || (attempt.nativeRunId && proof.runId !== attempt.nativeRunId) || proof.binding.ownerSessionId !== (attempt.nativeSessionId ?? owner.sessionId)) return { write: false, value: false };
+      if (typeof attempt.nativeSessionFile !== "string" || !attempt.nativeSessionFile || checkpoint.sessionFile !== attempt.nativeSessionFile || checkpoint.sessionId !== (attempt.nativeSessionId ?? owner.sessionId) || checkpoint.runId !== proof.runId || checkpoint.entryId !== proof.checkpointEntryId || (attempt.checkpoint && !sameCheckpointReference(attempt.checkpoint, checkpoint))) return { write: false, value: false };
       if (attempt.model) {
         if (!modelSdkClose) throw new Error("A native model receipt cannot release its persistent SDK/file writer without a close acknowledgement");
         validateModelSdkClose(modelSdkClose, proof);

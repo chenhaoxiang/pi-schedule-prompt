@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeRunCheckpoint, type NativeRunHandle, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
-import { isResilient, sameCheckpointReference, spentOnUtcDay } from "./resilient-policy.js";
+import { isResilient, sameCheckpointReference, sameNativeProof, spentOnUtcDay } from "./resilient-policy.js";
 import { type PreparedScheduledModel, planScheduledModel, prepareScheduledModel, readModelSdkClose, readStoredModelSession, validateContinuationCheckpointBinding } from "./scheduled-model.js";
 import { type CronStorage, ScheduleStoreBusyError } from "./storage.js";
 import { cooldownNotBefore, misfire, nextDue, nextEligibleAfter, occurrence, timingView } from "./timing.js";
@@ -488,7 +488,9 @@ export class ResilientScheduling {
     try {
       const snapshot = handle.snapshot();
       if (snapshot.runId !== handle.runId || !sameNativeBinding(snapshot.binding, bindingFor(job.id, attempt))) throw new Error("Native handle returned a different accepted binding");
-      if (!this.storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId: handle.runId, sessionId: snapshot.binding.ownerSessionId, ...(attempt.model ? { sessionFile: context.sessionManager.getSessionFile() } : {}), startedAt: snapshot.startedAt, deadlineAt: snapshot.hardDeadlineAt })) throw new Error("Native handle could not bind its exact storage owner");
+      const sessionFile = context.sessionManager.getSessionFile();
+      if (typeof sessionFile !== "string" || !sessionFile) throw new Error("Native transcript file is unavailable for exact settlement binding");
+      if (!this.storage.bindResilientNative(job.id, attempt.id, attempt.owner, { runId: handle.runId, sessionId: snapshot.binding.ownerSessionId, sessionFile, startedAt: snapshot.startedAt, deadlineAt: snapshot.hardDeadlineAt })) throw new Error("Native handle could not bind its exact storage owner");
       if (attempt.model && !context.dispose) throw new Error("Persistent model SDK closure callback is unavailable");
       const initialProjection = job.runtime.slot.kind === "owned" ? { phase: job.runtime.slot.phase, ...(job.runtime.slot.reason !== undefined ? { reason: job.runtime.slot.reason } : {}), ...(job.runtime.slot.attempt.checkpoint?.entryId ? { checkpointEntryId: job.runtime.slot.attempt.checkpoint.entryId } : {}) } : { phase: "running" as const };
       this.active.set(job.id, { attempt: structuredClone(attempt), handle, ...context, projected: initialProjection });
@@ -769,8 +771,7 @@ export class ResilientScheduling {
       const checkpoint = record.checkpoint;
       return record.charged && record.id === attempt.id && record.revision === attempt.revision &&
         record.owner.sessionId === attempt.owner.sessionId && record.owner.instanceId === attempt.owner.instanceId && record.owner.epoch === attempt.owner.epoch &&
-        !!proof && sameNativeBinding(proof.binding, receipt.binding) && sameNativeBinding(proof.binding, expectedBinding) &&
-        proof.runId === receipt.runId && proof.checkpointEntryId === receipt.checkpointEntryId &&
+        !!proof && sameNativeProof(proof, receipt) && sameNativeBinding(proof.binding, expectedBinding) &&
         checkpoint?.sessionId === receipt.binding.ownerSessionId && checkpoint.runId === receipt.runId && checkpoint.entryId === receipt.checkpointEntryId &&
         sameCheckpointReference(checkpoint, checkpointReference);
     });

@@ -51,7 +51,8 @@ function sdkFixture() {
   vi.mocked(prepareModelSession).mockResolvedValue(session as any);
   const attempt: OwnedAttempt = { id: "before", revision: 1, owner: { sessionId: "logical-owner", instanceId: "instance", epoch: 2 }, occurrence: { id: "tick", revision: 1, source: "timer", dueAt: new Date().toISOString() }, admittedAt: new Date().toISOString(), deadlineMs: 10_000, workBudgetMs: 5000, model: "fixture/model", nativeSessionId: "schedule-synthetic" };
   const receipt: NativeExecutionProof = { version: 1, runId: "run", binding: { jobId: h.job.id, attemptId: attempt.id, ownerSessionId: "schedule-synthetic", ownerEpoch: attempt.owner.epoch, revision: attempt.revision }, finishedAt: new Date().toISOString(), execution: "deferred", checkpointEntryId: "checkpoint", effectStatus: "none-observed", businessOutcome: "unverified", failedRecoveryMs: 0 };
-  return { ...h, order, session, manager, attempt, receipt, emitShutdownError: () => listener?.({ event: "session_shutdown", error: "synthetic shutdown rejection", extensionPath: "fixture" }), open: () => prepareScheduledModel(h.ctx, h.job, attempt, "fixture/model", () => order.push("bound")) };
+  entries.set("receipt", { id: "receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: receipt });
+  return { ...h, order, session, manager, entries, attempt, receipt, emitShutdownError: () => listener?.({ event: "session_shutdown", error: "synthetic shutdown rejection", extensionPath: "fixture" }), open: () => prepareScheduledModel(h.ctx, h.job, attempt, "fixture/model", () => order.push("bound")) };
 }
 
  describe("read-only model planning and native transcript readback", () => {
@@ -148,6 +149,14 @@ describe("actual SDK close acknowledgement producer", () => {
     const h = sdkFixture(); h.session.extensionRunner.emit.mockImplementationOnce(async () => { h.emitShutdownError(); });
     const prepared = await h.open(); await expect(prepared.dispose(h.receipt)).rejects.toThrow(/shutdown handler failed/);
     expect(h.session.dispose).toHaveBeenCalledOnce(); expect(h.manager.appendCustomEntry).not.toHaveBeenCalled(); expect(readModelSdkClose(prepared.sessionManager, h.receipt)).toBeUndefined();
+  });
+
+  it("does not accept an ACK that is followed by later transcript activity", () => {
+    const h = sdkFixture();
+    const proof: ModelSdkCloseProof = { version: 1, runId: h.receipt.runId, binding: { ...h.receipt.binding }, checkpointEntryId: h.receipt.checkpointEntryId, closedAt: new Date().toISOString() };
+    h.entries.set("sdk-close", { id: "sdk-close", type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: proof });
+    h.entries.set("later", { id: "later", type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId: h.receipt.runId, binding: h.receipt.binding } });
+    expect(readModelSdkClose(h.manager, h.receipt)).toBeUndefined();
   });
 
   it("does not acknowledge a failed close-ACK write even after SDK disposal has returned", async () => {

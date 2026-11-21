@@ -295,13 +295,13 @@ describe("resilient native timer composition", () => {
     const settle = vi.spyOn(h.storage, "settleResilient");
     settle.mockImplementationOnce((id, attemptId, owner, proof, checkpoint, disposition, modelSdkClose, expectedRuntime) => {
       const foreignCheckpoint = { ...checkpoint, sessionFile: path.join(h.ctx.cwd, "foreign-native-session.jsonl") };
-      expect(persist(id, attemptId, owner, proof, foreignCheckpoint, disposition, modelSdkClose, expectedRuntime)).toBe(true);
+      expect(persist(id, attemptId, owner, proof, foreignCheckpoint, disposition, modelSdkClose, expectedRuntime)).toBe(false);
       return false;
     });
     h.runs[0].close(); await flush();
     expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { slot: { kind: "idle" } }, attemptHistory: [{ outcome: "completed" }] });
     expect(h.runs).toHaveLength(1);
-    expect(scheduler.getNextRun("job")).toBeNull();
+    expect(scheduler.getNextRun("job")).toBeInstanceOf(Date);
   });
 
   it("fails closed before inline continuation when the persisted checkpoint file differs from the current session manager", async () => {
@@ -1144,6 +1144,18 @@ describe("resilient native timer composition", () => {
     const recovered = h.newScheduler(); recovered.start(); await flush();
     expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { lastFinishedAt: closedAt, slot: { kind: "idle", phase: "backoff" } }, attemptHistory: [{ modelSdkClose: { closedAt, runId: native.runId } }] });
     expect(recovered.getNextRun("job")?.getTime()).toBe(Date.parse(closedAt) + minute); expect(prepareScheduledModel).toHaveBeenCalledOnce();
+  });
+
+  it("keeps model ownership after restart when a valid SDK ACK is followed by later transcript activity", async () => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute });
+    modelPreparation(h); const scheduler = h.newScheduler(); scheduler.start(); await advance(minute + 1000); await flush();
+    vi.spyOn(h.storage, "settleResilient").mockImplementationOnce(() => { throw new Error("synthetic final store write loss"); });
+    h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush(); await flush();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required" });
+    h.entries.set("later-transcript-entry", { id: "later-transcript-entry", type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId: "run-0", binding: h.runs[0].request.binding } });
+    const recovered = h.newScheduler(); recovered.start(); await flush();
+    expect(recovered.isRunning()).toBe(true); expect(h.runs).toHaveLength(1); expect(prepareScheduledModel).toHaveBeenCalledOnce();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "model_sdk_closure_unconfirmed" });
   });
 
   it("does not refund a model native refusal until that prepared SDK writer has actually closed", async () => {

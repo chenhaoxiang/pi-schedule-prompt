@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AgentSession, CURRENT_SESSION_VERSION, type ExtensionContext, type FileEntry, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { type NativeCapability, type NativeSessionReader, nativeCapability, sameNativeBinding } from "./native.js";
-import { sameCheckpointReference, validateModelSdkClose, validateNativeProof } from "./resilient-policy.js";
+import { normalizeNativeProof, sameCheckpointReference, sameNativeProof, validateModelSdkClose, validateNativeProof } from "./resilient-policy.js";
 import { prepareModelSession, resolveModelRoute } from "./subagent.js";
 import type { ModelSdkCloseProof, NativeCheckpointReference, NativeExecutionProof, OwnedAttempt, ResilientJob } from "./types.js";
 
@@ -38,16 +38,26 @@ export function readStoredModelSession(cwd: string, sessionId: string, sessionFi
 
 /** A native run receipt cannot substitute for this separate persistent SDK/file-writer acknowledgement. */
 export function readModelSdkClose(manager: NativeSessionReader, native: NativeExecutionProof): ModelSdkCloseProof | undefined {
-  const entries = manager.getEntries();
-  for (let index = entries.length - 1; index >= 0; index--) {
+  const entries = manager.getEntries().filter(entry => !!entry);
+  const lastIndex = entries.length - 1;
+  if (lastIndex < 1) return undefined;
+  const expected = normalizeNativeProof(native);
+  let receiptIndex = -1;
+  for (let index = 0; index < lastIndex; index++) {
     const entry = entries[index];
-    if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY) continue;
-    const proof = entry.data as ModelSdkCloseProof;
-    if (proof?.runId !== native.runId || !sameNativeBinding(proof.binding, native.binding) || proof.checkpointEntryId !== native.checkpointEntryId) continue;
-    validateModelSdkClose(proof, native);
-    return structuredClone(proof);
+    if (entry.type !== "custom" || entry.customType !== "pi.scheduled-receipt.v1") continue;
+    try {
+      if (sameNativeProof(entry.data as NativeExecutionProof, expected)) receiptIndex = index;
+    } catch { /* Ignore unrelated or malformed transcript metadata. */ }
   }
-  return undefined;
+  if (receiptIndex < 0) return undefined;
+  const entry = entries[lastIndex];
+  if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY || lastIndex <= receiptIndex) return undefined;
+  const proof = entry.data as ModelSdkCloseProof;
+  if (proof?.runId !== expected.runId || !sameNativeBinding(proof.binding, expected.binding) || proof.checkpointEntryId !== expected.checkpointEntryId) return undefined;
+  try { validateModelSdkClose(proof, expected); }
+  catch { return undefined; }
+  return structuredClone(proof);
 }
 
 export function validateContinuationCheckpointBinding(job: ResilientJob, continuation: ScheduledContinuation, data: { runId: string; binding: NativeExecutionProof["binding"] }): void {

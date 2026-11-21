@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { Cron } from "croner";
 import { validEventId, validEvidenceFingerprint } from "./events.js";
 import { validateLegacyHandover } from "./legacy-lineage.js";
@@ -117,15 +118,36 @@ export function validateNativeProof(proof: NativeExecutionProof): void {
   if (proof?.version !== 1 || !validEventId(proof.runId) || !proof.binding || !validEventId(proof.binding.jobId) || !validEventId(proof.binding.attemptId) || !validEventId(proof.binding.ownerSessionId) || !safeInteger(proof.binding.ownerEpoch, 1) || !safeInteger(proof.binding.revision, 1) || !instant(proof.finishedAt) || !nativeOutcomes.has(proof.execution) || !validEventId(proof.checkpointEntryId) || !["none-observed", "unknown"].includes(proof.effectStatus) || proof.businessOutcome !== "unverified" || !Number.isFinite(proof.failedRecoveryMs) || proof.failedRecoveryMs < 0 || (proof.retryNotBefore !== undefined && !instant(proof.retryNotBefore))) throw new Error("Invalid native execution proof");
 }
 
+/** Keep only the immutable native receipt fields before comparing cooperating writers' evidence. */
+export function normalizeNativeProof(received: NativeExecutionProof): NativeExecutionProof {
+  validateNativeProof(received);
+  return {
+    version: 1,
+    runId: received.runId,
+    binding: { ...received.binding },
+    finishedAt: received.finishedAt,
+    execution: received.execution,
+    checkpointEntryId: received.checkpointEntryId,
+    effectStatus: received.effectStatus,
+    businessOutcome: "unverified",
+    failedRecoveryMs: received.failedRecoveryMs,
+    ...(received.retryNotBefore === undefined ? {} : { retryNotBefore: received.retryNotBefore }),
+  };
+}
+
+export function sameNativeProof(a: NativeExecutionProof, b: NativeExecutionProof): boolean {
+  return isDeepStrictEqual(normalizeNativeProof(a), normalizeNativeProof(b));
+}
+
 function validateOwned(value: OwnedAttempt, job: ResilientJob): void {
   if (!value || !validEventId(value.id) || !safeInteger(value.revision, 1) || value.revision > (job.revision ?? 1) || !instant(value.admittedAt) || !safeInteger(value.deadlineMs, 1000) || value.deadlineMs > 86_400_000 || !safeInteger(value.workBudgetMs, 1) || value.workBudgetMs >= value.deadlineMs) throw new Error("Invalid admitted resilient attempt");
   validateOwner(value.owner);
   validateOccurrence(value.occurrence);
   if (value.owner.sessionId !== job.session || value.owner.epoch !== job.runtime.ownerEpoch || value.occurrence.revision !== value.revision) throw new Error("Inconsistent resilient ownership/revision");
   if (value.model !== undefined && (typeof value.model !== "string" || !value.model.trim())) throw new Error("Invalid accepted model route");
-  if (value.nativeSessionFile !== undefined && (!value.model || typeof value.nativeSessionFile !== "string" || !value.nativeSessionFile || value.nativeSessionFile.length > 2048 || /[\u0000-\u001f\u007f]/.test(value.nativeSessionFile))) throw new Error("Invalid accepted native session file");
+  if (value.nativeSessionFile !== undefined && (typeof value.nativeSessionFile !== "string" || !value.nativeSessionFile || value.nativeSessionFile.length > 2048 || /[\u0000-\u001f\u007f]/.test(value.nativeSessionFile))) throw new Error("Invalid accepted native session file");
   if (value.nativeRunId !== undefined && (!validEventId(value.nativeSessionId) || (!value.model && value.nativeSessionId !== value.owner.sessionId) || !validEventId(value.nativeRunId) || !instant(value.nativeStartedAt) || !instant(value.nativeDeadlineAt) || Date.parse(value.nativeDeadlineAt) - Date.parse(value.nativeStartedAt) !== value.deadlineMs)) throw new Error("Invalid accepted native run budget/binding");
-  if (value.nativeRunId === undefined && ((value.nativeSessionId !== undefined && (!value.model || (!value.nativeSessionFile && value.nativeSessionId !== (job.runtime.continuation?.checkpoint.sessionId ?? ("schedule-" + value.id))) || !validEventId(value.nativeSessionId) || !value.nativeSessionId.startsWith("schedule-"))) || value.nativeStartedAt !== undefined || value.nativeDeadlineAt !== undefined || value.checkpoint !== undefined)) throw new Error("Unbound attempt cannot claim native progress; model session identity/file is a reservation, not execution proof");
+  if (value.nativeRunId === undefined && ((value.nativeSessionId !== undefined && (!value.model || (!value.nativeSessionFile && value.nativeSessionId !== (job.runtime.continuation?.checkpoint.sessionId ?? ("schedule-" + value.id))) || !validEventId(value.nativeSessionId) || !value.nativeSessionId.startsWith("schedule-"))) || (!value.model && value.nativeSessionFile !== undefined) || value.nativeStartedAt !== undefined || value.nativeDeadlineAt !== undefined || value.checkpoint !== undefined)) throw new Error("Unbound attempt cannot claim native progress; model session identity/file is a reservation, not execution proof");
   if (value.checkpoint) validateCheckpoint(value.checkpoint, value.nativeSessionId!, value.nativeRunId);
 }
 

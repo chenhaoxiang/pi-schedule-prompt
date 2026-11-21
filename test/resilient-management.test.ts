@@ -27,7 +27,7 @@ function closedUnknown(h: ReturnType<typeof fixture>, id: string, extra: Partial
   const reserved = h.storage.reserveResilient(id, "owner", "fixture-owner", job.revision!, tick.id)!;
   if (reserved.runtime.slot.kind !== "owned") throw new Error("No synthetic owner");
   const attempt = reserved.runtime.slot.attempt; const runId = "native-" + attempt.id;
-  h.storage.bindResilientNative(id, attempt.id, attempt.owner, { runId, sessionId: "owner", startedAt: new Date().toISOString(), deadlineAt: new Date(Date.now() + attempt.deadlineMs).toISOString() });
+  h.storage.bindResilientNative(id, attempt.id, attempt.owner, { runId, sessionId: "owner", sessionFile: h.ctx.sessionManager.getSessionFile(), startedAt: new Date().toISOString(), deadlineAt: new Date(Date.now() + attempt.deadlineMs).toISOString() });
   const checkpoint = { sessionId: "owner", runId, entryId: "checkpoint-" + attempt.id, sessionFile: h.ctx.sessionManager.getSessionFile() };
   const proof: NativeExecutionProof = { version: 1, runId, binding: { jobId: id, attemptId: attempt.id, ownerSessionId: "owner", ownerEpoch: attempt.owner.epoch, revision: attempt.revision }, finishedAt: new Date().toISOString(), execution: "completed", checkpointEntryId: checkpoint.entryId, effectStatus: "unknown", businessOutcome: "unverified", failedRecoveryMs: 0, ...extra };
   h.entries.set(checkpoint.entryId, { type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { ...proof, completedResults: [], completedResultCount: 0, declarations: { nextAction: "consume the retained synthetic checkpoint" } } });

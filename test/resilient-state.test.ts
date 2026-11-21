@@ -32,9 +32,10 @@ function reserve(storage: CronStorage, id = "job", instance = "instance-a"): { j
 function evidence(storage: CronStorage, attempt: OwnedAttempt, outcome: NativeExecutionProof["execution"] = "completed", effectStatus: NativeExecutionProof["effectStatus"] = "none-observed", id = "job") {
   const runId = "run-" + attempt.id;
   const sessionId = attempt.nativeSessionId ?? attempt.owner.sessionId;
+  const sessionFile = "/synthetic/" + sessionId + ".jsonl";
   const startedAt = new Date().toISOString();
-  expect(storage.bindResilientNative(id, attempt.id, attempt.owner, { runId, sessionId, startedAt, deadlineAt: new Date(Date.now() + attempt.deadlineMs).toISOString() })).toBe(true);
-  const checkpoint: NativeCheckpointReference = { runId, sessionId, entryId: "entry-" + attempt.id, sessionFile: "/synthetic/" + sessionId + ".jsonl" };
+  expect(storage.bindResilientNative(id, attempt.id, attempt.owner, { runId, sessionId, sessionFile, startedAt, deadlineAt: new Date(Date.now() + attempt.deadlineMs).toISOString() })).toBe(true);
+  const checkpoint: NativeCheckpointReference = { runId, sessionId, entryId: "entry-" + attempt.id, sessionFile };
   const proof: NativeExecutionProof = { version: 1, runId, binding: { jobId: id, attemptId: attempt.id, ownerSessionId: sessionId, ownerEpoch: attempt.owner.epoch, revision: attempt.revision }, execution: outcome, finishedAt: new Date().toISOString(), checkpointEntryId: checkpoint.entryId, effectStatus, businessOutcome: "unverified", failedRecoveryMs: 0 };
   return { proof, checkpoint };
 }
@@ -300,6 +301,11 @@ describe("versioned resilient store and exact ownership", () => {
   });
 
   for (const mismatch of [
+    { name: "finished time", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.finishedAt = new Date(Date.parse(proof.finishedAt) + 1000).toISOString(); } },
+    { name: "execution", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.execution = "failed"; } },
+    { name: "effect status", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.effectStatus = "unknown"; } },
+    { name: "failed recovery", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.failedRecoveryMs++; } },
+    { name: "retry not-before", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.retryNotBefore = new Date(Date.parse(proof.finishedAt) + 1000).toISOString(); } },
     { name: "proof run", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.runId = "wrong-proof-run"; } },
     { name: "proof checkpoint entry", change: (proof: NativeExecutionProof, _checkpoint: NativeCheckpointReference) => { proof.checkpointEntryId = "wrong-proof-checkpoint"; } },
     { name: "checkpoint entry", change: (_proof: NativeExecutionProof, checkpoint: NativeCheckpointReference) => { checkpoint.entryId = "wrong-checkpoint"; } },
@@ -324,6 +330,18 @@ describe("versioned resilient store and exact ownership", () => {
       expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
       expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" })).toBe(false);
       expect(replace).toHaveBeenCalledOnce(); expect(h.storage.getJob("job")?.attemptResolutions).toHaveLength(1);
+    });
+  }
+
+  for (const scenario of [{ label: "inline", model: false }, { label: "explicit-model", model: true }] as const) {
+    it(`rejects a foreign checkpoint transcript for ${scenario.label} settlement`, () => {
+      const h = fixture([seed(scenario.model ? { model: "fixture/model" } : {})]); const first = reserve(h.storage); const receipt = evidence(h.storage, first.attempt);
+      const foreign = { ...receipt.checkpoint, sessionFile: "/synthetic/foreign-session.jsonl" };
+      const before = fs.readFileSync(h.storage.getStorePath());
+      const sdk = scenario.model ? { version: 1 as const, runId: receipt.proof.runId, binding: { ...receipt.proof.binding }, checkpointEntryId: receipt.proof.checkpointEntryId, closedAt: receipt.proof.finishedAt } : undefined;
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, foreign, { phase: "waiting" }, sdk)).toBe(false);
+      expect(fs.readFileSync(h.storage.getStorePath())).toEqual(before); expect(h.storage.getJob("job")?.attemptHistory).toHaveLength(0);
+      expect(h.storage.settleResilient("job", first.attempt.id, first.attempt.owner, receipt.proof, receipt.checkpoint, { phase: "waiting" }, sdk)).toBe(true);
     });
   }
 
