@@ -57,6 +57,18 @@ export type ResilientIdlePhase = "waiting" | "backoff" | "reconciling" | "waitin
 export type ResilientSlot =
   | { kind: "idle"; phase: ResilientIdlePhase; reason?: string }
   | { kind: "owned"; phase: "running" | "draining" | "cancelling" | "attention-required"; attempt: OwnedAttempt; reason?: string };
+/** Exact runtime/projection identity required when a stale writer may otherwise share a revision. */
+interface ResilientRuntimeExpectationBase {
+  phase: ResilientSlot["phase"];
+  reason?: string;
+  /** Presence is significant: an absent target must not match a newly armed one. */
+  nextEligibleAt?: string;
+  /** Presence is significant: pending replacement is a same-revision CAS conflict. */
+  pendingId?: string;
+  pendingRevision?: number;
+}
+export type ResilientRuntimeExpectation = ResilientRuntimeExpectationBase &
+  ({ attemptId?: undefined; ownerEpoch?: number } | { attemptId: string; ownerEpoch: number });
 export interface ResilientRuntime {
   /** Preserved pre-schema4 spending, never replenished by recovery or ownership transfer. */
   baselineAttempts: number;
