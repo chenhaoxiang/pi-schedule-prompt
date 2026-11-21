@@ -72,6 +72,15 @@ function sdkFixture() {
     expect((reader.getEntry("checkpoint") as any).data.declarations.nextAction).toBe("use-existing-result");
   });
 
+  it("re-reads the exact stored transcript tail for every metadata-only access", () => {
+    const h = fixture();
+    const reader = readStoredModelSession(h.cwd, "schedule-synthetic", h.file);
+    expect(reader.getEntries()).toHaveLength(1);
+    fs.appendFileSync(h.file, JSON.stringify({ id: "later", parentId: "checkpoint", timestamp: new Date().toISOString(), type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId: "run", binding: h.values[1].data.binding } }) + "\n");
+    expect(reader.getEntries()).toHaveLength(2);
+    expect(reader.getEntry("later")).toMatchObject({ id: "later", customType: "pi.scheduled-checkpoint.v1" });
+  });
+
   it("rejects a continuation transcript with a missing or foreign cwd without rewriting it", () => {
     const h = fixture();
     for (const cwd of [undefined, path.dirname(h.cwd)]) {
@@ -156,6 +165,14 @@ describe("actual SDK close acknowledgement producer", () => {
     const proof: ModelSdkCloseProof = { version: 1, runId: h.receipt.runId, binding: { ...h.receipt.binding }, checkpointEntryId: h.receipt.checkpointEntryId, closedAt: new Date().toISOString() };
     h.entries.set("sdk-close", { id: "sdk-close", type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: proof });
     h.entries.set("later", { id: "later", type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId: h.receipt.runId, binding: h.receipt.binding } });
+    expect(readModelSdkClose(h.manager, h.receipt)).toBeUndefined();
+  });
+
+  it("rejects an ACK for an earlier receipt when a conflicting duplicate receipt follows it", () => {
+    const h = sdkFixture();
+    const proof: ModelSdkCloseProof = { version: 1, runId: h.receipt.runId, binding: { ...h.receipt.binding }, checkpointEntryId: h.receipt.checkpointEntryId, closedAt: new Date().toISOString() };
+    h.entries.set("conflicting-receipt", { id: "conflicting-receipt", type: "custom", customType: "pi.scheduled-receipt.v1", data: { ...h.receipt, execution: "failed" } });
+    h.entries.set("sdk-close", { id: "sdk-close", type: "custom", customType: MODEL_SDK_CLOSE_ENTRY, data: proof });
     expect(readModelSdkClose(h.manager, h.receipt)).toBeUndefined();
   });
 

@@ -24,16 +24,25 @@ function selectedFile(cwd: string, sessionFile: string): string {
   return selected;
 }
 
-/** A strict metadata-only read. Never call SessionManager.open (which may repair/migrate bytes) during preflight/readback. */
-export function readStoredModelSession(cwd: string, sessionId: string, sessionFile: string): NativeSessionReader {
+function readStoredEntries(cwd: string, sessionId: string, sessionFile: string): { selected: string; entries: SessionEntry[] } {
   const selected = selectedFile(cwd, sessionFile);
   const values = fs.readFileSync(selected, "utf8").split("\n").filter(line => line.trim()).map(line => JSON.parse(line) as FileEntry);
   const header = values[0];
   if (header?.type !== "session" || header.id !== sessionId || header.version !== CURRENT_SESSION_VERSION || typeof header.cwd !== "string" || path.resolve(header.cwd) !== path.resolve(cwd)) throw new Error("Native transcript identity/format is unavailable; preserve original bytes");
   const entries = values.slice(1) as SessionEntry[];
   if (entries.some(entry => !entry || typeof entry.id !== "string" || !entry.id) || new Set(entries.map(entry => entry.id)).size !== entries.length) throw new Error("Native transcript entries are malformed/duplicated; preserve original bytes");
-  const byId = new Map(entries.map(entry => [entry.id, entry]));
-  return { getSessionId: () => sessionId, getSessionFile: () => selected, getEntry: id => structuredClone(byId.get(id)), getEntries: () => structuredClone(entries) };
+  return { selected, entries };
+}
+
+/** A strict metadata-only read. Never call SessionManager.open (which may repair/migrate bytes) during preflight/readback. */
+export function readStoredModelSession(cwd: string, sessionId: string, sessionFile: string): NativeSessionReader {
+  const initial = readStoredEntries(cwd, sessionId, sessionFile);
+  return {
+    getSessionId: () => sessionId,
+    getSessionFile: () => initial.selected,
+    getEntry: id => structuredClone(readStoredEntries(cwd, sessionId, sessionFile).entries.find(entry => entry.id === id)),
+    getEntries: () => structuredClone(readStoredEntries(cwd, sessionId, sessionFile).entries),
+  };
 }
 
 /** A native run receipt cannot substitute for this separate persistent SDK/file-writer acknowledgement. */
@@ -43,14 +52,22 @@ export function readModelSdkClose(manager: NativeSessionReader, native: NativeEx
   if (lastIndex < 1) return undefined;
   const expected = normalizeNativeProof(native);
   let receiptIndex = -1;
+  let latestReceiptIndex = -1;
+  let latestReceiptMatches = false;
   for (let index = 0; index < lastIndex; index++) {
     const entry = entries[index];
     if (entry.type !== "custom" || entry.customType !== "pi.scheduled-receipt.v1") continue;
+    latestReceiptIndex = index;
     try {
-      if (sameNativeProof(entry.data as NativeExecutionProof, expected)) receiptIndex = index;
-    } catch { /* Ignore unrelated or malformed transcript metadata. */ }
+      latestReceiptMatches = sameNativeProof(entry.data as NativeExecutionProof, expected);
+      if (latestReceiptMatches) receiptIndex = index;
+    } catch {
+      // A malformed or conflicting later receipt is still transcript activity;
+      // it cannot be skipped when proving which receipt the ACK closes.
+      latestReceiptMatches = false;
+    }
   }
-  if (receiptIndex < 0) return undefined;
+  if (receiptIndex < 0 || receiptIndex !== latestReceiptIndex || !latestReceiptMatches) return undefined;
   const entry = entries[lastIndex];
   if (entry.type !== "custom" || entry.customType !== MODEL_SDK_CLOSE_ENTRY || lastIndex <= receiptIndex) return undefined;
   const proof = entry.data as ModelSdkCloseProof;

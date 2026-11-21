@@ -278,6 +278,23 @@ describe("resilient native timer composition", () => {
     expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { slot: { kind: "idle" } }, attemptHistory: [{ outcome: "completed" }] });
   });
 
+  it("revalidates the model SDK close ACK during settlement recovery before releasing ownership", async () => {
+    const h = fixture({ model: "fixture/model", intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute });
+    modelPreparation(h);
+    const scheduler = h.newScheduler(); scheduler.start(); await advance(minute + 1000); await flush();
+    const persist = h.storage.settleResilient.bind(h.storage);
+    const settle = vi.spyOn(h.storage, "settleResilient");
+    settle.mockImplementationOnce(() => false).mockImplementationOnce(() => false).mockImplementation((...args) => persist(...args));
+    h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    expect(settle).toHaveBeenCalledTimes(2);
+    h.entries.set("later-transcript-entry", { id: "later-transcript-entry", type: "custom", customType: "pi.scheduled-checkpoint.v1", data: { version: 1, runId: "run-0", binding: h.runs[0].request.binding } });
+    await advance(1000); await flush();
+    expect(settle).toHaveBeenCalledTimes(2);
+    expect(h.capability.start).toHaveBeenCalledOnce();
+    expect(h.row()).toMatchObject({ attemptCount: 1, runtime: { slot: { kind: "owned", phase: "attention-required", reason: "model_sdk_closure_unconfirmed" } }, attemptHistory: [] });
+    expect(scheduler.getNextRun("job")).toBeNull();
+  });
+
   it("retries settlement twice after consecutive CAS losses before recording the exact closure", async () => {
     const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
     const settle = vi.spyOn(h.storage, "settleResilient"); settle.mockImplementationOnce(() => false).mockImplementationOnce(() => false);

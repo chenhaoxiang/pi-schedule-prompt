@@ -36,7 +36,6 @@ interface PendingSettlementRecovery extends PendingSettlementEvidence {
   receipt: NativeExecutionProof & { reason?: string };
   manager: NativeSessionReader;
   waitingReason?: string;
-  modelSdkClose?: ModelSdkCloseProof;
   timer?: NodeJS.Timeout;
 }
 interface PendingSettlementNotification extends PendingSettlementEvidence {
@@ -478,8 +477,21 @@ export class ResilientScheduling {
       return;
     }
     const entries = manager.getEntries?.() ?? [];
-    const receipt = entries.find(entry => entry.type === "custom" && entry.customType === "pi.scheduled-receipt.v1" && sameNativeBinding((entry.data as NativeExecutionProof)?.binding, bindingFor(job.id, attempt)) && (!attempt.nativeRunId || (entry.data as NativeExecutionProof).runId === attempt.nativeRunId));
-    if (receipt?.type === "custom") { this.finish(job.id, attempt, receipt.data as NativeExecutionProof, manager); return; }
+    const expectedBinding = bindingFor(job.id, attempt);
+    let receipt: NativeExecutionProof | undefined;
+    let conflictingReceipt = false;
+    for (const entry of entries) {
+      if (entry.type !== "custom" || entry.customType !== "pi.scheduled-receipt.v1" || !sameNativeBinding((entry.data as NativeExecutionProof)?.binding, expectedBinding)) continue;
+      const candidate = entry.data as NativeExecutionProof;
+      if (attempt.nativeRunId && candidate.runId !== attempt.nativeRunId) {
+        receipt = undefined;
+        conflictingReceipt = true;
+      } else {
+        receipt = candidate;
+        conflictingReceipt = false;
+      }
+    }
+    if (receipt && !conflictingReceipt) { this.finish(job.id, attempt, receipt, manager); return; }
     this.keepOwned(job, attempt, "native_owner_unconfirmed");
   }
 
@@ -533,11 +545,10 @@ export class ResilientScheduling {
     return { reference: { sessionId: receipt.binding.ownerSessionId, entryId: receipt.checkpointEntryId, runId: receipt.runId, sessionFile }, waitingReason: data.declarations?.waitingReason };
   }
 
-  private finish(id: string, attempt: OwnedAttempt, receipt: NativeExecutionProof & { reason?: string }, manager: NativeSessionReader, allowRecovery = true, retained?: { checkpoint: NativeCheckpointReference; waitingReason?: string; modelSdkClose?: ModelSdkCloseProof }): void {
+  private finish(id: string, attempt: OwnedAttempt, receipt: NativeExecutionProof & { reason?: string }, manager: NativeSessionReader, allowRecovery = true, retained?: { checkpoint: NativeCheckpointReference; waitingReason?: string }): void {
     let before: ResilientJob | undefined;
     let recoveryCheckpoint: NativeCheckpointReference | undefined;
     let recoveryWaitingReason: string | undefined;
-    let recoveryModelSdkClose: ModelSdkCloseProof | undefined;
     try {
       // Read the immutable receipt/checkpoint evidence before touching the
       // store. If the store is busy, this exact receipt can still be retained
@@ -546,8 +557,7 @@ export class ResilientScheduling {
       this.assertCheckpointSessionFile(checkpoint.reference, manager);
       recoveryCheckpoint = checkpoint.reference;
       recoveryWaitingReason = checkpoint.waitingReason;
-      const modelSdkClose = attempt.model ? retained?.modelSdkClose ?? readModelSdkClose(manager, receipt) : undefined;
-      recoveryModelSdkClose = modelSdkClose;
+      const modelSdkClose = attempt.model ? readModelSdkClose(manager, receipt) : undefined;
       before = this.current(id);
       if (!before) {
         this.clearSettlementRecovery(id);
@@ -587,7 +597,7 @@ export class ResilientScheduling {
       // The native handle is already settled here. Retain exact ownership and
       // checkpoint evidence, then give this scheduler one bounded,
       // receipt-only recovery pass. It must not start another native action.
-      if (allowRecovery) this.scheduleSettlementRecovery({ id, attempt: structuredClone(attempt), receipt: structuredClone(receipt), manager, checkpoint: structuredClone(recoveryCheckpoint!), ...(checkpoint.waitingReason !== undefined ? { waitingReason: checkpoint.waitingReason } : {}), ...(modelSdkClose ? { modelSdkClose: structuredClone(modelSdkClose) } : {}) });
+      if (allowRecovery) this.scheduleSettlementRecovery({ id, attempt: structuredClone(attempt), receipt: structuredClone(receipt), manager, checkpoint: structuredClone(recoveryCheckpoint!), ...(checkpoint.waitingReason !== undefined ? { waitingReason: checkpoint.waitingReason } : {}) });
       else {
         const current = this.current(id);
         if (current && this.sameOwnedAttempt(current, attempt)) {
@@ -599,7 +609,7 @@ export class ResilientScheduling {
       if (this.active.get(id)?.attempt.id === attempt.id) this.active.delete(id);
       if (error instanceof ScheduleStoreBusyError && recoveryCheckpoint) {
         if (allowRecovery) {
-          this.scheduleSettlementRecovery({ id, attempt: structuredClone(attempt), receipt: structuredClone(receipt), manager, checkpoint: structuredClone(recoveryCheckpoint), ...(recoveryWaitingReason !== undefined ? { waitingReason: recoveryWaitingReason } : {}), ...(recoveryModelSdkClose ? { modelSdkClose: structuredClone(recoveryModelSdkClose) } : {}) });
+          this.scheduleSettlementRecovery({ id, attempt: structuredClone(attempt), receipt: structuredClone(receipt), manager, checkpoint: structuredClone(recoveryCheckpoint), ...(recoveryWaitingReason !== undefined ? { waitingReason: recoveryWaitingReason } : {}) });
         } else {
           // The one receipt-only pass is bounded. If contention persists, make
           // the exact owner/checkpoint observable as attention-required rather
@@ -720,7 +730,7 @@ export class ResilientScheduling {
       this.settlementRecovery.delete(recovery.id);
       // This invocation is deliberately receipt-only and does not schedule a
       // second recovery loop if persistence remains unavailable.
-      this.finish(recovery.id, recovery.attempt, recovery.receipt, recovery.manager, false, { checkpoint: recovery.checkpoint, ...(recovery.waitingReason !== undefined ? { waitingReason: recovery.waitingReason } : {}), ...(recovery.modelSdkClose ? { modelSdkClose: recovery.modelSdkClose } : {}) });
+      this.finish(recovery.id, recovery.attempt, recovery.receipt, recovery.manager, false, { checkpoint: recovery.checkpoint, ...(recovery.waitingReason !== undefined ? { waitingReason: recovery.waitingReason } : {}) });
     }, SETTLEMENT_RECOVERY_DELAY_MS);
     recovery.timer.unref?.();
   }
