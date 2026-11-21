@@ -434,10 +434,14 @@ export class ResilientScheduling {
     const job = this.storage.getJob(id);
     return job && isResilient(job) && job.session === this.ctx.sessionManager.getSessionId() ? job : undefined;
   }
+  private assertCheckpointSessionFile(checkpoint: NativeCheckpointReference | undefined, manager: NativeSessionReader): void {
+    if (checkpoint?.sessionFile !== undefined && manager.getSessionFile?.() !== checkpoint.sessionFile) throw new Error("Exact native checkpoint transcript file is unavailable; do not replay the run");
+  }
   private prompt(job: ResilientJob, manager: NativeSessionReader): string {
     const continuation = job.runtime.continuation;
     if (!continuation) return job.prompt;
     const checkpoint = continuation.checkpoint;
+    this.assertCheckpointSessionFile(checkpoint, manager);
     const data = this.readCheckpoint(manager, checkpoint.entryId, checkpoint.runId);
     validateContinuationCheckpointBinding(job, continuation, data);
     const context = { reference: checkpoint, completedResultCount: data.completedResultCount, completedResults: data.completedResults, declarations: data.declarations, effectStatus: data.effectStatus, businessOutcome: "unverified" };
@@ -453,6 +457,13 @@ export class ResilientScheduling {
       ? tracked?.sessionManager ?? (attempt.nativeSessionFile && attempt.nativeSessionId ? readStoredModelSession(this.ctx.cwd, attempt.nativeSessionId, attempt.nativeSessionFile) : undefined)
       : this.ctx.sessionManager;
     if (!manager) { this.keepOwned(job, attempt, "native_model_transcript_unavailable"); return; }
+    try {
+      this.assertCheckpointSessionFile(attempt.checkpoint, manager);
+      this.assertCheckpointSessionFile(job.runtime.continuation?.checkpoint, manager);
+    } catch (error) {
+      this.keepOwned(job, attempt, "native_owner_unconfirmed", error, attempt.checkpoint);
+      return;
+    }
     if (handle && sameNativeBinding(handle.snapshot().binding, bindingFor(job.id, attempt)) && (!attempt.nativeRunId || attempt.nativeRunId === handle.runId)) {
       this.attach(job, attempt, handle, { sessionManager: manager, dispose: tracked?.dispose });
       if (job.enabled && job.policy.intervalMode !== "fixed-delay") {

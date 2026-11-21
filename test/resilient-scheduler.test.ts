@@ -297,6 +297,32 @@ describe("resilient native timer composition", () => {
     expect(scheduler.getNextRun("job")).toBeNull();
   });
 
+  it("fails closed before inline continuation when the persisted checkpoint file differs from the current session manager", async () => {
+    const h = fixture({ intervalMs: minute, schedule: "1m", deadlineMs: 10 * minute }, { workBudgetMs: 5 * minute }); const scheduler = h.newScheduler(); scheduler.start();
+    await advance(minute + 1000); h.runs[0].close("deferred", "none-observed", "response_retry_exhausted"); await flush();
+    const continuation = h.row().runtime.continuation;
+    expect(continuation?.checkpoint.sessionFile).toBe(h.ctx.sessionManager.getSessionFile());
+    (h.ctx.sessionManager as any).getSessionFile = () => path.join(h.ctx.cwd, "foreign-native-session.jsonl");
+    await advance(minute + 1000); await flush();
+    expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_start_failed" });
+  });
+
+  it("fails closed while restoring inline ownership when the persisted checkpoint file is missing from the current manager", async () => {
+    const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
+    const slot = h.row().runtime.slot;
+    if (slot.kind !== "owned") throw new Error("Expected an owned inline run");
+    const checkpointEntryId = h.runs[0].handle.checkpoint();
+    const sessionFile = h.ctx.sessionManager.getSessionFile();
+    expect(sessionFile).toBeDefined();
+    expect(h.storage.markResilientPhase("job", slot.attempt.id, slot.attempt.owner, "attention-required", "synthetic_restore", { sessionId: "owner", entryId: checkpointEntryId, runId: "run-0", sessionFile })).toBe(true);
+    scheduler.stop();
+    (h.ctx.sessionManager as any).getSessionFile = () => undefined;
+    const restored = h.newScheduler(); restored.start(); await flush();
+    expect(restored.isRunning()).toBe(true); expect(h.runs).toHaveLength(1); expect(h.capability.start).toHaveBeenCalledOnce();
+    expect(h.row().runtime.slot).toMatchObject({ kind: "owned", phase: "attention-required", reason: "native_owner_unconfirmed" });
+  });
+
   it("retains the exact receipt and owner when receipt-only recovery reads a busy store", async () => {
     const h = fixture(); const scheduler = h.newScheduler(); scheduler.start(); await advance(60 * minute + 1000);
     vi.spyOn(h.storage, "settleResilient").mockReturnValue(false);
