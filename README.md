@@ -16,7 +16,7 @@ This is [chenhaoxiang/pi-schedule-prompt](https://github.com/chenhaoxiang/pi-sch
 Install the maintained source only after reviewing its changes:
 
 ```sh
-pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.5.1-fork.1
+pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.5.1-fork.2
 ```
 
 Pin a reviewed commit for reproducibility. Installation does not hot-upgrade active Pi sessions. This change does not install itself or start monitoring other sessions.

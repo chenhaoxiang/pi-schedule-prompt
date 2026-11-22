@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.5.1-fork.2] - 2026-11-22 (recovery hardening; source/activation separate)
+
+- Bind resilient continuation, checkpoint, settlement and late-receipt evidence to the exact session, transcript, cwd, attempt and owner metadata; reject mismatched or conflicting restore receipts.
+- Require persisted checkpoint/session-file and final native/SDK closure evidence before releasing a resilient model attempt, preserving ambiguous effects as attention-required instead of replaying them.
+- Keep the `0.5.1-fork.1` package and installation available for rollback. This release changes source/package selection only; it does not migrate live stores, edit settings, reload active sessions or start monitoring.
+
 ## [0.5.1-fork.1] - candidate (community v0.5.1 full integration; source/activation separate)
 
 - Integrate the community v0.5.1 idle job type, inactivity lifecycle signals, local-offset display and duplicate-name/tool guidance fixes while retaining the fork's event, durable, resilient, native-guard, UNKNOWN and reconciliation contracts.

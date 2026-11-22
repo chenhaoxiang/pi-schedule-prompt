@@ -77,7 +77,7 @@ These are source/fixture examples, not an instruction to activate an existing UN
 
 ## Project store cutover from 0.4.1-fork.23
 
-The new profile/project layout is a separate change from schema4 promotion. `0.5.1-fork.1` does not migrate a legacy file during `session_start`. Use the pinned candidate/release package, not the upstream mirror. The offline helper accepts one canonical project directory and one canonical Pi agent directory; it does not open a session or change settings.
+The new profile/project layout is a separate change from schema4 promotion. `0.5.1-fork.2` does not migrate a legacy file during `session_start`. Use the pinned candidate/release package, not the upstream mirror. The offline helper accepts one canonical project directory and one canonical Pi agent directory; it does not open a session or change settings.
 
 1. For each legacy project-local store, select **one** destination profile. Record the current package pins and the affected owner sessions, supervisor/launchers and actual writer/store bindings. Back up the original store, its schema4 sidecars and settings privately. Retain original native transcripts in place. Never start a second imported copy for another profile of the same project.
 2. During the approved maintenance window, stop all affected old session/SDK writers and stop auto-restarts. Verify exact handle closure and no outstanding writer before proceeding. A dead PID, absence of a lock, `pi list` or a successful preview is not closure evidence. Preserve unrelated sessions.
