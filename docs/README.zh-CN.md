@@ -17,7 +17,7 @@ created: 2026-10-20
 - main：经过审查的维护整合主线。
 - upstream-main：纯社区镜像，不作为安装源；upstream 远端只读。
 - 版本使用 0.5.1-fork.N，禁止误发至社区 npm 身份。源码、GitHub Release、本机安装和运行中的 session 分别验真。
-- 候选安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.5.1-fork.1`；需要复现时锁定受审提交。候选阶段不改变现有本机选择或活动 session。
+- 候选安装入口：`pi install git:github.com/chenhaoxiang/pi-schedule-prompt@v0.5.1-fork.2`；需要复现时锁定受审提交。候选阶段不改变现有本机选择或活动 session。
 - 要求 Node 22.19+、Pi 1.3.x。本次源码改动不自动安装、不强制重启旧会话、不启动真实监控。
 
 ## 定时与管理
