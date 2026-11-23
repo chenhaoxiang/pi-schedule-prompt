@@ -163,32 +163,58 @@ export default async function (pi: ExtensionAPI) {
 
   // --- Lifecycle events ---
 
+  const notifyBestEffort = (ctx: ExtensionContext, message: string, level: "error" | "warning") => {
+    try { if (ctx.hasUI) ctx.ui.notify(message, level); }
+    catch (error) { console.error("[pi-schedule-prompt] Startup notification failed:", error); }
+  };
+  const appendBestEffort = (type: string, data: Record<string, unknown>) => {
+    try { pi.appendEntry(type, data); }
+    catch (error) { console.error("[pi-schedule-prompt] Startup metadata append failed:", error); }
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     try {
       initializeSession(ctx);
-      if (ctx.mode !== "print" && ctx.mode !== "json") {
+    } catch (error) {
+      try { cleanupSession(ctx); } catch (cleanupError) { console.error("[pi-schedule-prompt] Cleanup after initialization failure failed:", cleanupError); }
+      const reason = error instanceof Error && error.message ? error.message : String(error);
+      console.error("[pi-schedule-prompt] Initialization failed:", error);
+      notifyBestEffort(ctx, `Schedule initialization failed: ${reason.slice(0, 240)}`, "error");
+      return;
+    }
+
+    if (ctx.mode !== "print" && ctx.mode !== "json") {
+      // A lifecycle observation is auxiliary: a transient store contention or
+      // event-admission fault must not tear down already-running timers.
+      try {
         scheduler.emitEvent("lifecycle:session-start", "start:" + ctx.sessionManager.getSessionId() + ":" + randomUUID());
-        const api = settings.eventApi;
-        if (api?.enabled) {
-          const own = scheduler;
-          const epoch = generation;
-          try {
-            const server = await startEventApi({ port: api.port, token: process.env[api.tokenEnv] ?? "" }, (id, name, eventId, evidenceFingerprint) => own.receiveEvent(id, name, eventId, evidenceFingerprint));
-            if (epoch !== generation) { server.closeAllConnections(); server.close(); }
-            else { eventServer = server; pi.appendEntry("schedule_event_api", { port: (server.address() as { port: number }).port, host: "127.0.0.1" }); }
-          } catch {
-            const message = "Local event API could not start; other scheduling remains available";
-            console.error(message);
-            pi.appendEntry("schedule_event_api", { state: "unavailable", reason: "startup-failed" });
-            if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      } catch (error) {
+        console.error("[pi-schedule-prompt] Session-start event was not admitted; timers remain running:", error);
+        notifyBestEffort(ctx, "Schedule startup event was skipped; timers remain running.", "warning");
+      }
+      const api = settings.eventApi;
+      if (api?.enabled) {
+        const own = scheduler;
+        const epoch = generation;
+        try {
+          const server = await startEventApi({ port: api.port, token: process.env[api.tokenEnv] ?? "" }, (id, name, eventId, evidenceFingerprint) => own.receiveEvent(id, name, eventId, evidenceFingerprint));
+          if (epoch !== generation) { server.closeAllConnections(); server.close(); }
+          else {
+            try {
+              pi.appendEntry("schedule_event_api", { port: (server.address() as { port: number }).port, host: "127.0.0.1" });
+              eventServer = server;
+            } catch (error) {
+              server.closeAllConnections(); server.close();
+              throw error;
+            }
           }
+        } catch (error) {
+          const message = "Local event API could not start; other scheduling remains available";
+          console.error(message, error);
+          appendBestEffort("schedule_event_api", { state: "unavailable", reason: "startup-failed" });
+          notifyBestEffort(ctx, message, "warning");
         }
       }
-    }
-    catch (error) {
-      cleanupSession(ctx);
-      console.error("[pi-schedule-prompt] Initialization failed:", error);
-      if (ctx.hasUI) ctx.ui.notify("Schedule store could not be loaded; timers are stopped. Check the local store.", "error");
     }
   });
 

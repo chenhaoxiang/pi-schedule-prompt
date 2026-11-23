@@ -5,14 +5,15 @@ import { createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRunt
 import { describe, expect, it, vi } from "vitest";
 import { EVENT_REQUEST } from "../src/events.js";
 import schedule from "../src/index.js";
+import { CronScheduler } from "../src/scheduler.js";
 import { CronStorage } from "../src/storage.js";
 
-async function fixture(eventName: string, ui?: { notify: ReturnType<typeof vi.fn>; setWidget: ReturnType<typeof vi.fn> }, tools: string[] = []) {
+async function fixture(eventName: string, ui?: { notify: ReturnType<typeof vi.fn>; setWidget: ReturnType<typeof vi.fn> }, tools: string[] = [], enableEventApi = !!ui) {
   const base = path.resolve("tmp/event-sdk"); fs.mkdirSync(base, { recursive: true });
   const cwd = fs.mkdtempSync(path.join(base, "case-"));
   const agentDir = path.join(cwd, "agent"); fs.mkdirSync(agentDir);
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
-  if (ui) {
+  if (ui && enableEventApi) {
     vi.stubEnv("SCHEDULE_SYNTHETIC_MISSING_TOKEN", undefined);
     fs.writeFileSync(path.join(agentDir, "schedule-prompts-settings.json"), JSON.stringify({ eventApi: { enabled: true, port: 0, tokenEnv: "SCHEDULE_SYNTHETIC_MISSING_TOKEN" } }));
   }
@@ -35,6 +36,20 @@ async function fixture(eventName: string, ui?: { notify: ReturnType<typeof vi.fn
 }
 
 describe("real SDK event lifecycle", () => {
+  it("reports the initialization cause instead of masking it as a store failure", async () => {
+    const ui = { notify: vi.fn(), setWidget: vi.fn() };
+    const start = vi.spyOn(CronScheduler.prototype, "start").mockImplementation(() => { throw new Error("synthetic scheduler startup failure"); });
+    const h = await fixture("local:done", ui, [], false);
+    try {
+      expect(ui.notify).toHaveBeenCalledWith("Schedule initialization failed: synthetic scheduler startup failure", "error");
+      expect(ui.notify).not.toHaveBeenCalledWith("Schedule store could not be loaded; timers are stopped. Check the local store.", "error");
+      expect(h.errors).toEqual([]);
+    } finally {
+      start.mockRestore();
+      await h.cleanup();
+    }
+  });
+
   it("fires at session-start but never recursively from its own settled turn", async () => {
     const h = await fixture("lifecycle:session-start,lifecycle:agent-settled");
     try {

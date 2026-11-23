@@ -5,7 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.1-fork.3] - 2026-11-23 (startup fault isolation)
+
+- Separate session initialization failures from the auxiliary session-start event. Startup now reports the actual initialization cause instead of masking every failure as a schedule-store load error; a lifecycle admission failure no longer tears down timers that were already started.
+- Keep startup notifications and metadata best-effort; if event metadata cannot be recorded, close the newly opened API instead of leaking a listener.
 
 ## [0.5.1-fork.2] - 2026-11-22 (recovery hardening; source/activation separate)
 
