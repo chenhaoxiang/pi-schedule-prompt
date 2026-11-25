@@ -30,7 +30,7 @@ const host = process.env.PI_SCHEDULE_HOST_PACKAGE_DIR;
 if (!host || !path.isAbsolute(host)) throw new Error('Set PI_SCHEDULE_HOST_PACKAGE_DIR to the exact maintained Pi host package directory');
 const hostRoot = fs.realpathSync(host);
 const hostPackage = JSON.parse(fs.readFileSync(path.join(hostRoot, 'package.json'), 'utf8'));
-if (hostPackage.name !== '@earendil-works/pi-coding-agent' || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(hostPackage.version)) throw new Error('Expected a recognized stable Pi 1.3/1.4/1.5 host; native capability is negotiated at runtime');
+if (hostPackage.name !== '@earendil-works/pi-coding-agent' || !/^1\.(?:3|4|5|6)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(hostPackage.version)) throw new Error('Expected a recognized stable Pi 1.3/1.4/1.5/1.6 host; native capability is negotiated at runtime');
 // Resolve the host's actual module, including a nested dependency, rather than assuming hoisting.
 const hostTypeboxEntry = fs.realpathSync(createRequire(path.join(hostRoot, 'package.json')).resolve('typebox'));
 let hostTypeboxPath = path.dirname(hostTypeboxEntry);
