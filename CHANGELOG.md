@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1-fork.4] - 2026-11-26 (Pi 1.6 host binding)
+
+- Recognize Pi `1.6.x` and `1.6.x-fork.N` hosts in the fixed installer's host and SDK-peer binding gate. Unqualified versions of recognized minors stay accepted as before; pre-release, `-fork.0` and `-fork.01` versions remain refused.
+- Native capability is still negotiated at runtime, so accepting a host version is not proof that the schedule capability, timers or store are active.
+
 ## [0.5.1-fork.3] - 2026-11-23 (startup fault isolation)
 
 - Separate session initialization failures from the auxiliary session-start event. Startup now reports the actual initialization cause instead of masking every failure as a schedule-store load error; a lifecycle admission failure no longer tears down timers that were already started.
