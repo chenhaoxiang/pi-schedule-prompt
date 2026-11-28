@@ -8,8 +8,13 @@ const owned: string[] = [];
 afterEach(() => { for (const root of owned.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 /** A synthetic Pi host installation: three lockstep peers next to the coding agent, plus typebox. */
+const fixtures = path.resolve("tmp/host-binding-fixtures");
+function scratch(prefix: string) {
+  fs.mkdirSync(fixtures, { recursive: true });
+  return fs.mkdtempSync(path.join(fixtures, prefix));
+}
 function host(version = "1.7.0-fork.1", root?: string) {
-  const base = root ?? fs.mkdtempSync(path.join(path.resolve("tmp/host-binding-fixtures"), "host-"));
+  const base = root ?? scratch("host-");
   owned.push(base);
   const scope = path.join(base, "node_modules/@earendil-works");
   for (const name of ["pi-coding-agent", "pi-ai", "pi-tui"]) {
@@ -25,7 +30,7 @@ function host(version = "1.7.0-fork.1", root?: string) {
 
 /** An installation directory holding only what the binding touches. */
 function installation() {
-  const dir = fs.mkdtempSync(path.join(path.resolve("tmp/host-binding-fixtures"), "install-"));
+  const dir = scratch("install-");
   owned.push(dir);
   fs.mkdirSync(path.join(dir, ".runtime/node_modules"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".install-receipt.json"), JSON.stringify({ sourceSha: "a".repeat(40), archiveSha256: "b".repeat(64), version: "0.5.1-fork.5", hostVersion: "1.6.0-fork.2", hostPath: "/elsewhere/pi-coding-agent" }) + "\n", { mode: 0o600 });
