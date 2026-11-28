@@ -1,6 +1,6 @@
 {
   "name": "pi-schedule-prompt",
-  "version": "0.5.1-fork.4",
+  "version": "0.5.1-fork.5",
   "private": true,
   "type": "module",
   "engines": {
@@ -22,6 +22,7 @@
     "dist",
     "docs",
     "prompts",
+    "scripts/host-binding.mjs",
     "scripts/supervisor.mjs",
     "scripts/supervisor-rpc.mjs",
     "scripts/retire-expired.mjs",
@@ -57,7 +58,7 @@
     "build": "tsc",
     "test": "vitest run --maxWorkers=2",
     "check": "npm run lint && npm run typecheck && npm run check:scripts && npm test && npm run build",
-    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/install-fixed.mjs && node --check scripts/retire-expired.mjs && node --check scripts/migrate-project-store.mjs && node --check test/npm12-root-policy.mjs && node --check test/online-smoke.mjs && node --check scripts/supervisor.mjs && node --check scripts/supervisor-rpc.mjs && node --check test/supervisor-native.mjs && node --check test/installed-native-cli.mjs && node --check test/resilient-native.mjs && node --check test/installed-host-peers.mjs && node --check test/installed-legacy-recovery.mjs && node --check test/installed-native-guard.mjs && node --check test/installed-readonly-resume.mjs",
+    "check:scripts": "node --check scripts/pack-fixed.mjs && node --check scripts/host-binding.mjs && node --check scripts/install-fixed.mjs && node --check scripts/retire-expired.mjs && node --check scripts/migrate-project-store.mjs && node --check test/npm12-root-policy.mjs && node --check test/online-smoke.mjs && node --check scripts/supervisor.mjs && node --check scripts/supervisor-rpc.mjs && node --check test/supervisor-native.mjs && node --check test/installed-native-cli.mjs && node --check test/resilient-native.mjs && node --check test/installed-host-peers.mjs && node --check test/installed-legacy-recovery.mjs && node --check test/installed-native-guard.mjs && node --check test/installed-readonly-resume.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",

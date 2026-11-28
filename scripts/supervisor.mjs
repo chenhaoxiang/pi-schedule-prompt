@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NativeRpc } from './supervisor-rpc.mjs';
+import { bindingMismatch, ensureBound, isStableHostVersion, readHost } from './host-binding.mjs';
 
 const sha = value => createHash('sha256').update(value).digest('hex');
 const readOnlyTools = ['find', 'grep', 'ls', 'read'];
@@ -73,10 +74,16 @@ function selectProjectStore(config, host) {
 function validatePins(config) {
   if (sha(fs.readFileSync(config.piCli)) !== config.piCliSha256) throw new Error('Pi CLI pin mismatch');
   const receipt = JSON.parse(fs.readFileSync(path.join(config.packageRoot, '.install-receipt.json'), 'utf8'));
-  if (receipt.sourceSha !== config.sourceCommit || !/^1\.(?:3|4|5)\.(?:0|[1-9]\d*)(?:-fork\.[1-9]\d*)?$/.test(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
-  if (typeof receipt.hostPath !== 'string' || fs.realpathSync(path.join(path.dirname(config.piCli), 'node_modules/@earendil-works/pi-coding-agent')) !== receipt.hostPath) throw new Error('CLI and fixed installer host bindings differ');
-  const host = JSON.parse(fs.readFileSync(path.join(receipt.hostPath, 'package.json'), 'utf8'));
-  if (host.version !== receipt.hostVersion) throw new Error('CLI and fixed installer host bindings differ');
+  if (receipt.sourceSha !== config.sourceCommit || !isStableHostVersion(receipt.hostVersion)) throw new Error('Fixed installation receipt mismatch');
+  // The binding is "the peers are the host that is running now", re-derived from the CLI this
+  // supervisor was started for — not a directory frozen at install time. A Pi upgrade moves the
+  // host, so the installation follows it here instead of demanding a reinstall.
+  const runningHost = readHost(fs.realpathSync(path.join(path.dirname(config.piCli), 'node_modules/@earendil-works/pi-coding-agent')));
+  if (bindingMismatch(config.packageRoot, runningHost) !== null || receipt.hostPath !== runningHost.root || receipt.hostVersion !== runningHost.version) {
+    ensureBound(config.packageRoot, runningHost);
+  }
+  const host = JSON.parse(fs.readFileSync(path.join(runningHost.root, 'package.json'), 'utf8'));
+  if (host.version !== runningHost.version) throw new Error('CLI and fixed installer host bindings differ');
   if (fs.realpathSync(config.packageRoot) !== config.packageRoot || fs.realpathSync(config.cwd) !== config.cwd) throw new Error('Use canonical cwd/package paths');
   validateSessionFile(config);
   return selectProjectStore(config, host);
