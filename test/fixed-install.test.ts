@@ -88,6 +88,33 @@ describe("fixed installation boundaries", () => {
     const again = f.install(); expect(again.status).not.toBe(0); expect(again.stderr).toContain("Host typebox binding mismatch");
   });
 
+  it("follows a moved host into its new directory without a new archive", () => {
+    const f = fixture(); const first = f.install(); expect(first.status, first.stderr).toBe(0);
+    const installed = path.join(f.root, "installed/0.4.1-fork.99");
+    const before = JSON.parse(fs.readFileSync(path.join(installed, ".install-receipt.json"), "utf8"));
+    expect(before.hostVersion).toBe("1.3.0");
+    // A Pi upgrade: the same packages, a new installation directory and version.
+    const movedHost = path.join(f.root, "next-host");
+    fs.cpSync(path.join(f.root, "host"), movedHost, { recursive: true });
+    for (const name of ["pi-coding-agent", "pi-ai", "pi-tui"]) fs.writeFileSync(path.join(movedHost, "node_modules/@earendil-works", name, "package.json"), JSON.stringify({ name: "@earendil-works/" + name, version: "1.7.0-fork.1", ...(name === "pi-coding-agent" ? { dependencies: { typebox: "1.3.27" } } : {}) }));
+    const again = spawnSync(process.execPath, [path.resolve("scripts/install-fixed.mjs"), f.archive, path.join(f.root, "provenance.json"), f.metadata.sourceSha, path.join(f.root, "installed")],
+      { encoding: "utf8", env: { PATH: process.env.PATH, HOME: f.root, npm_config_update_notifier: "false", npm_config_cache: path.join(f.root, "tmp/npm"), PI_SCHEDULE_HOST_PACKAGE_DIR: path.join(movedHost, "node_modules/@earendil-works/pi-coding-agent") }, timeout: 15000 });
+    expect(again.status, again.stderr).toBe(0);
+    const result = JSON.parse(again.stdout.split("\n").find(line => line.startsWith('{"installed":'))!);
+    expect(result.reused).toBe(false); expect(result.rebound).toBe(true); expect(result.hostVersion).toBe("1.7.0-fork.1");
+    // The peers follow the new host; the source identity does not change.
+    expect(fs.realpathSync(path.join(installed, "node_modules/@earendil-works/pi-coding-agent"))).toBe(fs.realpathSync(path.join(movedHost, "node_modules/@earendil-works/pi-coding-agent")));
+    expect(fs.realpathSync(path.join(installed, "node_modules/typebox"))).toBe(fs.realpathSync(path.join(movedHost, "node_modules/typebox")));
+    const after = JSON.parse(fs.readFileSync(path.join(installed, ".install-receipt.json"), "utf8"));
+    expect(after).toMatchObject({ sourceSha: before.sourceSha, archiveSha256: before.archiveSha256, version: before.version, hostVersion: "1.7.0-fork.1" });
+    expect(after.hostPath).toBe(fs.realpathSync(path.join(movedHost, "node_modules/@earendil-works/pi-coding-agent")));
+    // Re-running against the same host is a plain reuse, not another rebind.
+    const third = spawnSync(process.execPath, [path.resolve("scripts/install-fixed.mjs"), f.archive, path.join(f.root, "provenance.json"), f.metadata.sourceSha, path.join(f.root, "installed")],
+      { encoding: "utf8", env: { PATH: process.env.PATH, HOME: f.root, npm_config_update_notifier: "false", npm_config_cache: path.join(f.root, "tmp/npm"), PI_SCHEDULE_HOST_PACKAGE_DIR: path.join(movedHost, "node_modules/@earendil-works/pi-coding-agent") }, timeout: 15000 });
+    expect(third.status, third.stderr).toBe(0);
+    expect(JSON.parse(third.stdout.split("\n").find(line => line.startsWith('{"installed":'))!).reused).toBe(true);
+  });
+
   it("prefers a nested host typebox instead of a hoisted copy", () => {
     const f = fixture(); const host = path.join(f.root, "host/node_modules/@earendil-works/pi-coding-agent");
     const nested = path.join(host, "node_modules/typebox"); fs.mkdirSync(path.dirname(nested), { recursive: true });
@@ -114,7 +141,7 @@ describe("fixed installation boundaries", () => {
     expect(fs.existsSync(path.join(f.root, "installed/0.4.1-fork.99"))).toBe(false);
   });
 
-  it.each(["1.3.0-fork.1", "1.4.0-fork.5", "1.5.0-fork.2", "1.5.0-fork.3", "1.6.0", "1.6.0-fork.1"])("binds exact canonical %s SDK peers without treating version metadata as native activation", version => {
+  it.each(["1.3.0-fork.1", "1.4.0-fork.5", "1.5.0-fork.2", "1.5.0-fork.3", "1.6.0", "1.6.0-fork.1", "1.7.0-fork.1", "1.10.0"])("binds exact canonical %s SDK peers without treating version metadata as native activation", version => {
     const f = fixture();
     for (const name of ["pi-coding-agent", "pi-ai", "pi-tui"]) fs.writeFileSync(path.join(f.root, "host/node_modules/@earendil-works", name, "package.json"), JSON.stringify({ name: "@earendil-works/" + name, version, ...(name === "pi-coding-agent" ? { dependencies: { typebox: "1.3.27" } } : {}) }));
     const result = f.install(); expect(result.status, result.stderr).toBe(0);

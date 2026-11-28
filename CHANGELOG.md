@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1-fork.5] - 2026-11-28 (the host binding follows a Pi upgrade)
+
+- The host binding is re-derived from the Pi host that is running now instead of a directory frozen at install time. A Pi upgrade moves the host to a new installation directory; the fixed installation follows it by re-pointing its three SDK peers and typebox (`scripts/host-binding.mjs`), both when the fixed installer runs and when the dedicated supervisor starts. Reinstalling the package is no longer required for that.
+- Source and artefact identity do not move: `sourceSha`, `archiveSha256` and the package version stay in the receipt, and a same-directory identity change (a tampered or half-updated host) still fails closed rather than being adopted.
+- Accept any canonical Pi `1.x` host from `1.3` on, instead of a hard-coded `1.3`/`1.4`/`1.5`/`1.6` list that had already gone stale: the fixed installer accepted `1.6.x` while the supervisor still refused it. A `1.2` host (no native custom turns) and a `2.x` host stay refused; native capability is still negotiated at runtime, so accepting a version is not proof that the capability is active.
+- Replacing a peer or typebox link with a real directory, or a link to somewhere that is not a Pi host installation, is refused rather than deleted.
+
 ## [0.5.1-fork.4] - 2026-11-26 (Pi 1.6 host binding)
 
 - Recognize Pi `1.6.x` and `1.6.x-fork.N` hosts in the fixed installer's host and SDK-peer binding gate. Unqualified versions of recognized minors stay accepted as before; pre-release, `-fork.0` and `-fork.01` versions remain refused.
